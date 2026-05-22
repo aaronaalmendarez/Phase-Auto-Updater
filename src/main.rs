@@ -107,6 +107,11 @@ struct AvatarFetchResult {
     image: Result<ColorImage, String>,
 }
 
+struct ThemeBackgroundFetchResult {
+    key: String,
+    image: Result<ColorImage, String>,
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThemeSelection {
@@ -152,6 +157,10 @@ struct PhaseInstallerApp {
     roblox_avatar_key: Option<String>,
     avatar_tx: Sender<AvatarFetchResult>,
     avatar_rx: Receiver<AvatarFetchResult>,
+    theme_background: Option<TextureHandle>,
+    theme_background_key: Option<String>,
+    theme_background_tx: Sender<ThemeBackgroundFetchResult>,
+    theme_background_rx: Receiver<ThemeBackgroundFetchResult>,
     candidates: Vec<PluginFolderCandidate>,
     selected_folder: Option<PathBuf>,
     release: Option<verification::VersionResponse>,
@@ -212,6 +221,7 @@ impl PhaseInstallerApp {
         let candidates = detect_plugin_folders();
         let selected_folder = best_candidate(&candidates).map(|candidate| candidate.path);
         let (avatar_tx, avatar_rx) = mpsc::channel();
+        let (theme_background_tx, theme_background_rx) = mpsc::channel();
 
         let mut app = Self {
             logo: load_logo(&cc.egui_ctx),
@@ -221,6 +231,10 @@ impl PhaseInstallerApp {
             roblox_avatar_key: None,
             avatar_tx,
             avatar_rx,
+            theme_background: None,
+            theme_background_key: None,
+            theme_background_tx,
+            theme_background_rx,
             candidates,
             selected_folder,
             release: None,
@@ -311,6 +325,8 @@ impl PhaseInstallerApp {
         self.poll_theme_apply(ctx);
         self.poll_avatar_fetches(ctx);
         self.ensure_avatar_fetches(ctx);
+        self.poll_theme_background_fetches(ctx);
+        self.ensure_theme_background_fetch(ctx);
 
         let Some(started_at) = self.phase_started_at else {
             return;
@@ -1289,6 +1305,8 @@ impl PhaseInstallerApp {
                 if let Some(palette) = phase::palette_from_theme_code(&selection.theme_code) {
                     phase::set_palette(palette);
                     configure_style(ctx);
+                    self.theme_background = None;
+                    self.theme_background_key = None;
                     self.selected_theme = Some(selection.clone());
                     self.save_account_cache();
                     self.log(
@@ -1311,6 +1329,8 @@ impl PhaseInstallerApp {
         phase::reset_palette();
         configure_style(ctx);
         self.selected_theme = None;
+        self.theme_background = None;
+        self.theme_background_key = None;
         self.save_account_cache();
         self.log(phase::green(), "Restored default Phase theme.");
     }
@@ -1432,6 +1452,45 @@ impl PhaseInstallerApp {
                 AvatarKind::Phase => self.phase_avatar = Some(texture),
                 AvatarKind::Roblox => self.roblox_avatar = Some(texture),
             }
+            ctx.request_repaint();
+        }
+    }
+
+    fn ensure_theme_background_fetch(&mut self, ctx: &Context) {
+        let Some(image_id) = self
+            .selected_theme
+            .as_ref()
+            .and_then(|theme| theme.background_image_id.as_deref())
+            .filter(|id| !id.trim().is_empty())
+        else {
+            return;
+        };
+
+        if self.theme_background_key.as_deref() == Some(image_id) {
+            return;
+        }
+
+        let key = image_id.to_owned();
+        self.theme_background_key = Some(key.clone());
+        self.theme_background = None;
+        spawn_theme_background_fetch(
+            self.theme_background_tx.clone(),
+            key.clone(),
+            ctx.clone(),
+            move || verification::fetch_roblox_asset_thumbnail_image(&key),
+        );
+    }
+
+    fn poll_theme_background_fetches(&mut self, ctx: &Context) {
+        while let Ok(result) = self.theme_background_rx.try_recv() {
+            let Ok(image) = result.image else {
+                continue;
+            };
+            self.theme_background = Some(ctx.load_texture(
+                format!("theme-background-{}", result.key),
+                image,
+                TextureOptions::LINEAR,
+            ));
             ctx.request_repaint();
         }
     }
@@ -1760,6 +1819,7 @@ impl eframe::App for PhaseInstallerApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(phase::background()))
             .show(ctx, |ui| {
+                self.paint_theme_background(ui);
                 ui.vertical_centered(|ui| {
                     ui.set_width(SCROLL_BODY_WIDTH);
                     ui.add_space(12.0);
@@ -1790,6 +1850,25 @@ impl eframe::App for PhaseInstallerApp {
 }
 
 impl PhaseInstallerApp {
+    fn paint_theme_background(&self, ui: &mut Ui) {
+        let Some(texture) = &self.theme_background else {
+            return;
+        };
+
+        let rect = ui.max_rect();
+        ui.painter().image(
+            texture.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::from_rgba_premultiplied(255, 255, 255, 44),
+        );
+        ui.painter().rect_filled(
+            rect,
+            Rounding::ZERO,
+            Color32::from_rgba_premultiplied(0, 0, 0, 156),
+        );
+    }
+
     fn check_milestones(&mut self) {
         let Some(started_at) = self.phase_started_at else {
             return;
@@ -2970,6 +3049,28 @@ fn spawn_avatar_fetch(
         let _ = tx.send(AvatarFetchResult { kind, key, image });
         ctx.request_repaint();
     });
+}
+
+fn spawn_theme_background_fetch(
+    tx: Sender<ThemeBackgroundFetchResult>,
+    key: String,
+    ctx: Context,
+    loader: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let image = loader().and_then(decode_texture_image);
+        let _ = tx.send(ThemeBackgroundFetchResult { key, image });
+        ctx.request_repaint();
+    });
+}
+
+fn decode_texture_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
+    let image = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Invalid theme background image: {error}"))?
+        .to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+    Ok(ColorImage::from_rgba_unmultiplied(size, &pixels))
 }
 
 fn decode_avatar_image(bytes: Vec<u8>) -> Result<ColorImage, String> {

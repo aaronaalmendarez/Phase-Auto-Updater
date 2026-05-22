@@ -362,6 +362,33 @@ pub fn fetch_roblox_avatar_image(user_id: &str) -> Result<Vec<u8>, String> {
     fetch_image_bytes(&image_url)
 }
 
+pub fn fetch_roblox_asset_thumbnail_image(asset_id: &str) -> Result<Vec<u8>, String> {
+    let asset_id = asset_id.trim();
+    if asset_id.is_empty() {
+        return Err("Missing Roblox background asset ID.".to_owned());
+    }
+
+    let url = format!(
+        "https://thumbnails.roblox.com/v1/assets?assetIds={}&size=768x432&format=Png&isCircular=false",
+        url_escape(asset_id)
+    );
+    let response = http_agent()?
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+        .map_err(|error| format!("Could not fetch Roblox background: {error}"))?
+        .into_json::<RobloxThumbnailResponse>()
+        .map_err(|error| format!("Invalid Roblox background response: {error}"))?;
+
+    let image_url = response
+        .data
+        .into_iter()
+        .find_map(|item| item.image_url.filter(|url| !url.trim().is_empty()))
+        .ok_or_else(|| "Roblox did not return a background image.".to_owned())?;
+
+    fetch_image_bytes(&image_url)
+}
+
 pub fn fetch_phase_themes(plan: &VerificationPlan) -> Result<Vec<PhaseThemeAsset>, String> {
     let response = http_agent()?
         .get(&plan.phase_themes_url())
