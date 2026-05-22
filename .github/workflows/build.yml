@@ -1,0 +1,41 @@
+name: build installer
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: windows exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: build
+        shell: pwsh
+        run: .\scripts\build-msi.ps1
+      - name: upload windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhaseAnimatorInstaller-windows
+          path: dist/windows/
+
+  macos:
+    name: macos app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: build
+        run: bash ./scripts/build-macos.sh
+      - name: upload macos build
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhaseAnimatorInstaller-macos
+          path: dist/macos/
