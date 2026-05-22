@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -19,6 +20,29 @@ pub const ACTIVATE_ENDPOINT: &str = "/activate";
 pub const ROBLOX_PLUGIN_ASSET_ID: u64 = 130301148315515;
 pub const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/aaronaalmendarez/Phase-Auto-Updater/releases/latest";
+
+fn optional_u64_from_string_or_number<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| D::Error::custom("expected unsigned integer")),
+        Some(serde_json::Value::String(text)) => {
+            let text = text.trim();
+            if text.is_empty() {
+                Ok(None)
+            } else {
+                text.parse::<u64>().map(Some).map_err(D::Error::custom)
+            }
+        }
+        Some(_) => Err(D::Error::custom("expected unsigned integer or string")),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct VerificationPlan {
@@ -568,6 +592,7 @@ pub struct ActivationResponse {
     pub product: String,
     pub user_id: u64,
     pub install_id: String,
+    #[serde(default, deserialize_with = "optional_u64_from_string_or_number")]
     pub asset_id: Option<u64>,
     pub token: String,
     pub expires_at: u64,
