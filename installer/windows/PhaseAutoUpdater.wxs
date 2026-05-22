@@ -1,0 +1,83 @@
+<Wix
+  xmlns="http://wixtoolset.org/schemas/v4/wxs"
+  xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+    Name="Phase Auto Updater"
+    Manufacturer="Phase"
+    Version="$(var.PackageVersion)"
+    UpgradeCode="7c34ec8f-7732-4f3a-8d4e-5c6c9ff8aa08"
+    Scope="perUser">
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Phase Auto Updater is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="AppIcon" SourceFile="$(var.SourceDir)\PhaseAnimator.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.InstallerDir)\License.rtf" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.SourceDir)\WixUIDialogBmp.bmp" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.SourceDir)\WixUIBannerBmp.bmp" />
+
+    <ui:WixUI Id="WixUI_Minimal" />
+
+    <Feature Id="MainFeature" Title="Phase Auto Updater" Level="1">
+      <ComponentGroupRef Id="AppComponents" />
+    </Feature>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Phase Auto Updater" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Phase Auto Updater" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AppComponents">
+      <Component Id="AppFiles" Directory="INSTALLFOLDER" Guid="c4ae42f8-c123-4dcc-bd64-704b96cb9348">
+        <File Id="AppExe" Source="$(var.SourceDir)\PhaseAnimatorInstaller.exe">
+          <Shortcut
+            Id="DesktopShortcut"
+            Directory="DesktopFolder"
+            Name="Phase Auto Updater"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="AppIcon"
+            Advertise="no" />
+          <Shortcut
+            Id="StartMenuShortcut"
+            Directory="ApplicationProgramsFolder"
+            Name="Phase Auto Updater"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="AppIcon"
+            Advertise="no" />
+        </File>
+        <File Id="LogoPng" Source="$(var.SourceDir)\PhaseAnimator.png" />
+        <File Id="LogoIco" Source="$(var.SourceDir)\PhaseAnimator.ico" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveLocalProgramsFolder" Directory="LocalProgramsFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Phase\AutoUpdater"
+          Name="InstallPath"
+          Value="[INSTALLFOLDER]"
+          Type="string"
+          KeyPath="yes" />
+      </Component>
+
+      <Component Id="StartMenuFolder" Directory="ApplicationProgramsFolder" Guid="0397ddc5-1546-4077-ae83-2a4919ae3151">
+        <RemoveFolder Id="RemoveStartMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\Phase\AutoUpdater" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="StartOnLogin" Directory="INSTALLFOLDER" Guid="0aa6b9d2-313a-4f2f-b08d-a323e1f0ceab" Condition="START_ON_LOGIN">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="PhaseAutoUpdater"
+          Value="&quot;[INSTALLFOLDER]PhaseAnimatorInstaller.exe&quot;"
+          Type="string"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>
