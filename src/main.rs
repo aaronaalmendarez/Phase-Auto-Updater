@@ -26,6 +26,9 @@ const CONTENT_WIDTH: f32 = 410.0;
 const SCROLL_BODY_WIDTH: f32 = 422.0;
 const CARD_WIDTH: f32 = 410.0;
 const CARD_INNER_WIDTH: f32 = 394.0;
+const THEME_ROW_WIDTH: f32 = CARD_INNER_WIDTH;
+const THEME_ROW_MARGIN: f32 = 12.0;
+const THEME_ROW_INNER_WIDTH: f32 = THEME_ROW_WIDTH - THEME_ROW_MARGIN * 2.0;
 
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|arg| arg == "--smoke-test") {
@@ -121,6 +124,25 @@ struct ThemeSelection {
     background_image_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ThemeBackgroundMode {
+    Fit,
+    Stretch,
+    #[default]
+    Crop,
+}
+
+impl ThemeBackgroundMode {
+    fn label(self) -> &'static str {
+        match self {
+            ThemeBackgroundMode::Crop => "Crop",
+            ThemeBackgroundMode::Fit => "Fit",
+            ThemeBackgroundMode::Stretch => "Stretch",
+        }
+    }
+}
+
 struct InstallOutcome {
     target_path: PathBuf,
     backup_path: Option<PathBuf>,
@@ -147,6 +169,8 @@ struct AccountCache {
     activation: Option<verification::ActivationResponse>,
     #[serde(default)]
     selected_theme: Option<ThemeSelection>,
+    #[serde(default)]
+    theme_background_mode: ThemeBackgroundMode,
 }
 
 struct PhaseInstallerApp {
@@ -183,6 +207,9 @@ struct PhaseInstallerApp {
     theme_apply_rx: Option<Receiver<Result<ThemeSelection, String>>>,
     theme_error: Option<String>,
     selected_theme: Option<ThemeSelection>,
+    theme_search: String,
+    visible_theme_count: usize,
+    theme_background_mode: ThemeBackgroundMode,
     last_link_poll: Option<Instant>,
     linked_user: Option<verification::LinkedUser>,
     plugin_token: Option<String>,
@@ -257,6 +284,9 @@ impl PhaseInstallerApp {
             theme_apply_rx: None,
             theme_error: None,
             selected_theme: None,
+            theme_search: String::new(),
+            visible_theme_count: 6,
+            theme_background_mode: ThemeBackgroundMode::Crop,
             last_link_poll: None,
             linked_user: None,
             plugin_token: None,
@@ -1252,6 +1282,7 @@ impl PhaseInstallerApp {
         match result {
             Ok(themes) => {
                 self.theme_assets = themes;
+                self.visible_theme_count = self.visible_theme_count.max(6);
                 self.theme_error = None;
             }
             Err(error) => {
@@ -1372,6 +1403,7 @@ impl PhaseInstallerApp {
         self.roblox_username = cache.roblox_username;
         self.activation = cache.activation;
         self.selected_theme = cache.selected_theme;
+        self.theme_background_mode = cache.theme_background_mode;
         if let Some(selection) = &self.selected_theme {
             if let Some(palette) = phase::palette_from_theme_code(&selection.theme_code) {
                 phase::set_palette(palette);
@@ -1391,6 +1423,7 @@ impl PhaseInstallerApp {
             roblox_username: self.roblox_username.clone(),
             activation: self.activation.clone(),
             selected_theme: self.selected_theme.clone(),
+            theme_background_mode: self.theme_background_mode,
         };
         save_account_cache(&cache);
     }
@@ -1856,10 +1889,13 @@ impl PhaseInstallerApp {
         };
 
         let rect = ui.max_rect();
+        let texture_size = texture.size_vec2();
+        let (image_rect, uv_rect) =
+            theme_background_layout(rect, texture_size, self.theme_background_mode);
         ui.painter().image(
             texture.id(),
-            rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            image_rect,
+            uv_rect,
             Color32::from_rgba_premultiplied(255, 255, 255, 44),
         );
         ui.painter().rect_filled(
@@ -2594,26 +2630,62 @@ impl PhaseInstallerApp {
                     .fill(phase::input())
                     .stroke(Stroke::new(1.0, phase::line()))
                     .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(14.0, 10.0))
+                    .inner_margin(Margin::symmetric(THEME_ROW_MARGIN, 10.0))
                     .show(ui, |ui| {
-                        ui.set_width(CARD_INNER_WIDTH - 16.0);
+                        ui.set_width(THEME_ROW_INNER_WIDTH);
                         let current = self
                             .selected_theme
                             .as_ref()
                             .map(|theme| theme.title.as_str())
                             .unwrap_or("Default Phase");
-                        info_row(ui, "Active", current);
+                        info_row_width(ui, "Active", current, THEME_ROW_INNER_WIDTH);
                         if let Some(theme) = &self.selected_theme {
                             if let Some(image_id) = &theme.background_image_id {
                                 ui.add_space(4.0);
-                                info_row(ui, "Background image", image_id);
+                                info_row_width(
+                                    ui,
+                                    "Background image",
+                                    image_id,
+                                    THEME_ROW_INNER_WIDTH,
+                                );
                             }
                         }
+                        ui.add_space(4.0);
+                        info_row_width(
+                            ui,
+                            "Background mode",
+                            self.theme_background_mode.label(),
+                            THEME_ROW_INNER_WIDTH,
+                        );
                     });
 
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let btn_width = (CARD_INNER_WIDTH - 8.0) / 2.0;
+                ui.horizontal_centered(|ui| {
+                    let btn_width = (THEME_ROW_WIDTH - 16.0) / 3.0;
+                    for mode in [
+                        ThemeBackgroundMode::Crop,
+                        ThemeBackgroundMode::Fit,
+                        ThemeBackgroundMode::Stretch,
+                    ] {
+                        let selected = self.theme_background_mode == mode;
+                        let label = if selected {
+                            format!("{} ✓", mode.label())
+                        } else {
+                            mode.label().to_owned()
+                        };
+                        if secondary_button(ui, MiniIcon::Gear, &label, Vec2::new(btn_width, 34.0))
+                            .clicked()
+                        {
+                            self.theme_background_mode = mode;
+                            self.save_account_cache();
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal_centered(|ui| {
+                    let btn_width = (THEME_ROW_WIDTH - 8.0) / 2.0;
                     let loading = self.theme_fetch_rx.is_some();
                     let label = if loading { "Loading" } else { "Refresh" };
                     ui.add_enabled_ui(!loading, |ui| {
@@ -2636,19 +2708,58 @@ impl PhaseInstallerApp {
                 });
 
                 ui.add_space(8.0);
+                self.theme_search_row(ui);
+
+                ui.add_space(8.0);
                 if self.theme_assets.is_empty() && self.theme_fetch_rx.is_some() {
                     scrolling_label(
                         ui,
                         "Loading Phase themes...",
-                        CARD_INNER_WIDTH - 16.0,
+                        THEME_ROW_WIDTH,
                         FontId::proportional(11.0),
                         phase::text_muted(),
                     );
                 }
 
-                let themes: Vec<_> = self.theme_assets.iter().take(6).cloned().collect();
-                for asset in themes {
+                let themes: Vec<_> = self
+                    .theme_assets
+                    .iter()
+                    .filter(|asset| theme_matches_search(asset, &self.theme_search))
+                    .cloned()
+                    .collect();
+                let visible_count = self.visible_theme_count.min(themes.len());
+                for asset in themes.iter().take(visible_count).cloned() {
                     self.theme_asset_row(ui, asset);
+                    ui.add_space(6.0);
+                }
+
+                if !themes.is_empty() && visible_count < themes.len() {
+                    let remaining = themes.len() - visible_count;
+                    ui.horizontal_centered(|ui| {
+                        if secondary_button(
+                            ui,
+                            MiniIcon::Download,
+                            &format!("Show more ({remaining})"),
+                            Vec2::new(THEME_ROW_WIDTH, 36.0),
+                        )
+                        .clicked()
+                        {
+                            self.visible_theme_count =
+                                (self.visible_theme_count + 6).min(themes.len());
+                        }
+                    });
+                    ui.add_space(6.0);
+                } else if themes.is_empty()
+                    && !self.theme_assets.is_empty()
+                    && !self.theme_search.trim().is_empty()
+                {
+                    scrolling_label(
+                        ui,
+                        "No themes match that search.",
+                        THEME_ROW_WIDTH,
+                        FontId::proportional(11.0),
+                        phase::text_muted(),
+                    );
                     ui.add_space(6.0);
                 }
 
@@ -2657,7 +2768,7 @@ impl PhaseInstallerApp {
                     scrolling_label(
                         ui,
                         error,
-                        CARD_INNER_WIDTH - 16.0,
+                        THEME_ROW_WIDTH,
                         FontId::proportional(11.0),
                         phase::warning(),
                     );
@@ -2790,9 +2901,9 @@ impl PhaseInstallerApp {
             .fill(phase::surface())
             .stroke(Stroke::new(1.0, phase::line()))
             .rounding(Rounding::same(8.0))
-            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .inner_margin(Margin::symmetric(THEME_ROW_MARGIN, 10.0))
             .show(ui, |ui| {
-                ui.set_width(CARD_INNER_WIDTH - 16.0);
+                ui.set_width(THEME_ROW_INNER_WIDTH);
                 ui.horizontal(|ui| {
                     draw_icon(ui, MiniIcon::Gear, Vec2::splat(18.0), phase::accent());
                     ui.add_space(4.0);
@@ -2800,7 +2911,7 @@ impl PhaseInstallerApp {
                         scrolling_label(
                             ui,
                             &asset.title,
-                            CARD_INNER_WIDTH - 150.0,
+                            THEME_ROW_WIDTH - 150.0,
                             FontId::proportional(13.0),
                             phase::text(),
                         );
@@ -2812,7 +2923,7 @@ impl PhaseInstallerApp {
                         scrolling_label(
                             ui,
                             &format!("{} installs · {}", asset.install_count, author),
-                            CARD_INNER_WIDTH - 150.0,
+                            THEME_ROW_WIDTH - 150.0,
                             FontId::proportional(10.5),
                             phase::text_muted(),
                         );
@@ -2834,6 +2945,87 @@ impl PhaseInstallerApp {
                     });
                 });
             });
+    }
+
+    fn theme_search_row(&mut self, ui: &mut Ui) {
+        let width = THEME_ROW_WIDTH;
+        let height = 40.0;
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        if response.clicked() {
+            response.request_focus();
+        }
+
+        let focused = response.has_focus();
+        let border = if focused {
+            phase::accent()
+        } else if response.hovered() {
+            phase::accent_dim()
+        } else {
+            phase::line()
+        };
+        ui.painter()
+            .rect_filled(rect, Rounding::same(8.0), phase::surface());
+        ui.painter()
+            .rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, border));
+
+        let icon_rect = Rect::from_center_size(
+            Pos2::new(rect.left() + 24.0, rect.center().y),
+            Vec2::splat(15.0),
+        );
+        draw_icon_at(
+            ui.painter(),
+            icon_rect,
+            MiniIcon::Search,
+            phase::text_muted(),
+        );
+
+        let text_rect = Rect::from_min_max(
+            Pos2::new(rect.left() + 46.0, rect.top() + 7.0),
+            Pos2::new(rect.right() - 44.0, rect.bottom() - 6.0),
+        );
+        ui.allocate_ui_at_rect(text_rect, |ui| {
+            ui.visuals_mut().widgets.inactive.bg_fill = Color32::TRANSPARENT;
+            ui.visuals_mut().widgets.hovered.bg_fill = Color32::TRANSPARENT;
+            ui.visuals_mut().widgets.active.bg_fill = Color32::TRANSPARENT;
+            ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
+            ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::NONE;
+            ui.visuals_mut().widgets.active.bg_stroke = Stroke::NONE;
+            let response = ui.add_sized(
+                text_rect.size(),
+                egui::TextEdit::singleline(&mut self.theme_search)
+                    .hint_text("Search marketplace themes")
+                    .font(FontId::proportional(13.0))
+                    .desired_width(text_rect.width())
+                    .frame(false),
+            );
+            if response.changed() {
+                self.visible_theme_count = 6;
+            }
+        });
+
+        if !self.theme_search.is_empty() {
+            let clear_rect = Rect::from_center_size(
+                Pos2::new(rect.right() - 22.0, rect.center().y),
+                Vec2::splat(24.0),
+            );
+            let clear_response = ui.interact(clear_rect, ui.next_auto_id(), Sense::click());
+            let clear_color = if clear_response.hovered() {
+                phase::text()
+            } else {
+                phase::text_muted()
+            };
+            ui.painter().text(
+                clear_rect.center(),
+                Align2::CENTER_CENTER,
+                "x",
+                FontId::proportional(14.0),
+                clear_color,
+            );
+            if clear_response.clicked() {
+                self.theme_search.clear();
+                self.visible_theme_count = 6;
+            }
+        }
     }
 
     fn folder_candidates(&mut self, ui: &mut Ui) {
@@ -3233,6 +3425,7 @@ enum MiniIcon {
     Lock,
     Refresh,
     Rocket,
+    Search,
     User,
 }
 
@@ -3249,6 +3442,7 @@ impl MiniIcon {
             MiniIcon::Lock => "\u{E308}",
             MiniIcon::Refresh => "\u{E094}",
             MiniIcon::Rocket => "\u{E3FE}",
+            MiniIcon::Search => "\u{E4A6}",
             MiniIcon::User => "\u{E4D6}",
         }
     }
@@ -3434,6 +3628,22 @@ fn draw_icon_at(painter: &egui::Painter, rect: Rect, icon: MiniIcon, color: Colo
             painter.line_segment([p4, Pos2::new(p4.x - r * 0.34, p4.y - r * 0.22)], stroke);
             painter.line_segment([p4, Pos2::new(p4.x - r * 0.04, p4.y - r * 0.42)], stroke);
         }
+        MiniIcon::Search => {
+            let c = Pos2::new(
+                rect.center().x - rect.width() * 0.06,
+                rect.center().y - rect.height() * 0.06,
+            );
+            let r = rect.width().min(rect.height()) * 0.25;
+            let stroke = Stroke::new(1.7, color);
+            painter.circle_stroke(c, r, stroke);
+            painter.line_segment(
+                [
+                    Pos2::new(c.x + r * 0.72, c.y + r * 0.72),
+                    Pos2::new(c.x + r * 1.42, c.y + r * 1.42),
+                ],
+                stroke,
+            );
+        }
         MiniIcon::Rocket => {
             let center = rect.center();
             let w = rect.width();
@@ -3508,10 +3718,17 @@ fn release_metric(ui: &mut Ui, icon: MiniIcon, label: &str, value: &str) {
 }
 
 fn info_row(ui: &mut Ui, label: &str, value: &str) {
+    info_row_width(ui, label, value, CARD_INNER_WIDTH - 16.0);
+}
+
+fn info_row_width(ui: &mut Ui, label: &str, value: &str, width: f32) {
     ui.horizontal(|ui| {
-        ui.set_width(CARD_INNER_WIDTH - 16.0);
+        ui.set_width(width);
+        let label_width = 96.0;
+        let gap = 8.0;
+        let value_width = (width - label_width - gap).max(80.0);
         ui.add_sized(
-            Vec2::new(96.0, 20.0),
+            Vec2::new(label_width, 20.0),
             egui::Label::new(
                 RichText::new(label)
                     .font(FontId::proportional(13.0))
@@ -3519,11 +3736,11 @@ fn info_row(ui: &mut Ui, label: &str, value: &str) {
             )
             .wrap(false),
         );
-        ui.add_space(8.0);
+        ui.add_space(gap);
         scrolling_label(
             ui,
             value,
-            CARD_INNER_WIDTH - 126.0,
+            value_width,
             FontId::proportional(13.0),
             phase::text_secondary(),
         );
@@ -3764,6 +3981,59 @@ fn display_theme_owner(owner: &verification::PhaseThemeOwner) -> String {
         })
         .unwrap_or("Phase creator")
         .to_owned()
+}
+
+fn theme_matches_search(asset: &verification::PhaseThemeAsset, search: &str) -> bool {
+    let search = search.trim().to_ascii_lowercase();
+    if search.is_empty() {
+        return true;
+    }
+
+    let owner = asset
+        .owner
+        .as_ref()
+        .map(display_theme_owner)
+        .unwrap_or_default();
+    let tags = asset.tags.join(" ");
+    let haystack =
+        format!("{} {} {} {}", asset.title, asset.description, owner, tags).to_ascii_lowercase();
+    haystack.contains(&search)
+}
+
+fn theme_background_layout(
+    rect: Rect,
+    texture_size: Vec2,
+    mode: ThemeBackgroundMode,
+) -> (Rect, Rect) {
+    let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    let image_w = texture_size.x.max(1.0);
+    let image_h = texture_size.y.max(1.0);
+    let image_aspect = image_w / image_h;
+    let rect_aspect = rect.width().max(1.0) / rect.height().max(1.0);
+
+    match mode {
+        ThemeBackgroundMode::Stretch => (rect, full_uv),
+        ThemeBackgroundMode::Fit => {
+            let size = if image_aspect > rect_aspect {
+                Vec2::new(rect.width(), rect.width() / image_aspect)
+            } else {
+                Vec2::new(rect.height() * image_aspect, rect.height())
+            };
+            (Rect::from_center_size(rect.center(), size), full_uv)
+        }
+        ThemeBackgroundMode::Crop => {
+            let uv = if image_aspect > rect_aspect {
+                let visible_width = rect_aspect / image_aspect;
+                let inset = (1.0 - visible_width) * 0.5;
+                Rect::from_min_max(Pos2::new(inset, 0.0), Pos2::new(1.0 - inset, 1.0))
+            } else {
+                let visible_height = image_aspect / rect_aspect;
+                let inset = (1.0 - visible_height) * 0.5;
+                Rect::from_min_max(Pos2::new(0.0, inset), Pos2::new(1.0, 1.0 - inset))
+            };
+            (rect, uv)
+        }
+    }
 }
 
 fn primary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui::Response {

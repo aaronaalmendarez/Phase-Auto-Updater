@@ -119,11 +119,12 @@ impl VerificationPlan {
         )
     }
 
-    pub fn phase_themes_url(&self) -> String {
+    pub fn phase_themes_url(&self, page: u64) -> String {
         format!(
-            "{}{}?kind=theme&sort=popular",
+            "{}{}?kind=theme&sort=popular&page={}",
             self.base_url.trim_end_matches('/'),
-            PHASE_ASSETS_ENDPOINT
+            PHASE_ASSETS_ENDPOINT,
+            page.max(1)
         )
     }
 
@@ -390,19 +391,32 @@ pub fn fetch_roblox_asset_thumbnail_image(asset_id: &str) -> Result<Vec<u8>, Str
 }
 
 pub fn fetch_phase_themes(plan: &VerificationPlan) -> Result<Vec<PhaseThemeAsset>, String> {
-    let response = http_agent()?
-        .get(&plan.phase_themes_url())
-        .timeout(std::time::Duration::from_secs(10))
-        .call()
-        .map_err(|error| format!("Could not load Phase themes: {error}"))?
-        .into_json::<PhaseThemeListResponse>()
-        .map_err(|error| format!("Invalid Phase themes response: {error}"))?;
+    let mut page = 1;
+    let mut themes = Vec::new();
 
-    Ok(response
-        .assets
-        .into_iter()
-        .filter(|asset| asset.kind == "theme" && asset.has_theme_code)
-        .collect())
+    loop {
+        let response = http_agent()?
+            .get(&plan.phase_themes_url(page))
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+            .map_err(|error| format!("Could not load Phase themes: {error}"))?
+            .into_json::<PhaseThemeListResponse>()
+            .map_err(|error| format!("Invalid Phase themes response: {error}"))?;
+
+        themes.extend(
+            response
+                .assets
+                .into_iter()
+                .filter(|asset| asset.kind == "theme" && asset.has_theme_code),
+        );
+
+        if page >= response.pages.max(1) {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(themes)
 }
 
 pub fn install_phase_theme(
@@ -573,6 +587,8 @@ pub struct PluginMeResponse {
 #[serde(rename_all = "camelCase")]
 pub struct PhaseThemeListResponse {
     pub assets: Vec<PhaseThemeAsset>,
+    #[serde(default = "default_page_count")]
+    pub pages: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -624,6 +640,10 @@ pub struct PhaseThemeOwner {
     pub username: String,
     #[serde(default)]
     pub display_name: Option<String>,
+}
+
+fn default_page_count() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize)]
