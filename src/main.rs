@@ -1846,7 +1846,8 @@ fn safe_file_fragment(value: &str) -> String {
 }
 
 impl eframe::App for PhaseInstallerApp {
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        apply_windows_title_bar(frame);
         self.tick(ctx);
 
         egui::CentralPanel::default()
@@ -3227,6 +3228,54 @@ fn load_window_icon() -> IconData {
         width: 256,
         height: 256,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_title_bar(frame: &eframe::Frame) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DwmSetWindowAttribute,
+    };
+
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(window) = handle.as_raw() else {
+        return;
+    };
+
+    let hwnd = window.hwnd.get() as *mut core::ffi::c_void;
+    let caption = color_ref(phase::surface());
+    let text = color_ref(phase::text());
+    let border = color_ref(phase::accent_dim());
+
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR as u32,
+            &caption as *const _ as *const _,
+            core::mem::size_of_val(&caption) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TEXT_COLOR as u32,
+            &text as *const _ as *const _,
+            core::mem::size_of_val(&text) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            &border as *const _ as *const _,
+            core::mem::size_of_val(&border) as u32,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_title_bar(_frame: &eframe::Frame) {}
+
+fn color_ref(color: Color32) -> u32 {
+    (color.r() as u32) | ((color.g() as u32) << 8) | ((color.b() as u32) << 16)
 }
 
 fn spawn_avatar_fetch(
