@@ -21,6 +21,7 @@ The updater connects to Phase, checks for the latest release, and installs the p
 - connects a Phase account
 - supports Roblox OAuth verification
 - supports license key activation
+- can apply public Phase marketplace themes to the installer UI
 - watches for new updater events and sends a desktop notification
 - downloads the plugin `.rbxm`
 - checks the file hash before replacing local files
@@ -72,7 +73,7 @@ cargo run --bin phase-tool
 There are GitHub Actions in `.github/workflows`:
 
 - `build.yml` builds Windows and macOS on pushes / PRs and uploads artifacts.
-- `release.yml` builds `PhaseAnimatorSetup.exe`, the Windows MSI, and the macOS zip when a tag like `v0.1.5` is pushed.
+- `release.yml` builds `PhaseAnimatorSetup.exe`, the Windows MSI, and the macOS zip when a tag like `v0.1.6` is pushed.
 
 When a GitHub Release has a newer `PhaseAutoUpdater-*.msi` asset, the app shows it in the Options tab and can launch the installer update.
 

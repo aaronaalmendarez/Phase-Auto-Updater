@@ -107,6 +107,15 @@ struct AvatarFetchResult {
     image: Result<ColorImage, String>,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThemeSelection {
+    asset_id: String,
+    title: String,
+    theme_code: String,
+    background_image_id: Option<String>,
+}
+
 struct InstallOutcome {
     target_path: PathBuf,
     backup_path: Option<PathBuf>,
@@ -131,6 +140,8 @@ struct AccountCache {
     roblox_user_id: String,
     roblox_username: Option<String>,
     activation: Option<verification::ActivationResponse>,
+    #[serde(default)]
+    selected_theme: Option<ThemeSelection>,
 }
 
 struct PhaseInstallerApp {
@@ -158,6 +169,11 @@ struct PhaseInstallerApp {
     app_update_install_rx: Option<Receiver<Result<PathBuf, String>>>,
     app_update: Option<verification::AppUpdateInfo>,
     app_update_error: Option<String>,
+    theme_assets: Vec<verification::PhaseThemeAsset>,
+    theme_fetch_rx: Option<Receiver<Result<Vec<verification::PhaseThemeAsset>, String>>>,
+    theme_apply_rx: Option<Receiver<Result<ThemeSelection, String>>>,
+    theme_error: Option<String>,
+    selected_theme: Option<ThemeSelection>,
     last_link_poll: Option<Instant>,
     linked_user: Option<verification::LinkedUser>,
     plugin_token: Option<String>,
@@ -222,6 +238,11 @@ impl PhaseInstallerApp {
             app_update_install_rx: None,
             app_update: None,
             app_update_error: None,
+            theme_assets: Vec::new(),
+            theme_fetch_rx: None,
+            theme_apply_rx: None,
+            theme_error: None,
+            selected_theme: None,
             last_link_poll: None,
             linked_user: None,
             plugin_token: None,
@@ -249,17 +270,20 @@ impl PhaseInstallerApp {
             milestone: 0,
         };
 
-        app.load_cached_accounts();
+        app.load_cached_accounts(&cc.egui_ctx);
 
-        app.log(phase::BLUE, "Detected local Roblox Studio plugin folders.");
+        app.log(
+            phase::blue(),
+            "Detected local Roblox Studio plugin folders.",
+        );
         if let Some(path) = app.selected_folder.clone() {
             app.log(
-                phase::GREEN,
+                phase::green(),
                 format!("Install location: {}", compact_path(&path, 30)),
             );
         } else {
             app.log(
-                phase::WARNING,
+                phase::warning(),
                 "Choose a Roblox Studio plugin folder to continue.",
             );
         }
@@ -267,6 +291,7 @@ impl PhaseInstallerApp {
         app.begin_update_stream(&cc.egui_ctx);
         app.begin_phase_account_refresh(&cc.egui_ctx);
         app.begin_app_update_check(&cc.egui_ctx);
+        app.begin_theme_fetch(&cc.egui_ctx);
 
         app
     }
@@ -282,6 +307,8 @@ impl PhaseInstallerApp {
         self.poll_phase_disconnect(ctx);
         self.poll_app_update_check(ctx);
         self.poll_app_update_install(ctx);
+        self.poll_theme_fetch(ctx);
+        self.poll_theme_apply(ctx);
         self.poll_avatar_fetches(ctx);
         self.ensure_avatar_fetches(ctx);
 
@@ -338,26 +365,26 @@ impl PhaseInstallerApp {
         self.phase_started_at = Some(Instant::now());
         self.milestone = 0;
         self.activity.clear();
-        self.log(phase::BLUE, "Checking for updates...");
+        self.log(phase::blue(), "Checking for updates...");
         self.begin_version_check(None);
     }
 
     fn start_install(&mut self) {
         let Some(folder) = self.selected_folder.clone() else {
             self.phase = InstallPhase::Error;
-            self.log(phase::RED, "Select an install location first.");
+            self.log(phase::red(), "Select an install location first.");
             return;
         };
 
         let Some(release) = self.release.clone() else {
             self.phase = InstallPhase::Error;
-            self.log(phase::RED, "Check for updates before installing.");
+            self.log(phase::red(), "Check for updates before installing.");
             return;
         };
 
         if release.blocked || !release.download_available {
             self.phase = InstallPhase::Error;
-            self.log(phase::RED, "This update is not available for install.");
+            self.log(phase::red(), "This update is not available for install.");
             return;
         }
 
@@ -365,7 +392,7 @@ impl PhaseInstallerApp {
             self.phase = InstallPhase::Error;
             self.active_tab = ViewTab::Account;
             self.log(
-                phase::RED,
+                phase::red(),
                 "Connect or verify your account before installing.",
             );
             return;
@@ -376,7 +403,7 @@ impl PhaseInstallerApp {
         self.phase_started_at = Some(Instant::now());
         self.milestone = 3;
         self.activity.clear();
-        self.log(phase::BLUE, "Preparing update.");
+        self.log(phase::blue(), "Preparing update.");
 
         let plugin_files = self
             .selected_candidate()
@@ -439,24 +466,24 @@ impl PhaseInstallerApp {
                     self.progress = 1.0;
                     self.phase_started_at = None;
                     self.log(
-                        phase::GREEN,
+                        phase::green(),
                         format!("Version {latest_version} is available."),
                     );
                     if required {
-                        self.log(phase::WARNING, "This update is required.");
+                        self.log(phase::warning(), "This update is required.");
                     }
                 } else {
                     self.phase = InstallPhase::Complete;
                     self.progress = 1.0;
                     self.phase_started_at = None;
-                    self.log(phase::GREEN, "Installed plugin is current.");
+                    self.log(phase::green(), "Installed plugin is current.");
                 }
             }
             Err(error) => {
                 self.release_error = Some(error.clone());
                 self.phase = InstallPhase::Error;
                 self.phase_started_at = None;
-                self.log(phase::RED, error);
+                self.log(phase::red(), error);
             }
         }
         ctx.request_repaint();
@@ -496,7 +523,7 @@ impl PhaseInstallerApp {
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or("new version");
-                self.log(phase::GREEN, format!("Update available: {version}."));
+                self.log(phase::green(), format!("Update available: {version}."));
                 show_update_notification(version);
                 self.begin_version_check(Some(ctx.clone()));
             }
@@ -551,7 +578,7 @@ impl PhaseInstallerApp {
         self.link_url = None;
         self.linked_user = None;
         self.plugin_token = None;
-        self.log(phase::BLUE, "Opening Phase account connection.");
+        self.log(phase::blue(), "Opening Phase account connection.");
 
         let repaint = ctx.clone();
         std::thread::spawn(move || {
@@ -591,13 +618,13 @@ impl PhaseInstallerApp {
                     self.link_code = Some(session.code.clone());
                     self.link_url = Some(session.verify_url.clone());
                     self.link_expires_at = Some(session.expires_at);
-                    self.log(phase::GREEN, format!("Link code ready: {}", session.code));
+                    self.log(phase::green(), format!("Link code ready: {}", session.code));
                     if let Err(error) = open::that(&session.verify_url) {
-                        self.log(phase::WARNING, format!("Open browser failed: {error}"));
+                        self.log(phase::warning(), format!("Open browser failed: {error}"));
                     }
                     self.begin_link_status_check(ctx);
                 }
-                Err(error) => self.log(phase::RED, error),
+                Err(error) => self.log(phase::red(), error),
             }
             ctx.request_repaint();
         }
@@ -635,7 +662,7 @@ impl PhaseInstallerApp {
                     .as_ref()
                     .map(display_linked_user)
                     .unwrap_or_else(|| "Phase account".to_owned());
-                self.log(phase::GREEN, format!("Connected to {name}."));
+                self.log(phase::green(), format!("Connected to {name}."));
                 if !access_token.is_empty() {
                     let user_id_text = status.roblox_user_id.clone().unwrap_or_default();
                     if let Ok(user_id) = user_id_text.parse::<u64>() {
@@ -664,7 +691,7 @@ impl PhaseInstallerApp {
                                 access_message.clone()
                             },
                         });
-                        self.log(phase::GREEN, "Phase account license verified.");
+                        self.log(phase::green(), "Phase account license verified.");
                     }
                 } else if status
                     .access_status
@@ -672,14 +699,14 @@ impl PhaseInstallerApp {
                     .is_some_and(|value| value != "verified" && value != "pending")
                     && !access_message.is_empty()
                 {
-                    self.log(phase::WARNING, access_message);
+                    self.log(phase::warning(), access_message);
                 }
                 self.save_account_cache();
             }
             Ok(status) => {
                 self.link_expires_at = status.expires_at;
             }
-            Err(error) => self.log(phase::WARNING, error),
+            Err(error) => self.log(phase::warning(), error),
         }
         ctx.request_repaint();
     }
@@ -718,17 +745,17 @@ impl PhaseInstallerApp {
             Ok(me) if me.plugin_linked => {
                 self.linked_user = Some(me.user);
                 if self.plugin_token.is_some() {
-                    self.log(phase::GREEN, "Phase account restored.");
+                    self.log(phase::green(), "Phase account restored.");
                 }
                 self.save_account_cache();
             }
             Ok(_) => {
                 self.clear_phase_account(true);
-                self.log(phase::WARNING, "Phase account link expired.");
+                self.log(phase::warning(), "Phase account link expired.");
             }
             Err(error) => {
                 self.clear_phase_account(true);
-                self.log(phase::WARNING, error);
+                self.log(phase::warning(), error);
             }
         }
         ctx.request_repaint();
@@ -759,7 +786,7 @@ impl PhaseInstallerApp {
         self.roblox_user_id.clear();
         self.activation = None;
         self.activation_error = None;
-        self.log(phase::BLUE, "Starting Roblox browser verification.");
+        self.log(phase::blue(), "Starting Roblox browser verification.");
 
         let repaint = ctx.clone();
         std::thread::spawn(move || {
@@ -805,15 +832,15 @@ impl PhaseInstallerApp {
                     self.roblox_oauth_state = Some(session.state.clone());
                     self.roblox_oauth_url = Some(session.url.clone());
                     self.roblox_oauth_expires_at = Some(session.expires_at);
-                    self.log(phase::GREEN, "Roblox verification link ready.");
+                    self.log(phase::green(), "Roblox verification link ready.");
                     if let Err(error) = open::that(&session.url) {
-                        self.log(phase::WARNING, format!("Open browser failed: {error}"));
+                        self.log(phase::warning(), format!("Open browser failed: {error}"));
                     }
                     self.begin_roblox_oauth_status_check(ctx);
                 }
                 Err(error) => {
                     self.activation_error = Some(error.clone());
-                    self.log(phase::RED, error);
+                    self.log(phase::red(), error);
                 }
             }
             ctx.request_repaint();
@@ -844,7 +871,7 @@ impl PhaseInstallerApp {
                 let Ok(user_id) = user_id_text.parse::<u64>() else {
                     self.activation_error =
                         Some("Roblox OAuth returned an invalid user ID.".to_owned());
-                    self.log(phase::RED, "Roblox OAuth returned an invalid user ID.");
+                    self.log(phase::red(), "Roblox OAuth returned an invalid user ID.");
                     ctx.request_repaint();
                     return;
                 };
@@ -879,7 +906,7 @@ impl PhaseInstallerApp {
                     .as_deref()
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or(&self.roblox_user_id);
-                self.log(phase::GREEN, format!("Roblox verified: {name}."));
+                self.log(phase::green(), format!("Roblox verified: {name}."));
                 self.save_account_cache();
             }
             Ok(status) if status.status == "denied" => {
@@ -888,14 +915,14 @@ impl PhaseInstallerApp {
                     .unwrap_or_else(|| "Roblox verification was denied.".to_owned());
                 self.activation = None;
                 self.activation_error = Some(message.clone());
-                self.log(phase::RED, message);
+                self.log(phase::red(), message);
             }
             Ok(status) => {
                 self.roblox_oauth_expires_at = status.expires_at;
             }
             Err(error) => {
                 self.activation_error = Some(error.clone());
-                self.log(phase::WARNING, error);
+                self.log(phase::warning(), error);
             }
         }
         ctx.request_repaint();
@@ -908,14 +935,14 @@ impl PhaseInstallerApp {
 
         let Ok(user_id) = self.roblox_user_id.trim().parse::<u64>() else {
             self.activation_error = Some("Verify Roblox in browser first.".to_owned());
-            self.log(phase::RED, "Verify Roblox in browser first.");
+            self.log(phase::red(), "Verify Roblox in browser first.");
             return;
         };
 
         let license_key = self.license_key.trim().to_owned();
         if license_key.is_empty() {
             self.activation_error = Some("Enter a Phase license key.".to_owned());
-            self.log(phase::RED, "Enter a Phase license key.");
+            self.log(phase::red(), "Enter a Phase license key.");
             return;
         }
 
@@ -933,7 +960,7 @@ impl PhaseInstallerApp {
         self.activation = None;
         self.activation_error = None;
         self.log(
-            phase::BLUE,
+            phase::blue(),
             "Activating license key for verified Roblox account.",
         );
 
@@ -957,7 +984,7 @@ impl PhaseInstallerApp {
         self.activation_rx = None;
         match result {
             Ok(activation) => {
-                self.log(phase::GREEN, activation.message.clone());
+                self.log(phase::green(), activation.message.clone());
                 self.activation_error = None;
                 self.activation = Some(activation);
                 self.save_account_cache();
@@ -965,7 +992,7 @@ impl PhaseInstallerApp {
             Err(error) => {
                 self.activation = None;
                 self.activation_error = Some(error.clone());
-                self.log(phase::RED, error);
+                self.log(phase::red(), error);
             }
         }
         ctx.request_repaint();
@@ -1002,17 +1029,17 @@ impl PhaseInstallerApp {
                             self.phase = InstallPhase::Complete;
                             self.progress = 1.0;
                             self.log(
-                                phase::GREEN,
+                                phase::green(),
                                 format!("Installed Phase Animator {}.", outcome.version),
                             );
                             if let Some(backup) = outcome.backup_path {
                                 self.log(
-                                    phase::BLUE,
+                                    phase::blue(),
                                     format!("Backup saved: {}", compact_path(&backup, 34)),
                                 );
                             }
                             self.log(
-                                phase::GREEN,
+                                phase::green(),
                                 format!("Installed at {}", compact_path(&outcome.target_path, 34)),
                             );
                             self.refresh_detection();
@@ -1021,7 +1048,7 @@ impl PhaseInstallerApp {
                         Err(error) => {
                             self.phase = InstallPhase::Error;
                             self.progress = 0.0;
-                            self.log(phase::RED, error);
+                            self.log(phase::red(), error);
                         }
                     }
                 }
@@ -1047,7 +1074,7 @@ impl PhaseInstallerApp {
         let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
         let (tx, rx) = mpsc::channel();
         self.phase_disconnect_rx = Some(rx);
-        self.log(phase::BLUE, "Disconnecting Phase account.");
+        self.log(phase::blue(), "Disconnecting Phase account.");
 
         let repaint = ctx.clone();
         std::thread::spawn(move || {
@@ -1070,11 +1097,11 @@ impl PhaseInstallerApp {
         match result {
             Ok(()) => {
                 self.clear_phase_account(true);
-                self.log(phase::GREEN, "Phase account disconnected.");
+                self.log(phase::green(), "Phase account disconnected.");
             }
             Err(error) => {
                 self.clear_phase_account(true);
-                self.log(phase::WARNING, error);
+                self.log(phase::warning(), error);
             }
         }
         ctx.request_repaint();
@@ -1109,7 +1136,7 @@ impl PhaseInstallerApp {
         match result {
             Ok(Some(update)) => {
                 self.log(
-                    phase::BLUE,
+                    phase::blue(),
                     format!("Installer update {} is available.", update.version),
                 );
                 show_system_notification(
@@ -1142,7 +1169,7 @@ impl PhaseInstallerApp {
         let (tx, rx) = mpsc::channel();
         self.app_update_install_rx = Some(rx);
         self.log(
-            phase::BLUE,
+            phase::blue(),
             format!("Downloading installer {}.", update.version),
         );
 
@@ -1167,16 +1194,125 @@ impl PhaseInstallerApp {
         match result {
             Ok(path) => {
                 self.log(
-                    phase::GREEN,
+                    phase::green(),
                     format!("Installer launched: {}", compact_path(&path, 34)),
                 );
             }
             Err(error) => {
                 self.app_update_error = Some(error.clone());
-                self.log(phase::RED, error);
+                self.log(phase::red(), error);
             }
         }
         ctx.request_repaint();
+    }
+
+    fn begin_theme_fetch(&mut self, ctx: &Context) {
+        if self.theme_fetch_rx.is_some() {
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.theme_fetch_rx = Some(rx);
+        self.theme_error = None;
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::fetch_phase_themes(&plan);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_theme_fetch(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .theme_fetch_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.theme_fetch_rx = None;
+        match result {
+            Ok(themes) => {
+                self.theme_assets = themes;
+                self.theme_error = None;
+            }
+            Err(error) => {
+                self.theme_error = Some(error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_theme_apply(&mut self, ctx: &Context, asset: verification::PhaseThemeAsset) {
+        if self.theme_apply_rx.is_some() {
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.theme_apply_rx = Some(rx);
+        self.theme_error = None;
+        self.log(phase::blue(), format!("Applying {} theme.", asset.title));
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::install_phase_theme(&plan, &asset.id).and_then(|response| {
+                let theme_code = response.theme_code.trim().to_owned();
+                if theme_code.is_empty() {
+                    return Err("Theme did not include a Phase theme code.".to_owned());
+                }
+                Ok(ThemeSelection {
+                    asset_id: response.asset.id,
+                    title: response.asset.title,
+                    background_image_id: parse_theme_background_image_id(&theme_code),
+                    theme_code,
+                })
+            });
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_theme_apply(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .theme_apply_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.theme_apply_rx = None;
+        match result {
+            Ok(selection) => {
+                if let Some(palette) = phase::palette_from_theme_code(&selection.theme_code) {
+                    phase::set_palette(palette);
+                    configure_style(ctx);
+                    self.selected_theme = Some(selection.clone());
+                    self.save_account_cache();
+                    self.log(
+                        phase::green(),
+                        format!("Theme applied: {}", selection.title),
+                    );
+                } else {
+                    self.theme_error = Some("Theme code did not include enough colors.".to_owned());
+                }
+            }
+            Err(error) => {
+                self.theme_error = Some(error.clone());
+                self.log(phase::red(), error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn reset_theme(&mut self, ctx: &Context) {
+        phase::reset_palette();
+        configure_style(ctx);
+        self.selected_theme = None;
+        self.save_account_cache();
+        self.log(phase::green(), "Restored default Phase theme.");
     }
 
     fn disconnect_roblox_account(&mut self) {
@@ -1190,7 +1326,7 @@ impl PhaseInstallerApp {
         self.activation = None;
         self.activation_error = None;
         self.save_account_cache();
-        self.log(phase::GREEN, "Roblox account disconnected locally.");
+        self.log(phase::green(), "Roblox account disconnected locally.");
     }
 
     fn clear_phase_account(&mut self, save: bool) {
@@ -1206,7 +1342,7 @@ impl PhaseInstallerApp {
         }
     }
 
-    fn load_cached_accounts(&mut self) {
+    fn load_cached_accounts(&mut self, ctx: &Context) {
         let Some(cache) = load_account_cache() else {
             return;
         };
@@ -1215,8 +1351,15 @@ impl PhaseInstallerApp {
         self.roblox_user_id = cache.roblox_user_id;
         self.roblox_username = cache.roblox_username;
         self.activation = cache.activation;
+        self.selected_theme = cache.selected_theme;
+        if let Some(selection) = &self.selected_theme {
+            if let Some(palette) = phase::palette_from_theme_code(&selection.theme_code) {
+                phase::set_palette(palette);
+                configure_style(ctx);
+            }
+        }
         if self.plugin_token.is_some() || !self.roblox_user_id.trim().is_empty() {
-            self.log(phase::BLUE, "Restored saved account connection.");
+            self.log(phase::blue(), "Restored saved account connection.");
         }
     }
 
@@ -1227,6 +1370,7 @@ impl PhaseInstallerApp {
             roblox_user_id: self.roblox_user_id.clone(),
             roblox_username: self.roblox_username.clone(),
             activation: self.activation.clone(),
+            selected_theme: self.selected_theme.clone(),
         };
         save_account_cache(&cache);
     }
@@ -1298,7 +1442,7 @@ impl PhaseInstallerApp {
         self.selected_folder = previous
             .filter(|path| path.exists())
             .or_else(|| best_candidate(&self.candidates).map(|candidate| candidate.path));
-        self.log(phase::BLUE, "Install locations refreshed.");
+        self.log(phase::blue(), "Install locations refreshed.");
     }
 
     fn choose_folder(&mut self) {
@@ -1313,7 +1457,7 @@ impl PhaseInstallerApp {
                 self.candidates.insert(0, candidate);
             }
             self.log(
-                phase::GREEN,
+                phase::green(),
                 format!("Selected {}", compact_path(&folder, 30)),
             );
         }
@@ -1321,13 +1465,13 @@ impl PhaseInstallerApp {
 
     fn open_folder(&mut self) {
         let Some(path) = self.selected_folder.clone() else {
-            self.log(phase::WARNING, "No install location selected.");
+            self.log(phase::warning(), "No install location selected.");
             return;
         };
 
         match open::that(&path) {
-            Ok(_) => self.log(phase::BLUE, "Opened install location."),
-            Err(error) => self.log(phase::RED, format!("Could not open folder: {error}")),
+            Ok(_) => self.log(phase::blue(), "Opened install location."),
+            Err(error) => self.log(phase::red(), format!("Could not open folder: {error}")),
         }
     }
 
@@ -1413,7 +1557,7 @@ fn install_update(
     send_install_progress(
         tx,
         InstallPhase::Downloading,
-        phase::BLUE,
+        phase::blue(),
         "Authorizing install.",
         0.12,
     );
@@ -1440,7 +1584,7 @@ fn install_update(
     send_install_progress(
         tx,
         InstallPhase::Downloading,
-        phase::BLUE,
+        phase::blue(),
         "Downloading update package.",
         0.36,
     );
@@ -1477,7 +1621,7 @@ fn install_update(
     send_install_progress(
         tx,
         InstallPhase::Installing,
-        phase::GREEN,
+        phase::green(),
         "Update package verified.",
         0.72,
     );
@@ -1489,7 +1633,7 @@ fn install_update(
         send_install_progress(
             tx,
             InstallPhase::Installing,
-            phase::BLUE,
+            phase::blue(),
             "Created local backup.",
             0.82,
         );
@@ -1510,7 +1654,7 @@ fn install_update(
     send_install_progress(
         tx,
         InstallPhase::Installing,
-        phase::GREEN,
+        phase::green(),
         "Plugin files updated.",
         0.94,
     );
@@ -1614,7 +1758,7 @@ impl eframe::App for PhaseInstallerApp {
         self.tick(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(phase::BACKGROUND))
+            .frame(egui::Frame::none().fill(phase::background()))
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.set_width(SCROLL_BODY_WIDTH);
@@ -1655,10 +1799,10 @@ impl PhaseInstallerApp {
         match self.phase {
             InstallPhase::Checking => {
                 if elapsed >= Duration::from_millis(150) && self.milestone == 0 {
-                    self.log(phase::BLUE, "Checking for updates...");
+                    self.log(phase::blue(), "Checking for updates...");
                     self.milestone = 1;
                 } else if elapsed >= Duration::from_millis(400) && self.milestone == 1 {
-                    self.log(phase::GREEN, "Update service is available.");
+                    self.log(phase::green(), "Update service is available.");
                     self.milestone = 2;
                 } else if elapsed >= Duration::from_millis(650) && self.milestone == 2 {
                     let target = self
@@ -1666,7 +1810,7 @@ impl PhaseInstallerApp {
                         .as_ref()
                         .map(|release| release.latest_version.as_str())
                         .unwrap_or("latest");
-                    self.log(phase::BLUE, format!("Preparing version {target}."));
+                    self.log(phase::blue(), format!("Preparing version {target}."));
                     self.milestone = 3;
                 }
             }
@@ -1697,8 +1841,8 @@ impl PhaseInstallerApp {
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
         let painter = ui.painter();
 
-        painter.rect_filled(rect, Rounding::same(8.0), phase::INPUT);
-        painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, phase::LINE));
+        painter.rect_filled(rect, Rounding::same(8.0), phase::input());
+        painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, phase::line()));
 
         let tab_width = width / 4.0;
         let highlight_rect = Rect::from_min_max(
@@ -1712,11 +1856,11 @@ impl PhaseInstallerApp {
             ),
         );
 
-        painter.rect_filled(highlight_rect, Rounding::same(6.0), phase::SURFACE);
+        painter.rect_filled(highlight_rect, Rounding::same(6.0), phase::surface());
         painter.rect_stroke(
             highlight_rect,
             Rounding::same(6.0),
-            Stroke::new(1.0, phase::LINE),
+            Stroke::new(1.0, phase::line()),
         );
 
         if response.clicked() {
@@ -1753,9 +1897,9 @@ impl PhaseInstallerApp {
             };
 
             let color = if is_active {
-                phase::TEXT
+                phase::text()
             } else {
-                phase::TEXT_MUTED
+                phase::text_muted()
             };
 
             let icon_rect =
@@ -1779,8 +1923,8 @@ impl PhaseInstallerApp {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
         let painter = ui.painter();
 
-        painter.rect_filled(rect, Rounding::same(6.0), phase::INPUT);
-        painter.rect_stroke(rect, Rounding::same(6.0), Stroke::new(1.0, phase::LINE));
+        painter.rect_filled(rect, Rounding::same(6.0), phase::input());
+        painter.rect_stroke(rect, Rounding::same(6.0), Stroke::new(1.0, phase::line()));
 
         let progress = self.progress;
         if progress > 0.0 {
@@ -1798,9 +1942,9 @@ impl PhaseInstallerApp {
             pct_text,
             FontId::proportional(13.0),
             if progress > 0.4 {
-                phase::TEXT_ON_ACCENT
+                phase::text_on_accent()
             } else {
-                phase::TEXT
+                phase::text()
             },
         );
     }
@@ -1813,7 +1957,7 @@ impl PhaseInstallerApp {
             ui.label(
                 RichText::new("Phase Animator")
                     .font(FontId::proportional(24.0))
-                    .color(phase::TEXT),
+                    .color(phase::text()),
             );
         }
     }
@@ -1851,7 +1995,7 @@ impl PhaseInstallerApp {
                     &name,
                     "Phase account",
                     width,
-                    phase::ACCENT,
+                    phase::accent(),
                 );
             }
             if count == 2 {
@@ -1864,7 +2008,7 @@ impl PhaseInstallerApp {
                     &name,
                     "Roblox verified",
                     width,
-                    phase::BLUE,
+                    phase::blue(),
                 );
             }
         });
@@ -1876,13 +2020,13 @@ impl PhaseInstallerApp {
             RichText::new("Phase Animator")
                 .font(FontId::proportional(28.0))
                 .strong()
-                .color(phase::TEXT),
+                .color(phase::text()),
         );
         ui.add_space(3.0);
         ui.label(
             RichText::new("Roblox Studio plugin installer")
                 .font(FontId::proportional(13.5))
-                .color(phase::TEXT_SECONDARY),
+                .color(phase::text_secondary()),
         );
         ui.add_space(8.0);
         let row_size = Vec2::new(ui.available_width(), 24.0);
@@ -1892,7 +2036,7 @@ impl PhaseInstallerApp {
             let current_phase = phase_text(self.phase);
             let current_channel = "Default channel";
             status_pill(ui, current_phase, phase_color(self.phase));
-            status_pill(ui, current_channel, phase::ACCENT);
+            status_pill(ui, current_channel, phase::accent());
         });
     }
 
@@ -1921,8 +2065,8 @@ impl PhaseInstallerApp {
 
             ui.add_space(8.0);
             egui::Frame::none()
-                .fill(phase::INPUT)
-                .stroke(Stroke::new(1.0, phase::LINE))
+                .fill(phase::input())
+                .stroke(Stroke::new(1.0, phase::line()))
                 .rounding(Rounding::same(6.0))
                 .inner_margin(Margin::same(10.0))
                 .show(ui, |ui| {
@@ -1989,12 +2133,12 @@ impl PhaseInstallerApp {
                 "Use after closing Roblox Studio for best results.",
             ] {
                 ui.horizontal(|ui| {
-                    draw_icon(ui, MiniIcon::Check, Vec2::splat(16.0), phase::GREEN);
+                    draw_icon(ui, MiniIcon::Check, Vec2::splat(16.0), phase::green());
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(note)
                             .font(FontId::proportional(13.0))
-                            .color(phase::TEXT_SECONDARY),
+                            .color(phase::text_secondary()),
                     );
                 });
                 ui.add_space(4.0);
@@ -2008,14 +2152,14 @@ impl PhaseInstallerApp {
             ui.add_space(6.0);
 
             egui::Frame::none()
-                .fill(phase::INPUT)
-                .stroke(Stroke::new(1.0, phase::LINE))
+                .fill(phase::input())
+                .stroke(Stroke::new(1.0, phase::line()))
                 .rounding(Rounding::same(8.0))
                 .inner_margin(Margin::symmetric(14.0, 12.0))
                 .show(ui, |ui| {
                     ui.set_width(CARD_INNER_WIDTH - 16.0);
                     ui.horizontal(|ui| {
-                        draw_icon(ui, MiniIcon::User, Vec2::splat(34.0), phase::ACCENT);
+                        draw_icon(ui, MiniIcon::User, Vec2::splat(34.0), phase::accent());
                         ui.add_space(10.0);
                         ui.vertical(|ui| {
                             let title = self
@@ -2027,7 +2171,7 @@ impl PhaseInstallerApp {
                                 RichText::new(title)
                                     .font(FontId::proportional(15.0))
                                     .strong()
-                                    .color(phase::TEXT),
+                                    .color(phase::text()),
                             );
                             let detail = if self.plugin_token.is_some() {
                                 "Connected to this installer"
@@ -2039,7 +2183,7 @@ impl PhaseInstallerApp {
                             ui.label(
                                 RichText::new(detail)
                                     .font(FontId::proportional(11.0))
-                                    .color(phase::TEXT_MUTED),
+                                    .color(phase::text_muted()),
                             );
                         });
                     });
@@ -2113,7 +2257,7 @@ impl PhaseInstallerApp {
                     .clicked()
                     {
                         if let Err(error) = open::that(url) {
-                            self.log(phase::WARNING, format!("Open browser failed: {error}"));
+                            self.log(phase::warning(), format!("Open browser failed: {error}"));
                         }
                     }
                 }
@@ -2123,21 +2267,21 @@ impl PhaseInstallerApp {
             section_label(ui, "Verified Access");
             ui.add_space(6.0);
             egui::Frame::none()
-                .fill(phase::INPUT)
-                .stroke(Stroke::new(1.0, phase::LINE))
+                .fill(phase::input())
+                .stroke(Stroke::new(1.0, phase::line()))
                 .rounding(Rounding::same(8.0))
                 .inner_margin(Margin::symmetric(12.0, 10.0))
                 .show(ui, |ui| {
                     ui.set_width(CARD_INNER_WIDTH - 16.0);
                     ui.horizontal(|ui| {
-                        draw_icon(ui, MiniIcon::Lock, Vec2::splat(24.0), phase::ACCENT);
+                        draw_icon(ui, MiniIcon::Lock, Vec2::splat(24.0), phase::accent());
                         ui.add_space(8.0);
                         ui.vertical(|ui| {
                             ui.label(
                                 RichText::new("Roblox OAuth")
                                     .font(FontId::proportional(14.0))
                                     .strong()
-                                    .color(phase::TEXT),
+                                    .color(phase::text()),
                             );
                             let identity = self
                                 .roblox_username
@@ -2153,7 +2297,7 @@ impl PhaseInstallerApp {
                                 identity,
                                 CARD_INNER_WIDTH - 68.0,
                                 FontId::proportional(11.0),
-                                phase::TEXT_MUTED,
+                                phase::text_muted(),
                             );
                         });
                     });
@@ -2161,7 +2305,7 @@ impl PhaseInstallerApp {
                     ui.label(
                         RichText::new("Phase license key")
                             .font(FontId::proportional(11.0))
-                            .color(phase::TEXT_MUTED),
+                            .color(phase::text_muted()),
                     );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.license_key)
@@ -2213,7 +2357,7 @@ impl PhaseInstallerApp {
                         .clicked()
                         {
                             if let Err(error) = open::that(url) {
-                                self.log(phase::WARNING, format!("Open browser failed: {error}"));
+                                self.log(phase::warning(), format!("Open browser failed: {error}"));
                             }
                         }
                     }
@@ -2250,7 +2394,7 @@ impl PhaseInstallerApp {
                     error,
                     CARD_INNER_WIDTH - 16.0,
                     FontId::proportional(11.0),
-                    phase::RED,
+                    phase::red(),
                 );
             }
         });
@@ -2268,21 +2412,21 @@ impl PhaseInstallerApp {
             section_label(ui, "Install location");
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                draw_icon(ui, MiniIcon::Folder, Vec2::splat(40.0), phase::ACCENT);
+                draw_icon(ui, MiniIcon::Folder, Vec2::splat(40.0), phase::accent());
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.label(
                         RichText::new("ACTIVE ROBLOX PATH")
                             .font(FontId::proportional(10.0))
                             .strong()
-                            .color(phase::TEXT_MUTED),
+                            .color(phase::text_muted()),
                     );
                     scrolling_label(
                         ui,
                         &selected_text,
                         CARD_INNER_WIDTH - 74.0,
                         FontId::monospace(13.0),
-                        phase::TEXT,
+                        phase::text(),
                     );
                 });
             });
@@ -2290,8 +2434,8 @@ impl PhaseInstallerApp {
             if let Some(candidate) = self.selected_candidate() {
                 ui.add_space(8.0);
                 egui::Frame::none()
-                    .fill(phase::INPUT)
-                    .stroke(Stroke::new(1.0, phase::LINE))
+                    .fill(phase::input())
+                    .stroke(Stroke::new(1.0, phase::line()))
                     .rounding(Rounding::same(6.0))
                     .inner_margin(Margin::same(10.0))
                     .show(ui, |ui| {
@@ -2349,26 +2493,103 @@ impl PhaseInstallerApp {
                             RichText::new("Release Channel")
                                 .font(FontId::proportional(14.0))
                                 .strong()
-                                .color(phase::TEXT),
+                                .color(phase::text()),
                         );
                         ui.label(
                             RichText::new("Default public updater track")
                                 .font(FontId::proportional(11.0))
-                                .color(phase::TEXT_MUTED),
+                                .color(phase::text_muted()),
                         );
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        status_pill(ui, "Default", phase::ACCENT);
+                        status_pill(ui, "Default", phase::accent());
                     });
                 });
 
                 ui.add_space(14.0);
 
+                section_label(ui, "Marketplace Themes");
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(phase::input())
+                    .stroke(Stroke::new(1.0, phase::line()))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(14.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(CARD_INNER_WIDTH - 16.0);
+                        let current = self
+                            .selected_theme
+                            .as_ref()
+                            .map(|theme| theme.title.as_str())
+                            .unwrap_or("Default Phase");
+                        info_row(ui, "Active", current);
+                        if let Some(theme) = &self.selected_theme {
+                            if let Some(image_id) = &theme.background_image_id {
+                                ui.add_space(4.0);
+                                info_row(ui, "Background image", image_id);
+                            }
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let btn_width = (CARD_INNER_WIDTH - 8.0) / 2.0;
+                    let loading = self.theme_fetch_rx.is_some();
+                    let label = if loading { "Loading" } else { "Refresh" };
+                    ui.add_enabled_ui(!loading, |ui| {
+                        if secondary_button(
+                            ui,
+                            MiniIcon::Refresh,
+                            label,
+                            Vec2::new(btn_width, 36.0),
+                        )
+                        .clicked()
+                        {
+                            self.begin_theme_fetch(ui.ctx());
+                        }
+                    });
+                    if secondary_button(ui, MiniIcon::Gear, "Default", Vec2::new(btn_width, 36.0))
+                        .clicked()
+                    {
+                        self.reset_theme(ui.ctx());
+                    }
+                });
+
+                ui.add_space(8.0);
+                if self.theme_assets.is_empty() && self.theme_fetch_rx.is_some() {
+                    scrolling_label(
+                        ui,
+                        "Loading Phase themes...",
+                        CARD_INNER_WIDTH - 16.0,
+                        FontId::proportional(11.0),
+                        phase::text_muted(),
+                    );
+                }
+
+                let themes: Vec<_> = self.theme_assets.iter().take(6).cloned().collect();
+                for asset in themes {
+                    self.theme_asset_row(ui, asset);
+                    ui.add_space(6.0);
+                }
+
+                if let Some(error) = &self.theme_error {
+                    ui.add_space(4.0);
+                    scrolling_label(
+                        ui,
+                        error,
+                        CARD_INNER_WIDTH - 16.0,
+                        FontId::proportional(11.0),
+                        phase::warning(),
+                    );
+                }
+
+                ui.add_space(16.0);
+
                 // Group checkmark preferences into a sleek card container
                 egui::Frame::none()
-                    .fill(phase::INPUT)
-                    .stroke(Stroke::new(1.0, phase::LINE))
+                    .fill(phase::input())
+                    .stroke(Stroke::new(1.0, phase::line()))
                     .rounding(Rounding::same(8.0))
                     .inner_margin(Margin::symmetric(14.0, 12.0))
                     .show(ui, |ui| {
@@ -2378,14 +2599,14 @@ impl PhaseInstallerApp {
                                 &mut self.backup_before_install,
                                 RichText::new("Back up current plugin first")
                                     .font(FontId::proportional(13.0))
-                                    .color(phase::TEXT_SECONDARY),
+                                    .color(phase::text_secondary()),
                             );
                             ui.add_space(10.0);
                             ui.checkbox(
                                 &mut self.restart_studio_hint,
                                 RichText::new("Show Roblox Studio restart reminder")
                                     .font(FontId::proportional(13.0))
-                                    .color(phase::TEXT_SECONDARY),
+                                    .color(phase::text_secondary()),
                             );
                         });
                     });
@@ -2395,8 +2616,8 @@ impl PhaseInstallerApp {
                 section_label(ui, "App Updates");
                 ui.add_space(6.0);
                 egui::Frame::none()
-                    .fill(phase::INPUT)
-                    .stroke(Stroke::new(1.0, phase::LINE))
+                    .fill(phase::input())
+                    .stroke(Stroke::new(1.0, phase::line()))
                     .rounding(Rounding::same(8.0))
                     .inner_margin(Margin::symmetric(14.0, 10.0))
                     .show(ui, |ui| {
@@ -2456,7 +2677,7 @@ impl PhaseInstallerApp {
                         error,
                         CARD_INNER_WIDTH - 16.0,
                         FontId::proportional(11.0),
-                        phase::WARNING,
+                        phase::warning(),
                     );
                 }
 
@@ -2465,24 +2686,75 @@ impl PhaseInstallerApp {
                 section_label(ui, "About");
                 ui.add_space(6.0);
                 egui::Frame::none()
-                    .fill(phase::INPUT)
-                    .stroke(Stroke::new(1.0, phase::LINE))
+                    .fill(phase::input())
+                    .stroke(Stroke::new(1.0, phase::line()))
                     .rounding(Rounding::same(8.0))
                     .inner_margin(Margin::symmetric(14.0, 10.0))
                     .show(ui, |ui| {
                         ui.set_width(CARD_INNER_WIDTH - 16.0);
                         ui.horizontal(|ui| {
-                            draw_icon(ui, MiniIcon::Lock, Vec2::splat(13.0), phase::TEXT_MUTED);
+                            draw_icon(ui, MiniIcon::Lock, Vec2::splat(13.0), phase::text_muted());
                             ui.add_space(6.0);
                             ui.label(
                                 RichText::new("Phase Animator installer settings")
                                     .font(FontId::proportional(12.0))
-                                    .color(phase::TEXT_MUTED),
+                                    .color(phase::text_muted()),
                             );
                         });
                     });
             });
         });
+    }
+
+    fn theme_asset_row(&mut self, ui: &mut Ui, asset: verification::PhaseThemeAsset) {
+        egui::Frame::none()
+            .fill(phase::surface())
+            .stroke(Stroke::new(1.0, phase::line()))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(CARD_INNER_WIDTH - 16.0);
+                ui.horizontal(|ui| {
+                    draw_icon(ui, MiniIcon::Gear, Vec2::splat(18.0), phase::accent());
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        scrolling_label(
+                            ui,
+                            &asset.title,
+                            CARD_INNER_WIDTH - 150.0,
+                            FontId::proportional(13.0),
+                            phase::text(),
+                        );
+                        let author = asset
+                            .owner
+                            .as_ref()
+                            .map(display_theme_owner)
+                            .unwrap_or_else(|| "Phase marketplace".to_owned());
+                        scrolling_label(
+                            ui,
+                            &format!("{} installs · {}", asset.install_count, author),
+                            CARD_INNER_WIDTH - 150.0,
+                            FontId::proportional(10.5),
+                            phase::text_muted(),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let applying = self.theme_apply_rx.is_some();
+                        ui.add_enabled_ui(!applying, |ui| {
+                            if secondary_button(
+                                ui,
+                                MiniIcon::Download,
+                                if applying { "Applying" } else { "Apply" },
+                                Vec2::new(92.0, 34.0),
+                            )
+                            .clicked()
+                            {
+                                self.start_theme_apply(ui.ctx(), asset);
+                            }
+                        });
+                    });
+                });
+            });
     }
 
     fn folder_candidates(&mut self, ui: &mut Ui) {
@@ -2499,22 +2771,26 @@ impl PhaseInstallerApp {
             let painter = ui.painter();
 
             let bg_color = if selected {
-                phase::INPUT
+                phase::input()
             } else if response.hovered() {
-                phase::SURFACE_HOVER
+                phase::surface_hover()
             } else {
-                phase::SURFACE
+                phase::surface()
             };
 
-            let border_color = if selected { phase::ACCENT } else { phase::LINE };
+            let border_color = if selected {
+                phase::accent()
+            } else {
+                phase::line()
+            };
 
             painter.rect_filled(rect, Rounding::same(8.0), bg_color);
             painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, border_color));
 
             let dot_color = match candidate.health {
-                FolderHealth::Ready => phase::GREEN,
-                FolderHealth::Empty => phase::WARNING,
-                FolderHealth::Missing => phase::RED,
+                FolderHealth::Ready => phase::green(),
+                FolderHealth::Empty => phase::warning(),
+                FolderHealth::Missing => phase::red(),
             };
 
             let dot_center = Pos2::new(rect.left() + 23.0, rect.center().y);
@@ -2523,9 +2799,9 @@ impl PhaseInstallerApp {
             let path_text = candidate.path.to_string_lossy().to_string();
             let health_lbl = health_label(&candidate.health);
             let text_color = if selected {
-                phase::TEXT
+                phase::text()
             } else {
-                phase::TEXT_SECONDARY
+                phase::text_secondary()
             };
             let title_rect = Rect::from_min_size(
                 Pos2::new(rect.left() + 40.0, rect.top() + 8.0),
@@ -2551,14 +2827,14 @@ impl PhaseInstallerApp {
                     &format!("Source: {}", candidate.source),
                     source_rect.width(),
                     FontId::proportional(10.5),
-                    phase::TEXT_MUTED,
+                    phase::text_muted(),
                 );
             });
 
             if response.clicked() {
                 self.selected_folder = Some(candidate.path.clone());
                 self.log(
-                    phase::BLUE,
+                    phase::blue(),
                     format!("Selected {}", compact_path(&candidate.path, 30)),
                 );
             }
@@ -2575,7 +2851,7 @@ impl PhaseInstallerApp {
 
             egui::Frame::none()
                 .fill(Color32::from_rgb(10, 8, 16))
-                .stroke(Stroke::new(1.0, phase::LINE))
+                .stroke(Stroke::new(1.0, phase::line()))
                 .rounding(Rounding::same(6.0))
                 .inner_margin(Margin::same(8.0))
                 .show(ui, |ui| {
@@ -2591,15 +2867,15 @@ impl PhaseInstallerApp {
                                 ui.label(
                                     RichText::new(time_prefix)
                                         .font(FontId::monospace(11.5))
-                                        .color(phase::TEXT_MUTED),
+                                        .color(phase::text_muted()),
                                 );
 
-                                let text_color = if line.color == phase::RED {
-                                    phase::RED
-                                } else if line.color == phase::GREEN {
+                                let text_color = if line.color == phase::red() {
+                                    phase::red()
+                                } else if line.color == phase::green() {
                                     Color32::from_rgb(120, 230, 150)
                                 } else {
-                                    phase::TEXT_SECONDARY
+                                    phase::text_secondary()
                                 };
 
                                 scrolling_label(
@@ -2634,14 +2910,14 @@ fn configure_style(ctx: &Context) {
 
     let mut style = (*ctx.style()).clone();
     style.visuals.dark_mode = true;
-    style.visuals.panel_fill = phase::BACKGROUND;
-    style.visuals.window_fill = phase::BACKGROUND;
-    style.visuals.widgets.noninteractive.bg_fill = phase::SURFACE;
-    style.visuals.widgets.inactive.bg_fill = phase::INPUT;
-    style.visuals.widgets.hovered.bg_fill = phase::SURFACE_HOVER;
-    style.visuals.widgets.active.bg_fill = phase::SURFACE_ACTIVE;
-    style.visuals.selection.bg_fill = phase::ACCENT_DIM;
-    style.visuals.selection.stroke = Stroke::new(1.0, phase::ACCENT);
+    style.visuals.panel_fill = phase::background();
+    style.visuals.window_fill = phase::background();
+    style.visuals.widgets.noninteractive.bg_fill = phase::surface();
+    style.visuals.widgets.inactive.bg_fill = phase::input();
+    style.visuals.widgets.hovered.bg_fill = phase::surface_hover();
+    style.visuals.widgets.active.bg_fill = phase::surface_active();
+    style.visuals.selection.bg_fill = phase::accent_dim();
+    style.visuals.selection.stroke = Stroke::new(1.0, phase::accent());
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(12.0, 8.0);
     ctx.set_style(style);
@@ -2750,8 +3026,8 @@ fn identity_card(
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 54.0), Sense::hover());
     {
         let painter = ui.painter();
-        painter.rect_filled(rect, Rounding::same(8.0), phase::INPUT);
-        painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, phase::LINE));
+        painter.rect_filled(rect, Rounding::same(8.0), phase::input());
+        painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, phase::line()));
 
         let avatar_rect = Rect::from_center_size(
             Pos2::new(rect.left() + 29.0, rect.center().y),
@@ -2771,13 +3047,13 @@ fn identity_card(
                 Align2::CENTER_CENTER,
                 initials(name),
                 FontId::proportional(13.0),
-                phase::TEXT,
+                phase::text(),
             );
         }
         painter.circle_stroke(avatar_rect.center(), 17.0, Stroke::new(1.5, accent));
         let dot = Pos2::new(avatar_rect.right() - 3.0, avatar_rect.bottom() - 4.0);
-        painter.circle_filled(dot, 5.0, phase::INPUT);
-        painter.circle_filled(dot, 3.4, phase::GREEN);
+        painter.circle_filled(dot, 5.0, phase::input());
+        painter.circle_filled(dot, 3.4, phase::green());
     }
 
     let text_x = rect.left() + 60.0;
@@ -2792,7 +3068,7 @@ fn identity_card(
             name,
             text_width,
             FontId::proportional(13.5),
-            phase::TEXT,
+            phase::text(),
         );
     });
     let detail_rect = Rect::from_min_size(
@@ -2805,7 +3081,7 @@ fn identity_card(
             detail,
             text_width,
             FontId::proportional(10.5),
-            phase::TEXT_MUTED,
+            phase::text_muted(),
         );
     });
 }
@@ -2816,8 +3092,8 @@ fn draw_card(ui: &mut Ui, height: Option<f32>, add_contents: impl FnOnce(&mut Ui
         ui.set_max_width(CARD_WIDTH);
 
         let frame = egui::Frame::none()
-            .fill(phase::SURFACE)
-            .stroke(Stroke::new(1.0, phase::LINE))
+            .fill(phase::surface())
+            .stroke(Stroke::new(1.0, phase::line()))
             .rounding(Rounding::same(8.0))
             .inner_margin(Margin::symmetric(14.0, 12.0));
 
@@ -2840,7 +3116,7 @@ fn section_label(ui: &mut Ui, text: &str) {
     ui.label(
         RichText::new(text.to_uppercase())
             .font(FontId::proportional(10.0))
-            .color(phase::TEXT_MUTED),
+            .color(phase::text_muted()),
     );
 }
 
@@ -3097,13 +3373,13 @@ fn draw_icon_at(painter: &egui::Painter, rect: Rect, icon: MiniIcon, color: Colo
 }
 
 fn draw_release_icon(ui: &mut Ui, icon: MiniIcon) {
-    draw_icon(ui, icon, Vec2::splat(52.0), phase::ACCENT_HOVER);
+    draw_icon(ui, icon, Vec2::splat(52.0), phase::accent_hover());
 }
 
 fn release_metric(ui: &mut Ui, icon: MiniIcon, label: &str, value: &str) {
     egui::Frame::none()
-        .fill(phase::INPUT)
-        .stroke(Stroke::new(1.0, phase::LINE))
+        .fill(phase::input())
+        .stroke(Stroke::new(1.0, phase::line()))
         .rounding(Rounding::same(8.0))
         .inner_margin(Margin::symmetric(18.0, 14.0))
         .show(ui, |ui| {
@@ -3116,14 +3392,14 @@ fn release_metric(ui: &mut Ui, icon: MiniIcon, label: &str, value: &str) {
                     ui.label(
                         RichText::new(label.to_uppercase())
                             .font(FontId::proportional(10.5))
-                            .color(phase::TEXT_MUTED),
+                            .color(phase::text_muted()),
                     );
                     scrolling_label(
                         ui,
                         value,
                         CARD_INNER_WIDTH - 96.0,
                         FontId::proportional(18.0),
-                        phase::TEXT,
+                        phase::text(),
                     );
                 });
             });
@@ -3138,7 +3414,7 @@ fn info_row(ui: &mut Ui, label: &str, value: &str) {
             egui::Label::new(
                 RichText::new(label)
                     .font(FontId::proportional(13.0))
-                    .color(phase::TEXT_MUTED),
+                    .color(phase::text_muted()),
             )
             .wrap(false),
         );
@@ -3148,7 +3424,7 @@ fn info_row(ui: &mut Ui, label: &str, value: &str) {
             value,
             CARD_INNER_WIDTH - 126.0,
             FontId::proportional(13.0),
-            phase::TEXT_SECONDARY,
+            phase::text_secondary(),
         );
     });
 }
@@ -3169,7 +3445,7 @@ fn scrolling_label(ui: &mut Ui, text: &str, width: f32, font: FontId, color: Col
 fn status_pill(ui: &mut Ui, text: &str, color: Color32) {
     let width = (text.chars().count() as f32 * 6.5 + 24.0).max(56.0);
     egui::Frame::none()
-        .fill(phase::INPUT)
+        .fill(phase::input())
         .stroke(Stroke::new(1.0, color))
         .rounding(Rounding::same(999.0))
         .inner_margin(Margin::symmetric(10.0, 4.0))
@@ -3201,13 +3477,13 @@ fn phase_text(phase: InstallPhase) -> &'static str {
 
 fn phase_color(phase: InstallPhase) -> Color32 {
     match phase {
-        InstallPhase::Complete => phase::GREEN,
-        InstallPhase::Error => phase::RED,
-        InstallPhase::Ready => phase::ACCENT,
+        InstallPhase::Complete => phase::green(),
+        InstallPhase::Error => phase::red(),
+        InstallPhase::Ready => phase::accent(),
         InstallPhase::Checking | InstallPhase::Downloading | InstallPhase::Installing => {
-            phase::BLUE
+            phase::blue()
         }
-        InstallPhase::Idle => phase::ACCENT_DIM,
+        InstallPhase::Idle => phase::accent_dim(),
     }
 }
 
@@ -3273,6 +3549,7 @@ fn save_account_cache(cache: &AccountCache) {
         && cache.linked_user.is_none()
         && cache.roblox_user_id.trim().is_empty()
         && cache.activation.is_none()
+        && cache.selected_theme.is_none()
     {
         let _ = std::fs::remove_file(path);
         return;
@@ -3363,6 +3640,31 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+fn parse_theme_background_image_id(theme_code: &str) -> Option<String> {
+    theme_code
+        .split('|')
+        .find_map(|part| part.strip_prefix('i'))
+        .map(str::trim)
+        .filter(|value| value.chars().all(|ch| ch.is_ascii_digit()) && !value.is_empty())
+        .map(|value| value.to_owned())
+}
+
+fn display_theme_owner(owner: &verification::PhaseThemeOwner) -> String {
+    owner
+        .display_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            if owner.username.trim().is_empty() {
+                None
+            } else {
+                Some(owner.username.as_str())
+            }
+        })
+        .unwrap_or("Phase creator")
+        .to_owned()
+}
+
 fn primary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui::Response {
     let (id, button_rect) = ui.allocate_space(size);
     let response = ui.interact(button_rect, id, Sense::click());
@@ -3372,33 +3674,33 @@ fn primary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui::
 
     let painter = ui.painter();
 
-    let mut bg_color = phase::ACCENT;
+    let mut bg_color = phase::accent();
     if hovered {
-        bg_color = phase::ACCENT_HOVER;
+        bg_color = phase::accent_hover();
     }
     if active {
-        bg_color = phase::ACCENT_DIM;
+        bg_color = phase::accent_dim();
     }
 
     painter.rect_filled(button_rect, Rounding::same(6.0), bg_color);
     painter.rect_stroke(
         button_rect,
         Rounding::same(6.0),
-        Stroke::new(1.0, phase::TEXT_ON_ACCENT),
+        Stroke::new(1.0, phase::text_on_accent()),
     );
 
     let icon_rect = Rect::from_center_size(
         Pos2::new(button_rect.center().x - 82.0, button_rect.center().y),
         Vec2::splat(19.0),
     );
-    draw_icon_at(painter, icon_rect, icon, phase::TEXT_ON_ACCENT);
+    draw_icon_at(painter, icon_rect, icon, phase::text_on_accent());
 
     painter.text(
         Pos2::new(button_rect.center().x + 12.0, button_rect.center().y),
         Align2::CENTER_CENTER,
         text,
         FontId::proportional(16.0),
-        phase::TEXT_ON_ACCENT,
+        phase::text_on_accent(),
     );
 
     response
@@ -3413,14 +3715,18 @@ fn secondary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui
 
     let painter = ui.painter();
 
-    let stroke_color = if hovered { phase::ACCENT } else { phase::LINE };
+    let stroke_color = if hovered {
+        phase::accent()
+    } else {
+        phase::line()
+    };
 
     let bg_color = if active {
-        phase::SURFACE_ACTIVE
+        phase::surface_active()
     } else if hovered {
-        phase::SURFACE_HOVER
+        phase::surface_hover()
     } else {
-        phase::INPUT
+        phase::input()
     };
 
     painter.rect_filled(button_rect, Rounding::same(6.0), bg_color);
@@ -3431,9 +3737,9 @@ fn secondary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui
     );
 
     let text_color = if hovered {
-        phase::TEXT
+        phase::text()
     } else {
-        phase::TEXT_SECONDARY
+        phase::text_secondary()
     };
     let icon_rect = Rect::from_center_size(
         Pos2::new(button_rect.left() + 22.0, button_rect.center().y),
@@ -3456,44 +3762,187 @@ fn status_action(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) {
     let (id, button_rect) = ui.allocate_space(size);
     let _ = ui.interact(button_rect, id, Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(button_rect, Rounding::same(6.0), phase::SURFACE_ACTIVE);
+    painter.rect_filled(button_rect, Rounding::same(6.0), phase::surface_active());
     painter.rect_stroke(
         button_rect,
         Rounding::same(6.0),
-        Stroke::new(1.0, phase::LINE),
+        Stroke::new(1.0, phase::line()),
     );
     let icon_rect = Rect::from_center_size(
         Pos2::new(button_rect.left() + 22.0, button_rect.center().y),
         Vec2::splat(15.0),
     );
-    draw_icon_at(painter, icon_rect, icon, phase::GREEN);
+    draw_icon_at(painter, icon_rect, icon, phase::green());
     painter.text(
         Pos2::new(button_rect.center().x + 10.0, button_rect.center().y),
         Align2::CENTER_CENTER,
         text,
         FontId::proportional(14.0),
-        phase::TEXT_SECONDARY,
+        phase::text_secondary(),
     );
 }
 
 mod phase {
     use eframe::egui::Color32;
+    use std::sync::{OnceLock, RwLock};
 
-    pub const BACKGROUND: Color32 = Color32::from_rgb(21, 18, 37);
-    pub const SURFACE: Color32 = Color32::from_rgb(38, 33, 63);
-    pub const SURFACE_HOVER: Color32 = Color32::from_rgb(58, 52, 90);
-    pub const SURFACE_ACTIVE: Color32 = Color32::from_rgb(67, 59, 99);
-    pub const INPUT: Color32 = Color32::from_rgb(42, 36, 66);
-    pub const LINE: Color32 = Color32::from_rgb(58, 52, 90);
-    pub const ACCENT: Color32 = Color32::from_rgb(216, 184, 245);
-    pub const ACCENT_HOVER: Color32 = Color32::from_rgb(234, 216, 255);
-    pub const ACCENT_DIM: Color32 = Color32::from_rgb(122, 98, 159);
-    pub const BLUE: Color32 = Color32::from_rgb(158, 219, 255);
-    pub const GREEN: Color32 = Color32::from_rgb(75, 198, 122);
-    pub const RED: Color32 = Color32::from_rgb(224, 78, 78);
-    pub const WARNING: Color32 = Color32::from_rgb(228, 169, 64);
-    pub const TEXT: Color32 = Color32::from_rgb(243, 238, 255);
-    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(197, 190, 221);
-    pub const TEXT_MUTED: Color32 = Color32::from_rgb(159, 151, 188);
-    pub const TEXT_ON_ACCENT: Color32 = Color32::from_rgb(74, 64, 102);
+    #[derive(Clone, Copy)]
+    pub struct Palette {
+        background: Color32,
+        surface: Color32,
+        surface_hover: Color32,
+        surface_active: Color32,
+        input: Color32,
+        line: Color32,
+        accent: Color32,
+        accent_hover: Color32,
+        accent_dim: Color32,
+        blue: Color32,
+        green: Color32,
+        red: Color32,
+        warning: Color32,
+        text: Color32,
+        text_secondary: Color32,
+        text_muted: Color32,
+        text_on_accent: Color32,
+    }
+
+    static PALETTE: OnceLock<RwLock<Palette>> = OnceLock::new();
+
+    pub fn reset_palette() {
+        set_palette(default_palette());
+    }
+
+    pub fn set_palette(palette: Palette) {
+        let lock = PALETTE.get_or_init(|| RwLock::new(default_palette()));
+        if let Ok(mut current) = lock.write() {
+            *current = palette;
+        }
+    }
+
+    pub fn palette_from_theme_code(code: &str) -> Option<Palette> {
+        let colors = code
+            .split('|')
+            .nth(2)?
+            .split('.')
+            .filter_map(hex_color)
+            .collect::<Vec<_>>();
+        if colors.len() < 25 {
+            return None;
+        }
+
+        Some(Palette {
+            background: colors[0],
+            surface: colors[5],
+            surface_hover: colors[6],
+            surface_active: colors[7],
+            input: colors[23],
+            line: colors[20],
+            accent: colors[8],
+            accent_hover: colors[9],
+            accent_dim: colors[11],
+            blue: colors[12],
+            green: colors[13],
+            red: colors[14],
+            warning: colors[15],
+            text: colors[16],
+            text_secondary: colors[17],
+            text_muted: colors[18],
+            text_on_accent: colors[19],
+        })
+    }
+
+    pub fn background() -> Color32 {
+        current().background
+    }
+    pub fn surface() -> Color32 {
+        current().surface
+    }
+    pub fn surface_hover() -> Color32 {
+        current().surface_hover
+    }
+    pub fn surface_active() -> Color32 {
+        current().surface_active
+    }
+    pub fn input() -> Color32 {
+        current().input
+    }
+    pub fn line() -> Color32 {
+        current().line
+    }
+    pub fn accent() -> Color32 {
+        current().accent
+    }
+    pub fn accent_hover() -> Color32 {
+        current().accent_hover
+    }
+    pub fn accent_dim() -> Color32 {
+        current().accent_dim
+    }
+    pub fn blue() -> Color32 {
+        current().blue
+    }
+    pub fn green() -> Color32 {
+        current().green
+    }
+    pub fn red() -> Color32 {
+        current().red
+    }
+    pub fn warning() -> Color32 {
+        current().warning
+    }
+    pub fn text() -> Color32 {
+        current().text
+    }
+    pub fn text_secondary() -> Color32 {
+        current().text_secondary
+    }
+    pub fn text_muted() -> Color32 {
+        current().text_muted
+    }
+    pub fn text_on_accent() -> Color32 {
+        current().text_on_accent
+    }
+
+    fn current() -> Palette {
+        let lock = PALETTE.get_or_init(|| RwLock::new(default_palette()));
+        lock.read()
+            .map(|palette| *palette)
+            .unwrap_or_else(|_| default_palette())
+    }
+
+    fn default_palette() -> Palette {
+        Palette {
+            background: Color32::from_rgb(21, 18, 37),
+            surface: Color32::from_rgb(38, 33, 63),
+            surface_hover: Color32::from_rgb(58, 52, 90),
+            surface_active: Color32::from_rgb(67, 59, 99),
+            input: Color32::from_rgb(42, 36, 66),
+            line: Color32::from_rgb(58, 52, 90),
+            accent: Color32::from_rgb(216, 184, 245),
+            accent_hover: Color32::from_rgb(234, 216, 255),
+            accent_dim: Color32::from_rgb(122, 98, 159),
+            blue: Color32::from_rgb(158, 219, 255),
+            green: Color32::from_rgb(75, 198, 122),
+            red: Color32::from_rgb(224, 78, 78),
+            warning: Color32::from_rgb(228, 169, 64),
+            text: Color32::from_rgb(243, 238, 255),
+            text_secondary: Color32::from_rgb(197, 190, 221),
+            text_muted: Color32::from_rgb(159, 151, 188),
+            text_on_accent: Color32::from_rgb(74, 64, 102),
+        }
+    }
+
+    fn hex_color(value: &str) -> Option<Color32> {
+        let value = value.trim();
+        if value.len() != 6 {
+            return None;
+        }
+        let rgb = u32::from_str_radix(value, 16).ok()?;
+        Some(Color32::from_rgb(
+            ((rgb >> 16) & 0xff) as u8,
+            ((rgb >> 8) & 0xff) as u8,
+            (rgb & 0xff) as u8,
+        ))
+    }
 }

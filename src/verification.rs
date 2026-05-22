@@ -14,6 +14,7 @@ pub const PLUGIN_LINK_STATUS_ENDPOINT: &str = "/api/plugin-link/status";
 pub const PLUGIN_LINK_ME_ENDPOINT: &str = "/api/plugin-link/me";
 pub const ROBLOX_OAUTH_START_ENDPOINT: &str = "/api/plugin-link/roblox-oauth/start";
 pub const ROBLOX_OAUTH_STATUS_ENDPOINT: &str = "/api/plugin-link/roblox-oauth/status";
+pub const PHASE_ASSETS_ENDPOINT: &str = "/api/phase-assets";
 pub const ACTIVATE_ENDPOINT: &str = "/activate";
 pub const ROBLOX_PLUGIN_ASSET_ID: u64 = 130301148315515;
 pub const GITHUB_LATEST_RELEASE_URL: &str =
@@ -115,6 +116,23 @@ impl VerificationPlan {
             ROBLOX_OAUTH_STATUS_ENDPOINT,
             url_escape(state),
             url_escape(install_id)
+        )
+    }
+
+    pub fn phase_themes_url(&self) -> String {
+        format!(
+            "{}{}?kind=theme&sort=popular",
+            self.base_url.trim_end_matches('/'),
+            PHASE_ASSETS_ENDPOINT
+        )
+    }
+
+    pub fn phase_theme_install_url(&self, asset_id: &str) -> String {
+        format!(
+            "{}{}/{}/install",
+            self.base_url.trim_end_matches('/'),
+            PHASE_ASSETS_ENDPOINT,
+            url_escape(asset_id)
         )
     }
 }
@@ -344,6 +362,35 @@ pub fn fetch_roblox_avatar_image(user_id: &str) -> Result<Vec<u8>, String> {
     fetch_image_bytes(&image_url)
 }
 
+pub fn fetch_phase_themes(plan: &VerificationPlan) -> Result<Vec<PhaseThemeAsset>, String> {
+    let response = http_agent()?
+        .get(&plan.phase_themes_url())
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+        .map_err(|error| format!("Could not load Phase themes: {error}"))?
+        .into_json::<PhaseThemeListResponse>()
+        .map_err(|error| format!("Invalid Phase themes response: {error}"))?;
+
+    Ok(response
+        .assets
+        .into_iter()
+        .filter(|asset| asset.kind == "theme" && asset.has_theme_code)
+        .collect())
+}
+
+pub fn install_phase_theme(
+    plan: &VerificationPlan,
+    asset_id: &str,
+) -> Result<PhaseThemeInstallResponse, String> {
+    http_agent()?
+        .post(&plan.phase_theme_install_url(asset_id))
+        .timeout(std::time::Duration::from_secs(12))
+        .call()
+        .map_err(|error| format!("Could not prepare Phase theme: {error}"))?
+        .into_json::<PhaseThemeInstallResponse>()
+        .map_err(|error| format!("Invalid Phase theme response: {error}"))
+}
+
 fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
     let mut response = http_agent()?
         .get(url)
@@ -493,6 +540,63 @@ pub struct PluginMeResponse {
     pub user: LinkedUser,
     pub plugin_linked: bool,
     pub plugin_session: Option<PluginSessionInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseThemeListResponse {
+    pub assets: Vec<PhaseThemeAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseThemeInstallResponse {
+    pub asset: PhaseThemeAsset,
+    pub theme_code: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseThemeAsset {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub kind: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub owner: Option<PhaseThemeOwner>,
+    #[serde(default)]
+    pub theme_preview: PhaseThemePreview,
+    #[serde(default)]
+    pub theme_preview_image_url: String,
+    #[serde(default)]
+    pub has_theme_code: bool,
+    #[serde(default)]
+    pub install_count: u64,
+    #[serde(default)]
+    pub download_count: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseThemePreview {
+    #[serde(default)]
+    pub background: String,
+    #[serde(default)]
+    pub panel: String,
+    #[serde(default)]
+    pub accent: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseThemeOwner {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
