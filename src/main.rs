@@ -711,16 +711,23 @@ impl PhaseInstallerApp {
                 self.log(phase::green(), format!("Connected to {name}."));
                 if !access_token.is_empty() {
                     let user_id_text = status.roblox_user_id.clone().unwrap_or_default();
-                    if let Ok(user_id) = user_id_text.parse::<u64>() {
-                        self.roblox_user_id = user_id_text;
+                    let activation_mode = status
+                        .activation_mode
+                        .clone()
+                        .unwrap_or_else(|| "licenseKey".to_owned());
+                    let user_id = user_id_text
+                        .parse::<u64>()
+                        .ok()
+                        .or_else(|| (activation_mode == "phaseAccount").then_some(0_u64));
+                    if let Some(user_id) = user_id {
+                        if !user_id_text.trim().is_empty() {
+                            self.roblox_user_id = user_id_text;
+                        }
                         self.activation_error = None;
                         self.activation = Some(verification::ActivationResponse {
                             ok: true,
                             active: true,
-                            activation_mode: status
-                                .activation_mode
-                                .clone()
-                                .unwrap_or_else(|| "licenseKey".to_owned()),
+                            activation_mode,
                             product: "Phase Animator".to_owned(),
                             user_id,
                             install_id: status.install_id.clone().unwrap_or_else(install_id),
@@ -804,15 +811,22 @@ impl PhaseInstallerApp {
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
                     {
-                        if let Ok(user_id) = self.roblox_user_id.trim().parse::<u64>() {
+                        let activation_mode = session
+                            .activation_mode
+                            .clone()
+                            .unwrap_or_else(|| "licenseKey".to_owned());
+                        let user_id = self
+                            .roblox_user_id
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                            .or_else(|| (activation_mode == "phaseAccount").then_some(0_u64));
+                        if let Some(user_id) = user_id {
                             self.activation_error = None;
                             self.activation = Some(verification::ActivationResponse {
                                 ok: true,
                                 active: true,
-                                activation_mode: session
-                                    .activation_mode
-                                    .clone()
-                                    .unwrap_or_else(|| "licenseKey".to_owned()),
+                                activation_mode,
                                 product: "Phase Animator".to_owned(),
                                 user_id,
                                 install_id: session.install_id.clone().unwrap_or_else(install_id),
