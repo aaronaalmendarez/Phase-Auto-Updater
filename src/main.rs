@@ -789,7 +789,48 @@ impl PhaseInstallerApp {
         self.account_refresh_rx = None;
         match result {
             Ok(me) if me.plugin_linked => {
+                let session = me.plugin_session;
                 self.linked_user = Some(me.user);
+                if let Some(session) = session {
+                    if let Some(user_id_text) = session
+                        .roblox_user_id
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        self.roblox_user_id = user_id_text.to_owned();
+                    }
+                    if let Some(token) = session
+                        .activation_token
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        if let Ok(user_id) = self.roblox_user_id.trim().parse::<u64>() {
+                            self.activation_error = None;
+                            self.activation = Some(verification::ActivationResponse {
+                                ok: true,
+                                active: true,
+                                activation_mode: session
+                                    .activation_mode
+                                    .clone()
+                                    .unwrap_or_else(|| "licenseKey".to_owned()),
+                                product: "Phase Animator".to_owned(),
+                                user_id,
+                                install_id: session.install_id.clone().unwrap_or_else(install_id),
+                                asset_id: Some(verification::ROBLOX_PLUGIN_ASSET_ID),
+                                token: token.to_owned(),
+                                expires_at: 0,
+                                licensee: session
+                                    .licensee
+                                    .clone()
+                                    .unwrap_or_else(|| format!("Phase account {user_id}")),
+                                message: session
+                                    .message
+                                    .clone()
+                                    .unwrap_or_else(|| "Phase account access verified.".to_owned()),
+                            });
+                        }
+                    }
+                }
                 if self.plugin_token.is_some() {
                     self.log(phase::green(), "Phase account restored.");
                 }
@@ -800,8 +841,10 @@ impl PhaseInstallerApp {
                 self.log(phase::warning(), "Phase account link expired.");
             }
             Err(error) => {
-                self.clear_phase_account(true);
-                self.log(phase::warning(), error);
+                self.log(
+                    phase::warning(),
+                    format!("{error}. Saved account connection kept."),
+                );
             }
         }
         ctx.request_repaint();
@@ -1650,11 +1693,12 @@ fn install_update(
         tx,
         InstallPhase::Downloading,
         phase::blue(),
-        "Authorizing install.",
+        "Refreshing install access.",
         0.12,
     );
 
     let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+    let activation = refresh_activation_for_download(&plan, &activation, &license_key);
     let request = verification::DownloadSessionRequest {
         activation_mode: activation.activation_mode.clone(),
         user_id: activation.user_id,
@@ -1756,6 +1800,37 @@ fn install_update(
         backup_path,
         version: session.version,
     })
+}
+
+fn refresh_activation_for_download(
+    plan: &verification::VerificationPlan,
+    activation: &verification::ActivationResponse,
+    license_key: &str,
+) -> verification::ActivationResponse {
+    let request = match activation.activation_mode.as_str() {
+        "robloxPurchase" => Some(verification::ActivationRequest {
+            activation_mode: "robloxPurchase".to_owned(),
+            license_key: None,
+            user_id: activation.user_id,
+            install_id: install_id(),
+            asset_id: activation
+                .asset_id
+                .or(Some(verification::ROBLOX_PLUGIN_ASSET_ID)),
+        }),
+        "licenseKey" if !license_key.trim().is_empty() => Some(verification::ActivationRequest {
+            activation_mode: "licenseKey".to_owned(),
+            license_key: Some(license_key.trim().to_owned()),
+            user_id: activation.user_id,
+            install_id: install_id(),
+            asset_id: None,
+        }),
+        _ => None,
+    };
+
+    request
+        .as_ref()
+        .and_then(|request| verification::activate_install(plan, request).ok())
+        .unwrap_or_else(|| activation.clone())
 }
 
 fn send_install_progress(

@@ -656,7 +656,10 @@ pub struct PluginSessionInfo {
     pub last_seen_at: Option<String>,
     pub roblox_user_id: Option<String>,
     pub activation_mode: Option<String>,
+    pub install_id: Option<String>,
+    pub activation_token: Option<String>,
     pub licensee: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
