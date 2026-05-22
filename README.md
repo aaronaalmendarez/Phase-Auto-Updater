@@ -1,10 +1,18 @@
 # Phase Auto Updater
 
+<p align="center">
+  <img src="assets/PhaseAnimator.png" alt="Phase Animator logo" width="96">
+</p>
+
 Native updater and installer for the Phase Animator Roblox Studio plugin.
 
 This is the public client app. It is written in Rust with egui so it can feel close to the plugin without needing a browser wrapper.
 
 The updater connects to Phase, checks for the latest release, and installs the plugin into the local Roblox Studio plugins folder. It is meant to be small, native, and easy to build from source.
+
+<p align="center">
+  <img src="assets/ScreenshotPhase.png" alt="Phase Auto Updater app screenshot" width="456">
+</p>
 
 ## what it does
 
