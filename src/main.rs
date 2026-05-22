@@ -601,6 +601,17 @@ impl PhaseInstallerApp {
         actual == expected
     }
 
+    fn has_local_phase_install(&self) -> bool {
+        let Some(folder) = self.selected_folder.as_ref() else {
+            return false;
+        };
+        let plugin_files = self
+            .selected_candidate()
+            .map(|candidate| candidate.plugin_files.clone())
+            .unwrap_or_default();
+        choose_install_target(folder, &plugin_files).exists()
+    }
+
     fn start_phase_account_link(&mut self, ctx: &Context) {
         if self.link_rx.is_some() {
             return;
@@ -2298,8 +2309,13 @@ impl PhaseInstallerApp {
                 });
 
             ui.add_space(10.0);
+            let install_ready_text = if self.has_local_phase_install() {
+                "Install Update"
+            } else {
+                "Install Plugin"
+            };
             let button_text = match self.phase {
-                InstallPhase::Ready => "Install Update",
+                InstallPhase::Ready => install_ready_text,
                 InstallPhase::Complete => "Check Again",
                 _ => "Check for Update",
             };

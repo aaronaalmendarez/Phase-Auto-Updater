@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};
 use serde::de::Error as _;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;

@@ -6,6 +6,7 @@ cd "$ROOT"
 
 cargo fmt --check
 cargo build --release --bin phase-tool
+PACKAGE_VERSION="$(awk -F\" '/^version =/ { print $2; exit }' Cargo.toml)"
 
 APP_DIR="$ROOT/dist/macos/Phase Animator Installer.app"
 CONTENTS="$APP_DIR/Contents"
@@ -17,7 +18,7 @@ mkdir -p "$MACOS" "$RESOURCES"
 cp "$ROOT/target/release/phase-tool" "$MACOS/Phase Animator Installer"
 cp "$ROOT/assets/PhaseAnimator.png" "$RESOURCES/PhaseAnimator.png"
 
-cat > "$CONTENTS/Info.plist" <<'PLIST'
+cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -33,7 +34,7 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.19.1</string>
+  <string>${PACKAGE_VERSION}</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>NSHighResolutionCapable</key>
