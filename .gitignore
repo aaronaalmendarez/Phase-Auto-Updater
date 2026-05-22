@@ -1,0 +1,22 @@
+# rust stuff
+/target/
+
+# packaged builds
+/dist/
+/.tools/
+/.wix/
+
+# local editor/os
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# dont put local env files in here
+.env
+.env.*
+!.env.example
+
+# random local logs
+*.log
