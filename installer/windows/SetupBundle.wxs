@@ -1,0 +1,23 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle
+    Name="Phase Auto Updater Setup"
+    Manufacturer="Phase"
+    Version="$(var.PackageVersion)"
+    UpgradeCode="3fbdfb0e-26cf-4cb0-9053-0f39fbb7dfc8"
+    IconSourceFile="$(var.SourceDir)\PhaseAnimator.ico">
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+        Theme="hyperlinkLicense"
+        LogoFile="$(var.SourceDir)\PhaseAnimator.png"
+        LicenseUrl="https://phase.motioncore.xyz/terms" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <MsiPackage
+        SourceFile="$(var.MsiPath)"
+        Compressed="yes" />
+    </Chain>
+  </Bundle>
+</Wix>
