@@ -6,6 +6,8 @@ mod verification;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -16,6 +18,10 @@ use detector::{
 use eframe::egui::{
     self, Align2, Color32, ColorImage, Context, FontData, FontFamily, FontId, IconData, Margin,
     Pos2, Rect, RichText, Rounding, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
+};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use tray_icon::{
+    Icon as TrayIconImage, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 const APP_NAME: &str = "Phase Animator Installer";
@@ -29,6 +35,13 @@ const CARD_INNER_WIDTH: f32 = 394.0;
 const THEME_ROW_WIDTH: f32 = CARD_INNER_WIDTH;
 const THEME_ROW_MARGIN: f32 = 12.0;
 const THEME_ROW_INNER_WIDTH: f32 = THEME_ROW_WIDTH - THEME_ROW_MARGIN * 2.0;
+const TRAY_PANEL_WIDTH: f32 = 302.0;
+const TRAY_PANEL_HEIGHT: f32 = 286.0;
+const TRAY_VIEWPORT_KEY: &str = "phase-tray-controls";
+const PARKED_WINDOW_POS: f32 = -32_000.0;
+const PARKED_WINDOW_SIZE: f32 = 1.0;
+#[cfg(target_os = "windows")]
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|arg| arg == "--smoke-test") {
@@ -42,8 +55,10 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([APP_WIDTH, 620.0])
             .with_min_inner_size([320.0, 520.0])
+            .with_transparent(true)
             .with_title(APP_NAME)
             .with_icon(load_window_icon()),
+        persist_window: false,
         ..Default::default()
     };
 
@@ -159,6 +174,17 @@ enum InstallEvent {
     Finished(Result<InstallOutcome, String>),
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct TrayController {
+    _icon: TrayIcon,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+enum TraySignal {
+    ShowWindow,
+    ShowPanel { x: f32, y: f32 },
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountCache {
@@ -239,6 +265,19 @@ struct PhaseInstallerApp {
     // the egui view code too early made the first UI pass harder to tune.
     tab_lerp: f32,
     milestone: u32,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    tray: Option<TrayController>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    tray_rx: Receiver<TraySignal>,
+    close_dialog_open: bool,
+    allow_quit: bool,
+    hidden_to_tray: bool,
+    tray_notice_shown: bool,
+    tray_panel_open: bool,
+    tray_panel_pos: Pos2,
+    main_window_pos: Option<Pos2>,
+    tray_anim_nonce: u64,
+    dialog_anim_nonce: u64,
 }
 
 impl PhaseInstallerApp {
@@ -249,6 +288,8 @@ impl PhaseInstallerApp {
         let selected_folder = best_candidate(&candidates).map(|candidate| candidate.path);
         let (avatar_tx, avatar_rx) = mpsc::channel();
         let (theme_background_tx, theme_background_rx) = mpsc::channel();
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let (tray_tx, tray_rx) = mpsc::channel();
 
         let mut app = Self {
             logo: load_logo(&cc.egui_ctx),
@@ -312,6 +353,19 @@ impl PhaseInstallerApp {
             activity: Vec::new(),
             tab_lerp: 0.0,
             milestone: 0,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            tray: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            tray_rx,
+            close_dialog_open: false,
+            allow_quit: false,
+            hidden_to_tray: false,
+            tray_notice_shown: false,
+            tray_panel_open: false,
+            tray_panel_pos: Pos2::new(64.0, 64.0),
+            main_window_pos: None,
+            tray_anim_nonce: 0,
+            dialog_anim_nonce: 0,
         };
 
         app.load_cached_accounts(&cc.egui_ctx);
@@ -331,6 +385,13 @@ impl PhaseInstallerApp {
                 "Choose a Roblox Studio plugin folder to continue.",
             );
         }
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        match TrayController::new(tray_tx, cc.egui_ctx.clone()) {
+            Ok(tray) => app.tray = Some(tray),
+            Err(error) => app.log(phase::warning(), format!("Tray unavailable: {error}")),
+        }
+
         app.begin_version_check(Some(cc.egui_ctx.clone()));
         app.begin_update_stream(&cc.egui_ctx);
         app.begin_phase_account_refresh(&cc.egui_ctx);
@@ -357,6 +418,7 @@ impl PhaseInstallerApp {
         self.ensure_avatar_fetches(ctx);
         self.poll_theme_background_fetches(ctx);
         self.ensure_theme_background_fetch(ctx);
+        self.poll_tray(ctx);
 
         let Some(started_at) = self.phase_started_at else {
             return;
@@ -394,6 +456,232 @@ impl PhaseInstallerApp {
                 ctx.request_repaint();
             }
             _ => {}
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        matches!(
+            self.phase,
+            InstallPhase::Checking | InstallPhase::Downloading | InstallPhase::Installing
+        )
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn poll_tray(&mut self, ctx: &Context) {
+        let signals: Vec<TraySignal> = self.tray_rx.try_iter().collect();
+        for signal in signals {
+            match signal {
+                TraySignal::ShowWindow => {
+                    log_tray_debug("app received show window");
+                    self.show_main_window(ctx);
+                }
+                TraySignal::ShowPanel { x, y } => {
+                    log_tray_debug(format!("app received show panel at {x:.0},{y:.0}"));
+                    self.show_tray_panel(ctx, x, y);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    fn poll_tray(&mut self, _ctx: &Context) {}
+
+    fn tray_available(&self) -> bool {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            self.tray.is_some()
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            false
+        }
+    }
+
+    fn show_main_window(&mut self, ctx: &Context) {
+        self.hidden_to_tray = false;
+        self.close_tray_popup(ctx);
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MousePassthrough(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Transparent(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Decorations(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Resizable(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MinInnerSize(Vec2::new(320.0, 520.0)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(Vec2::new(APP_WIDTH, 620.0)),
+        );
+        if let Some(pos) = self.main_window_pos {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::OuterPosition(pos),
+            );
+        }
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Minimized(false),
+        );
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn show_tray_panel(&mut self, ctx: &Context, x: f32, y: f32) {
+        if !self.tray_panel_open {
+            self.tray_anim_nonce = self.tray_anim_nonce.wrapping_add(1);
+        }
+        self.tray_panel_open = true;
+        self.close_dialog_open = false;
+
+        let panel_x = (x - TRAY_PANEL_WIDTH + 14.0).max(8.0);
+        let panel_y = (y - TRAY_PANEL_HEIGHT - 8.0).max(8.0);
+        self.tray_panel_pos = Pos2::new(panel_x, panel_y);
+        if self.hidden_to_tray {
+            self.show_tray_panel_on_root(ctx);
+        } else {
+            ctx.send_viewport_cmd_to(tray_viewport_id(), egui::ViewportCommand::Focus);
+        }
+        ctx.request_repaint();
+    }
+
+    fn close_tray_popup(&mut self, ctx: &Context) {
+        self.tray_panel_open = false;
+        if self.hidden_to_tray {
+            self.park_root_for_tray(ctx);
+        } else {
+            ctx.send_viewport_cmd_to(tray_viewport_id(), egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint();
+    }
+
+    fn minimize_to_tray(&mut self, ctx: &Context) {
+        self.remember_main_window_position(ctx);
+        self.hidden_to_tray = true;
+        self.close_dialog_open = false;
+        self.close_tray_popup(ctx);
+        if !self.tray_notice_shown {
+            self.tray_notice_shown = true;
+            show_system_notification(
+                "Phase Animator",
+                "Still running in the tray. Right-click for install actions.",
+            );
+        }
+    }
+
+    fn show_tray_panel_on_root(&self, ctx: &Context) {
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MousePassthrough(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Transparent(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Decorations(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Resizable(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MinInnerSize(Vec2::new(TRAY_PANEL_WIDTH, 180.0)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::OuterPosition(self.tray_panel_pos),
+        );
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+    }
+
+    fn park_root_for_tray(&self, ctx: &Context) {
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Transparent(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Decorations(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Resizable(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MousePassthrough(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MinInnerSize(Vec2::splat(PARKED_WINDOW_SIZE)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(Vec2::splat(PARKED_WINDOW_SIZE)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::OuterPosition(Pos2::new(PARKED_WINDOW_POS, PARKED_WINDOW_POS)),
+        );
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+    }
+
+    fn remember_main_window_position(&mut self, ctx: &Context) {
+        if self.hidden_to_tray {
+            return;
+        }
+
+        let position = ctx.input(|input| input.viewport().outer_rect.map(|rect| rect.min));
+        if let Some(position) = position {
+            if position.x > -1_000.0 && position.y > -1_000.0 {
+                self.main_window_pos = Some(position);
+            }
+        }
+    }
+
+    fn open_selected_folder(&mut self) {
+        let Some(path) = self.selected_folder.clone() else {
+            self.log(phase::warning(), "Choose an install location first.");
+            return;
+        };
+        if let Err(error) = open::that(&path) {
+            self.log(phase::warning(), format!("Could not open folder: {error}"));
+        }
+    }
+
+    fn request_quit(&mut self, ctx: &Context) {
+        self.allow_quit = true;
+        self.close_dialog_open = false;
+        self.close_tray_popup(ctx);
+        self.cleanup_tray();
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+    }
+
+    fn cleanup_tray(&mut self) {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(tray) = self.tray.take() {
+            tray.hide();
         }
     }
 
@@ -610,6 +898,30 @@ impl PhaseInstallerApp {
             .map(|candidate| candidate.plugin_files.clone())
             .unwrap_or_default();
         choose_install_target(folder, &plugin_files).exists()
+    }
+
+    fn account_summary(&self) -> String {
+        if let Some(user) = self.linked_user.as_ref().map(display_linked_user) {
+            return user;
+        }
+        if let Some(name) = self
+            .roblox_username
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            return name.to_owned();
+        }
+        if !self.roblox_user_id.trim().is_empty() {
+            return format!("Roblox {}", self.roblox_user_id.trim());
+        }
+        "Not connected".to_owned()
+    }
+
+    fn release_summary(&self) -> String {
+        self.release
+            .as_ref()
+            .map(|release| release.latest_version.clone())
+            .unwrap_or_else(|| "Checking".to_owned())
     }
 
     fn start_phase_account_link(&mut self, ctx: &Context) {
@@ -1945,14 +2257,117 @@ fn safe_file_fragment(value: &str) -> String {
         .collect()
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl TrayController {
+    fn new(tx: Sender<TraySignal>, ctx: Context) -> Result<Self, String> {
+        let icon = load_tray_icon().ok_or_else(|| "Could not load tray icon.".to_owned())?;
+        let icon = TrayIconBuilder::new()
+            .with_tooltip("Phase Animator Installer")
+            .with_menu_on_left_click(false)
+            .with_menu_on_right_click(false)
+            .with_icon(icon)
+            .build()
+            .map_err(|error| format!("Could not create tray icon: {error}"))?;
+        log_tray_debug("tray icon created");
+
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            log_tray_debug(format!("event {event:?}"));
+            let signal = match event {
+                TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    button_state: MouseButtonState::Down,
+                    position,
+                    ..
+                } => {
+                    log_tray_debug("right down");
+                    Some(TraySignal::ShowPanel {
+                        x: position.x as f32,
+                        y: position.y as f32,
+                    })
+                }
+                TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    button_state: MouseButtonState::Up,
+                    position,
+                    ..
+                } => {
+                    log_tray_debug("right up");
+                    Some(TraySignal::ShowPanel {
+                        x: position.x as f32,
+                        y: position.y as f32,
+                    })
+                }
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    position,
+                    ..
+                } => {
+                    log_tray_debug("left up");
+                    Some(TraySignal::ShowPanel {
+                        x: position.x as f32,
+                        y: position.y as f32,
+                    })
+                }
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    log_tray_debug("left double");
+                    reveal_window_for_tray_signal();
+                    Some(TraySignal::ShowWindow)
+                }
+                _ => None,
+            };
+            if let Some(signal) = signal {
+                let _ = tx.send(signal);
+                ctx.request_repaint();
+            }
+        }));
+
+        Ok(Self { _icon: icon })
+    }
+
+    fn hide(&self) {
+        let _ = self._icon.set_visible(false);
+        log_tray_debug("tray icon hidden");
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl Drop for TrayController {
+    fn drop(&mut self) {
+        self.hide();
+    }
+}
+
 impl eframe::App for PhaseInstallerApp {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         apply_windows_title_bar(frame);
+        self.remember_main_window_position(ctx);
+        self.handle_close_request(ctx);
         self.tick(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(phase::background()))
+            .frame(egui::Frame::none().fill(if self.hidden_to_tray {
+                if self.tray_panel_open {
+                    phase::background()
+                } else {
+                    Color32::TRANSPARENT
+                }
+            } else {
+                phase::background()
+            }))
             .show(ctx, |ui| {
+                if self.hidden_to_tray {
+                    if self.tray_panel_open {
+                        self.tray_panel(ui);
+                    } else {
+                        ui.allocate_space(ui.available_size());
+                    }
+                    return;
+                }
+
                 self.paint_theme_background(ui);
                 ui.vertical_centered(|ui| {
                     ui.set_width(SCROLL_BODY_WIDTH);
@@ -1980,10 +2395,301 @@ impl eframe::App for PhaseInstallerApp {
                         });
                 });
             });
+        if !self.hidden_to_tray {
+            self.draw_close_dialog(ctx);
+            self.show_tray_popup_viewport(ctx);
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.cleanup_tray();
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
 }
 
 impl PhaseInstallerApp {
+    fn show_tray_popup_viewport(&mut self, ctx: &Context) {
+        if !self.tray_panel_open {
+            return;
+        }
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Phase Animator Controls")
+            .with_position(self.tray_panel_pos)
+            .with_inner_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT))
+            .with_min_inner_size(Vec2::new(TRAY_PANEL_WIDTH, 180.0))
+            .with_transparent(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(true)
+            .with_visible(true);
+
+        ctx.show_viewport_immediate(tray_viewport_id(), builder, |tray_ctx, _class| {
+            if tray_ctx.input(|input| input.viewport().close_requested()) {
+                self.close_tray_popup(tray_ctx);
+                return;
+            }
+
+            if tray_ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.close_tray_popup(tray_ctx);
+                return;
+            }
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(phase::background()))
+                .show(tray_ctx, |ui| {
+                    self.tray_panel(ui);
+                });
+        });
+    }
+
+    fn tray_panel(&mut self, ui: &mut Ui) {
+        ui.set_min_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT));
+
+        let raw_t = ui.ctx().animate_bool_with_time(
+            egui::Id::new(("phase-tray-pop", self.tray_anim_nonce)),
+            true,
+            0.16,
+        );
+        let fade_t = ease_out_cubic(raw_t).clamp(0.0, 1.0);
+        let panel_width = TRAY_PANEL_WIDTH;
+        let panel_height = TRAY_PANEL_HEIGHT;
+
+        ui.horizontal_centered(|ui| {
+            egui::Frame::none()
+                .fill(color_with_alpha(phase::background(), fade_t))
+                .stroke(Stroke::new(1.0, color_with_alpha(phase::line(), fade_t)))
+                .rounding(Rounding::same(14.0))
+                .inner_margin(Margin::same(10.0))
+                .show(ui, |ui| {
+                    let content_width = (panel_width - 20.0).max(180.0);
+                    ui.set_width(content_width);
+                    egui::ScrollArea::vertical()
+                        .id_source("phase-tray-panel-scroll")
+                        .max_height(panel_height - 20.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.tray_panel_contents(ui, content_width));
+                });
+        });
+    }
+
+    fn tray_panel_contents(&mut self, ui: &mut Ui, content_width: f32) {
+        ui.vertical_centered(|ui| {
+            ui.set_width(content_width);
+            ui.horizontal(|ui| {
+                if let Some(logo) = &self.logo {
+                    let image = egui::Image::new(logo).fit_to_exact_size(Vec2::splat(34.0));
+                    ui.add(image);
+                }
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Phase Animator")
+                            .font(FontId::proportional(15.0))
+                            .strong()
+                            .color(phase::text()),
+                    );
+                    ui.label(
+                        RichText::new("Tray controls")
+                            .font(FontId::proportional(11.5))
+                            .color(phase::text_secondary()),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if secondary_button(ui, MiniIcon::Download, "Hide", Vec2::new(78.0, 30.0))
+                        .clicked()
+                    {
+                        self.close_tray_popup(ui.ctx());
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            egui::Frame::none()
+                .fill(phase::surface())
+                .stroke(Stroke::new(1.0, phase::line()))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(Margin::same(10.0))
+                .show(ui, |ui| {
+                    let info_width = (content_width - 10.0).max(160.0);
+                    ui.set_width(info_width);
+                    compact_info_row(ui, "Status", phase_text(self.phase), info_width);
+                    compact_info_row(ui, "Account", &self.account_summary(), info_width);
+                    compact_info_row(ui, "Latest", &self.release_summary(), info_width);
+                });
+
+            ui.add_space(10.0);
+            let action_width = content_width;
+            if primary_button(
+                ui,
+                MiniIcon::External,
+                "Open Window",
+                Vec2::new(action_width, 34.0),
+            )
+            .clicked()
+            {
+                self.show_main_window(ui.ctx());
+            }
+
+            if secondary_button(
+                ui,
+                MiniIcon::Refresh,
+                "Check Updates",
+                Vec2::new(action_width, 34.0),
+            )
+            .clicked()
+                && !self.is_busy()
+            {
+                self.active_tab = ViewTab::Install;
+                self.start_check();
+            }
+
+            ui.add_enabled_ui(self.phase == InstallPhase::Ready && !self.is_busy(), |ui| {
+                let label = if self.has_local_phase_install() {
+                    "Install Update"
+                } else {
+                    "Install Plugin"
+                };
+                if secondary_button(ui, MiniIcon::Bolt, label, Vec2::new(action_width, 34.0))
+                    .clicked()
+                {
+                    self.active_tab = ViewTab::Install;
+                    self.start_install();
+                }
+            });
+
+            ui.add_enabled_ui(self.selected_folder.is_some(), |ui| {
+                if secondary_button(
+                    ui,
+                    MiniIcon::Folder,
+                    "Open Plugin Folder",
+                    Vec2::new(action_width, 34.0),
+                )
+                .clicked()
+                {
+                    self.open_selected_folder();
+                }
+            });
+
+            if secondary_button(
+                ui,
+                MiniIcon::External,
+                "Quit",
+                Vec2::new(action_width, 34.0),
+            )
+            .clicked()
+            {
+                self.request_quit(ui.ctx());
+            }
+
+            ui.add_space(8.0);
+        });
+    }
+
+    fn handle_close_request(&mut self, ctx: &Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+
+        if self.allow_quit {
+            self.cleanup_tray();
+            return;
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.tray_panel_open {
+            self.close_tray_popup(ctx);
+        }
+        if !self.close_dialog_open {
+            self.dialog_anim_nonce = self.dialog_anim_nonce.wrapping_add(1);
+        }
+        self.close_dialog_open = true;
+    }
+
+    fn draw_close_dialog(&mut self, ctx: &Context) {
+        if !self.close_dialog_open {
+            return;
+        }
+
+        let raw_t = ctx.animate_bool_with_time(
+            egui::Id::new(("phase-close-dialog-pop", self.dialog_anim_nonce)),
+            true,
+            0.18,
+        );
+        let pop_t = ease_out_back(raw_t).clamp(0.0, 1.0);
+        let fade_t = ease_out_cubic(raw_t).clamp(0.0, 1.0);
+        let scale = 0.94 + 0.06 * pop_t;
+        let width = 378.0 * scale;
+        let title_color = color_with_alpha(phase::text(), fade_t);
+        let body_color = color_with_alpha(phase::text_secondary(), fade_t);
+
+        egui::Window::new("Keep Phase Animator running?")
+            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - pop_t) * 12.0))
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(color_with_alpha(phase::surface(), fade_t))
+                    .stroke(Stroke::new(1.0, color_with_alpha(phase::line(), fade_t)))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(Margin::same(18.0 * scale)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                ui.label(
+                    RichText::new("Keep Phase Animator running?")
+                        .font(FontId::proportional(18.0))
+                        .strong()
+                        .color(title_color),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Minimize it to the tray to keep update checks and quick install actions available.")
+                        .font(FontId::proportional(13.0))
+                        .color(body_color),
+                );
+                if !self.tray_available() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Tray icon is not available in this build.")
+                            .font(FontId::proportional(12.5))
+                            .color(color_with_alpha(phase::warning(), fade_t)),
+                    );
+                }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if secondary_button(ui, MiniIcon::External, "Quit", Vec2::new(104.0, 36.0))
+                        .clicked()
+                    {
+                        self.request_quit(ctx);
+                    }
+                    if secondary_button(ui, MiniIcon::Gear, "Cancel", Vec2::new(112.0, 36.0))
+                        .clicked()
+                    {
+                        self.close_dialog_open = false;
+                    }
+                    ui.add_enabled_ui(self.tray_available(), |ui| {
+                        if primary_button(
+                            ui,
+                            MiniIcon::Download,
+                            "Minimize",
+                            Vec2::new(132.0, 36.0),
+                        )
+                        .clicked()
+                        {
+                            self.minimize_to_tray(ctx);
+                        }
+                    });
+                });
+            });
+    }
+
     fn paint_theme_background(&self, ui: &mut Ui) {
         let Some(texture) = &self.theme_background else {
             return;
@@ -3335,6 +4041,30 @@ fn load_window_icon() -> IconData {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn load_tray_icon() -> Option<TrayIconImage> {
+    let bytes = include_bytes!("../assets/PhaseAnimator.png");
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let width = image.width();
+    let height = image.height();
+    let side = width.min(height).max(1);
+    let offset_x = (width - side) / 2;
+    let offset_y = (height - side) / 2;
+    let mut square = image::RgbaImage::new(side, side);
+    for y in 0..side {
+        for x in 0..side {
+            square.put_pixel(x, y, *image.get_pixel(offset_x + x, offset_y + y));
+        }
+    }
+
+    let resized = image::imageops::resize(&square, 32, 32, image::imageops::FilterType::Lanczos3);
+    TrayIconImage::from_rgba(resized.into_raw(), 32, 32).ok()
+}
+
+fn tray_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(TRAY_VIEWPORT_KEY)
+}
+
 #[cfg(target_os = "windows")]
 fn apply_windows_title_bar(frame: &eframe::Frame) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -3350,6 +4080,7 @@ fn apply_windows_title_bar(frame: &eframe::Frame) {
     };
 
     let hwnd = window.hwnd.get() as *mut core::ffi::c_void;
+    MAIN_HWND.store(hwnd as isize, Ordering::Relaxed);
     let caption = color_ref(phase::surface());
     let text = color_ref(phase::text());
     let border = color_ref(phase::accent_dim());
@@ -3378,6 +4109,51 @@ fn apply_windows_title_bar(frame: &eframe::Frame) {
 
 #[cfg(not(target_os = "windows"))]
 fn apply_windows_title_bar(_frame: &eframe::Frame) {}
+
+#[cfg(target_os = "windows")]
+fn reveal_window_for_tray_signal() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
+    };
+
+    let hwnd = MAIN_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void;
+    if hwnd.is_null() {
+        log_tray_debug("window reveal skipped: missing hwnd");
+        return;
+    }
+
+    unsafe {
+        let shown = ShowWindow(hwnd, SW_SHOWNORMAL);
+        let focused = SetForegroundWindow(hwnd);
+        log_tray_debug(format!(
+            "window reveal requested: hwnd={}, show={}, focus={}",
+            hwnd as isize, shown, focused
+        ));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn reveal_window_for_tray_signal() {}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn log_tray_debug(message: impl AsRef<str>) {
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join("PhaseTrayDebug.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f32())
+        .unwrap_or_default();
+    let _ = writeln!(file, "[{elapsed:.3}] {}", message.as_ref());
+}
 
 fn color_ref(color: Color32) -> u32 {
     (color.r() as u32) | ((color.g() as u32) << 8) | ((color.b() as u32) << 16)
@@ -3875,6 +4651,30 @@ fn info_row(ui: &mut Ui, label: &str, value: &str) {
     info_row_width(ui, label, value, CARD_INNER_WIDTH - 16.0);
 }
 
+fn compact_info_row(ui: &mut Ui, label: &str, value: &str, width: f32) {
+    ui.horizontal(|ui| {
+        ui.set_width(width);
+        let label_width = 66.0_f32.min(width * 0.38);
+        let value_width = (width - label_width - 8.0).max(72.0);
+        ui.add_sized(
+            Vec2::new(label_width, 18.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .font(FontId::proportional(12.0))
+                    .color(phase::text_muted()),
+            )
+            .wrap(false),
+        );
+        scrolling_label(
+            ui,
+            value,
+            value_width,
+            FontId::proportional(12.5),
+            phase::text_secondary(),
+        );
+    });
+}
+
 fn info_row_width(ui: &mut Ui, label: &str, value: &str, width: f32) {
     ui.horizontal(|ui| {
         ui.set_width(width);
@@ -4190,42 +4990,78 @@ fn theme_background_layout(
     }
 }
 
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+fn ease_out_back(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0) - 1.0;
+    1.0 + 2.70158 * t.powi(3) + 1.70158 * t.powi(2)
+}
+
+fn color_with_alpha(color: Color32, alpha: f32) -> Color32 {
+    let alpha = (color.a() as f32 * alpha.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |left: u8, right: u8| left as f32 + (right as f32 - left as f32) * t;
+    Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()).round() as u8,
+        mix(a.g(), b.g()).round() as u8,
+        mix(a.b(), b.b()).round() as u8,
+        mix(a.a(), b.a()).round() as u8,
+    )
+}
+
 fn primary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui::Response {
     let (id, button_rect) = ui.allocate_space(size);
     let response = ui.interact(button_rect, id, Sense::click());
 
-    let hovered = response.hovered();
-    let active = response.clicked();
+    let enabled = ui.is_enabled();
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let hover_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("hover"), hovered, 0.12);
+    let press_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("press"), pressed, 0.08);
+    let opacity = if enabled { 1.0 } else { 0.45 };
 
     let painter = ui.painter();
+    let draw_rect = button_rect
+        .translate(Vec2::new(0.0, -1.4 * hover_t + 0.8 * press_t))
+        .shrink(press_t * 0.8);
 
-    let mut bg_color = phase::accent();
-    if hovered {
-        bg_color = phase::accent_hover();
-    }
-    if active {
-        bg_color = phase::accent_dim();
-    }
+    let mut bg_color = lerp_color(phase::accent(), phase::accent_hover(), hover_t);
+    bg_color = lerp_color(bg_color, phase::accent_dim(), press_t);
+    bg_color = color_with_alpha(bg_color, opacity);
+    let text_color = color_with_alpha(phase::text_on_accent(), opacity);
+    let rounding = Rounding::same(6.0 + hover_t * 1.5);
 
-    painter.rect_filled(button_rect, Rounding::same(6.0), bg_color);
+    painter.rect_filled(draw_rect, rounding, bg_color);
     painter.rect_stroke(
-        button_rect,
-        Rounding::same(6.0),
-        Stroke::new(1.0, phase::text_on_accent()),
+        draw_rect,
+        rounding,
+        Stroke::new(
+            1.0,
+            color_with_alpha(phase::text_on_accent(), 0.85 * opacity),
+        ),
     );
 
-    let icon_rect = Rect::from_center_size(
-        Pos2::new(button_rect.center().x - 82.0, button_rect.center().y),
-        Vec2::splat(19.0),
-    );
-    draw_icon_at(painter, icon_rect, icon, phase::text_on_accent());
+    let icon_x = (draw_rect.center().x - 82.0).max(draw_rect.left() + 24.0);
+    let icon_rect =
+        Rect::from_center_size(Pos2::new(icon_x, draw_rect.center().y), Vec2::splat(19.0));
+    draw_icon_at(painter, icon_rect, icon, text_color);
 
     painter.text(
-        Pos2::new(button_rect.center().x + 12.0, button_rect.center().y),
+        Pos2::new(draw_rect.center().x + 12.0, draw_rect.center().y),
         Align2::CENTER_CENTER,
         text,
         FontId::proportional(16.0),
-        phase::text_on_accent(),
+        text_color,
     );
 
     response
@@ -4235,45 +5071,47 @@ fn secondary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui
     let (id, button_rect) = ui.allocate_space(size);
     let response = ui.interact(button_rect, id, Sense::click());
 
-    let hovered = response.hovered();
-    let active = response.clicked();
+    let enabled = ui.is_enabled();
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let hover_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("hover"), hovered, 0.12);
+    let press_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("press"), pressed, 0.08);
+    let opacity = if enabled { 1.0 } else { 0.45 };
 
     let painter = ui.painter();
+    let draw_rect = button_rect
+        .translate(Vec2::new(0.0, -1.0 * hover_t + 0.7 * press_t))
+        .shrink(press_t * 0.6);
 
-    let stroke_color = if hovered {
-        phase::accent()
-    } else {
-        phase::line()
-    };
+    let stroke_color =
+        color_with_alpha(lerp_color(phase::line(), phase::accent(), hover_t), opacity);
+    let mut bg_color = lerp_color(phase::input(), phase::surface_hover(), hover_t);
+    bg_color = lerp_color(bg_color, phase::surface_active(), press_t);
+    bg_color = color_with_alpha(bg_color, opacity);
 
-    let bg_color = if active {
-        phase::surface_active()
-    } else if hovered {
-        phase::surface_hover()
-    } else {
-        phase::input()
-    };
+    let rounding = Rounding::same(6.0 + hover_t * 1.5);
+    painter.rect_filled(draw_rect, rounding, bg_color);
+    painter.rect_stroke(draw_rect, rounding, Stroke::new(1.0, stroke_color));
 
-    painter.rect_filled(button_rect, Rounding::same(6.0), bg_color);
-    painter.rect_stroke(
-        button_rect,
-        Rounding::same(6.0),
-        Stroke::new(1.0, stroke_color),
+    let text_color = color_with_alpha(
+        lerp_color(phase::text_secondary(), phase::text(), hover_t),
+        opacity,
     );
-
-    let text_color = if hovered {
-        phase::text()
-    } else {
-        phase::text_secondary()
-    };
     let icon_rect = Rect::from_center_size(
-        Pos2::new(button_rect.left() + 22.0, button_rect.center().y),
+        Pos2::new(
+            draw_rect.left() + 22.0 + 1.5 * hover_t,
+            draw_rect.center().y,
+        ),
         Vec2::splat(15.0),
     );
     draw_icon_at(painter, icon_rect, icon, text_color);
 
     painter.text(
-        Pos2::new(button_rect.center().x + 10.0, button_rect.center().y),
+        Pos2::new(draw_rect.center().x + 10.0, draw_rect.center().y),
         Align2::CENTER_CENTER,
         text,
         FontId::proportional(14.0),
