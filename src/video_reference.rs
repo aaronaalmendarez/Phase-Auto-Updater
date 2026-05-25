@@ -310,6 +310,8 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
   let previewTarget = 0;
   let previewPending = false;
   let suppressLocalSyncUntil = 0;
+  let desiredPlaying = false;
+  let playPromise = null;
   function setChromeVisible(visible) {{
     document.body.classList.toggle('controls-visible', visible);
   }}
@@ -416,10 +418,10 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
             const payload = packet.payload || {{}};
             const remoteRate = playbackRateFromPayload(payload);
             if (remoteRate !== undefined) setRate(remoteRate, {{ send: false }});
+            suppressLocalSyncFor(520);
+            if (payload.playing === false) requestPlayback(false);
             applyRemoteSeconds(payload.seconds, true);
-            suppressLocalSyncUntil = Date.now() + 220;
-            if (payload.playing === true && video.paused) video.play();
-            if (payload.playing === false && !video.paused) video.pause();
+            if (payload.playing === true) requestPlayback(true);
           }}
         }} catch (_) {{}}
       }};
@@ -446,6 +448,9 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
   function canSendLocalSync() {{
     return Date.now() >= suppressLocalSyncUntil;
   }}
+  function suppressLocalSyncFor(ms) {{
+    suppressLocalSyncUntil = Math.max(suppressLocalSyncUntil, Date.now() + ms);
+  }}
   function applyRemoteSeconds(seconds, force) {{
     if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return;
     const target = Math.max(0, seconds);
@@ -455,8 +460,32 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
       ? Math.max(0.045, Math.min(0.12, frameStep * 1.5))
       : Math.max(0.12, Math.min(0.24, frameStep * 12));
     if (force || video.paused || drift > correctionThreshold) {{
-      suppressLocalSyncUntil = Date.now() + 220;
+      suppressLocalSyncFor(220);
       video.currentTime = target;
+    }}
+  }}
+  function requestPlayback(shouldPlay) {{
+    desiredPlaying = shouldPlay === true;
+    if (!desiredPlaying) {{
+      try {{ video.pause(); }} catch (_) {{}}
+      refresh();
+      return;
+    }}
+    try {{
+      const result = video.play();
+      if (result && typeof result.then === 'function') {{
+        playPromise = result
+          .catch(() => {{}})
+          .then(() => {{
+            playPromise = null;
+            if (!desiredPlaying) {{
+              try {{ video.pause(); }} catch (_) {{}}
+            }}
+            refresh();
+          }});
+      }}
+    }} catch (_) {{
+      playPromise = null;
     }}
   }}
   function timelinePayload(extra) {{
@@ -577,10 +606,12 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
     if (!video.paused && canSendLocalSync()) sendBridge('sync.timeline', timelinePayload());
   }});
   video.addEventListener('play', () => {{
+    desiredPlaying = true;
     refresh();
     if (canSendLocalSync()) sendBridge('sync.playback', timelinePayload({{ playing: true }}));
   }});
   video.addEventListener('pause', () => {{
+    desiredPlaying = false;
     refresh();
     if (canSendLocalSync()) sendBridge('sync.playback', timelinePayload({{ playing: false }}));
   }});
@@ -590,7 +621,7 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
   }});
   play.addEventListener('click', () => {{
     suppressLocalSyncUntil = 0;
-    video.paused ? video.play() : video.pause();
+    requestPlayback(video.paused && !desiredPlaying);
   }});
   back.addEventListener('click', () => seekTo(video.currentTime - frameStep));
   forward.addEventListener('click', () => seekTo(video.currentTime + frameStep));
@@ -1834,6 +1865,8 @@ fn render_youtube_media_html(
   let lastObservedSeconds = 0;
   let lastRemoteCorrectionAt = 0;
   let phaseDrivenPlayback = false;
+  let desiredPlaying = false;
+  let pendingRemotePlayback = null;
   function setChromeVisible(visible) {{
     document.body.classList.toggle('controls-visible', visible);
   }}
@@ -1915,10 +1948,10 @@ fn render_youtube_media_html(
             const remoteRate = playbackRateFromPayload(payload);
             if (remoteRate !== undefined) setRate(remoteRate, {{ send: false }});
             phaseDrivenPlayback = payload.playing === true;
+            suppressLocalSyncFor(620);
+            if (payload.playing === false) requestPlayback(false);
             applyRemoteSeconds(payload.seconds, true, packet.op, payload);
-            suppressLocalSyncUntil = Date.now() + 260;
-            if (payload.playing === true) player?.playVideo?.();
-            if (payload.playing === false) player?.pauseVideo?.();
+            if (payload.playing === true) requestPlayback(true);
           }}
         }} catch (_) {{}}
       }};
@@ -1945,6 +1978,9 @@ fn render_youtube_media_html(
   function canSendLocalSync() {{
     return Date.now() >= suppressLocalSyncUntil;
   }}
+  function suppressLocalSyncFor(ms) {{
+    suppressLocalSyncUntil = Math.max(suppressLocalSyncUntil, Date.now() + ms);
+  }}
   function applyRemoteSeconds(seconds, force, op, payload) {{
     if (!playerReady || typeof seconds !== 'number' || !Number.isFinite(seconds)) return;
     const reason = payload?.reason ?? '';
@@ -1969,7 +2005,7 @@ fn render_youtube_media_html(
     if (passivePlaybackHint && now - lastRemoteCorrectionAt < 1000) return;
     if (force || !playing || drift > correctionThreshold) {{
       lastRemoteCorrectionAt = now;
-      suppressLocalSyncUntil = Date.now() + 260;
+      suppressLocalSyncFor(260);
       player.seekTo(target, true);
       lastObservedSeconds = target;
       refresh();
@@ -1992,6 +2028,33 @@ fn render_youtube_media_html(
     player.seekTo(target, true);
     refresh();
     if (send !== false && canSendLocalSync()) sendBridge('sync.seek', timelinePayload());
+  }}
+  function requestPlayback(shouldPlay) {{
+    desiredPlaying = shouldPlay === true;
+    if (!playerReady) {{
+      pendingRemotePlayback = desiredPlaying;
+      return;
+    }}
+    try {{
+      if (desiredPlaying) {{
+        player?.playVideo?.();
+      }} else {{
+        player?.pauseVideo?.();
+      }}
+    }} catch (_) {{}}
+    refresh();
+    setTimeout(enforceDesiredPlayback, 80);
+    setTimeout(enforceDesiredPlayback, 220);
+    setTimeout(enforceDesiredPlayback, 520);
+  }}
+  function enforceDesiredPlayback() {{
+    if (!playerReady) return;
+    const state = playerState();
+    try {{
+      if (desiredPlaying && state !== 1) player?.playVideo?.();
+      if (!desiredPlaying && (state === 1 || state === 3)) player?.pauseVideo?.();
+    }} catch (_) {{}}
+    refresh();
   }}
   function currentRate() {{
     if (!playerReady || !player?.getPlaybackRate) return initialPlaybackRate;
@@ -2037,15 +2100,22 @@ fn render_youtube_media_html(
     setRate(initialPlaybackRate, {{ send: false }});
     connectBridge();
     refresh();
+    if (pendingRemotePlayback !== null) {{
+      const pending = pendingRemotePlayback;
+      pendingRemotePlayback = null;
+      requestPlayback(pending);
+    }}
     setInterval(sendTimelineTick, 100);
   }}
   function onPlayerStateChange(event) {{
     const nextPlaying = event.data === 1;
     playing = nextPlaying;
     refresh();
+    if (canSendLocalSync()) desiredPlaying = nextPlaying;
     if ((event.data === 1 || event.data === 2 || event.data === 0) && canSendLocalSync()) {{
       sendBridge('sync.playback', timelinePayload({{ playing: nextPlaying }}));
     }}
+    if (!canSendLocalSync()) setTimeout(enforceDesiredPlayback, 120);
   }}
   function onPlayerError(event) {{
     document.body.classList.add('load-error');
@@ -2880,7 +2950,7 @@ fn relay_client_packet_to_peers(
         if index == sender_index {
             continue;
         }
-        match client.send(Message::Text(encoded.to_owned())) {
+        match send_text_with_retry(client, encoded) {
             Ok(_) => {
                 let _ = event_tx.send(BridgeEvent::PacketSent { op: op.to_owned() });
             }
@@ -2902,7 +2972,7 @@ fn send_to_clients(
 ) {
     let mut index = 0;
     while index < clients.len() {
-        match clients[index].send(Message::Text(encoded.clone())) {
+        match send_text_with_retry(&mut clients[index], &encoded) {
             Ok(_) => {
                 let _ = event_tx.send(BridgeEvent::PacketSent { op: op.clone() });
                 index += 1;
@@ -2924,6 +2994,21 @@ fn send_to_clients(
             }
         }
     }
+}
+
+fn send_text_with_retry(
+    client: &mut tungstenite::WebSocket<TcpStream>,
+    encoded: &str,
+) -> tungstenite::Result<()> {
+    for _ in 0..3 {
+        match client.send(Message::Text(encoded.to_owned())) {
+            Err(tungstenite::Error::Io(error)) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(3));
+            }
+            result => return result,
+        }
+    }
+    client.send(Message::Text(encoded.to_owned()))
 }
 
 fn send_auto_reply(client: &mut tungstenite::WebSocket<TcpStream>, packet: &VideoPacket) {
@@ -3051,6 +3136,12 @@ mod tests {
         assert!(html.contains("new YT.Player('phase-media'"));
         assert!(html.contains("player.getCurrentTime"));
         assert!(html.contains("player.seekTo(target, true)"));
+        assert!(html.contains("function requestPlayback(shouldPlay)"));
+        assert!(html.contains("function enforceDesiredPlayback()"));
+        assert!(html.contains("function suppressLocalSyncFor(ms)"));
+        assert!(html.contains("pendingRemotePlayback"));
+        assert!(html.contains("payload.playing === false) requestPlayback(false)"));
+        assert!(html.contains("payload.playing === true) requestPlayback(true)"));
         assert!(html.contains("phaseDrivenPlayback"));
         assert!(html.contains("reason === 'playback_correction'"));
         assert!(html.contains("passivePlaybackHint"));
@@ -3121,6 +3212,11 @@ mod tests {
         assert!(html.contains("sync.playback"));
         assert!(html.contains("sync.seek"));
         assert!(html.contains("function applyRemoteSeconds(seconds, force)"));
+        assert!(html.contains("function requestPlayback(shouldPlay)"));
+        assert!(html.contains("function suppressLocalSyncFor(ms)"));
+        assert!(html.contains("payload.playing === false) requestPlayback(false)"));
+        assert!(html.contains("payload.playing === true) requestPlayback(true)"));
+        assert!(!html.contains("payload.playing === false && !video.paused"));
         assert!(html.contains("function playbackRateFromPayload(payload)"));
         assert!(html.contains("playback_rate: video.playbackRate"));
         assert!(html.contains("reason: 'rate_change'"));

@@ -83,7 +83,7 @@ cargo run --bin phase-tool -- --video-popup <path-to-rendered-player-html>
 There are GitHub Actions in `.github/workflows`:
 
 - `build.yml` builds Windows and macOS on pushes / PRs and uploads artifacts.
-- `release.yml` builds `PhaseAnimatorSetup.exe`, the Windows MSI, and the macOS zip when a tag like `v0.19.5` is pushed.
+- `release.yml` builds `PhaseAnimatorSetup.exe`, the Windows MSI, and the macOS zip when a tag like `v0.19.6` is pushed.
 
 When a GitHub Release has a newer `PhaseAutoUpdater-*.msi` asset, the app shows it in the Options tab and can launch the installer update.
 
@@ -91,7 +91,7 @@ macOS still needs signing and notarization before a public customer release. The
 
 ## latest update
 
-`0.19.5` adds the Phase Video Reference companion surface. The updater now owns the local video bridge and standalone player window while keeping existing marketplace themes, tray controls, app self-update checks, and plugin install behavior.
+`0.19.6` tightens Video Reference play/pause sync so plugin pause commands stay authoritative even during quick start/stop changes. Windows builds are also statically linked against the MSVC runtime so the setup app can start on machines missing `VCRUNTIME140_1.dll`.
 
 ## repo notes
 

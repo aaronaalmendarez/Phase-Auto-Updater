@@ -2137,9 +2137,11 @@ impl PhaseInstallerApp {
         {
             self.video_sync_enabled = sync_enabled;
         }
-        if let Some(playing) = playing {
-            self.video_playing = playing;
-            self.video_play_last_tick = playing.then(Instant::now);
+        if op == "sync.playback" {
+            if let Some(playing) = playing {
+                self.video_playing = playing;
+                self.video_play_last_tick = playing.then(Instant::now);
+            }
         }
         if let Some(seconds) = seconds {
             self.video_position_seconds = seconds.max(0.0);
