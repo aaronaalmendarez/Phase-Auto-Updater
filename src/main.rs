@@ -2,7 +2,9 @@
 
 mod detector;
 mod verification;
+mod video_reference;
 
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,6 +52,14 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if let Some(path) = popup_arg_path() {
+        video_reference::install_popup_panic_logger();
+        if let Err(error) = video_reference::run_popup_window(&path) {
+            video_reference::append_popup_log(format!("popup failed before event loop: {error}"));
+            eprintln!("Phase video popup failed: {error}");
+        }
+        return Ok(());
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -67,6 +77,16 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Box::new(PhaseInstallerApp::new(cc))),
     )
+}
+
+fn popup_arg_path() -> Option<PathBuf> {
+    let mut args = std::env::args_os();
+    while let Some(arg) = args.next() {
+        if arg == "--video-popup" {
+            return args.next().map(PathBuf::from);
+        }
+    }
+    None
 }
 
 fn run_smoke_test() -> Result<(), String> {
@@ -105,6 +125,7 @@ enum ViewTab {
     Install,
     Account,
     Folders,
+    Video,
     Options,
 }
 
@@ -255,6 +276,27 @@ struct PhaseInstallerApp {
     activation_error: Option<String>,
     backup_before_install: bool,
     restart_studio_hint: bool,
+    video_bridge: video_reference::VideoReferenceBridge,
+    video_bridge_config: video_reference::BridgeConfig,
+    video_bridge_listening: bool,
+    video_bridge_connected: bool,
+    video_bridge_status: String,
+    video_source: String,
+    video_title: String,
+    video_duration_seconds: String,
+    video_fps: String,
+    video_start_frame: String,
+    video_offset_seconds: String,
+    video_playback_rate: String,
+    video_position_seconds: f64,
+    video_position_input: String,
+    video_sync_enabled: bool,
+    video_playing: bool,
+    video_play_last_tick: Option<Instant>,
+    video_last_sync_sent: Option<Instant>,
+    video_seq: u64,
+    video_last_plugin_state: String,
+    video_last_reference_status: String,
     phase: InstallPhase,
     active_tab: ViewTab,
     progress: f32,
@@ -288,6 +330,9 @@ impl PhaseInstallerApp {
         let selected_folder = best_candidate(&candidates).map(|candidate| candidate.path);
         let (avatar_tx, avatar_rx) = mpsc::channel();
         let (theme_background_tx, theme_background_rx) = mpsc::channel();
+        let video_bridge_config = video_reference::BridgeConfig::default_local();
+        let video_bridge =
+            video_reference::VideoReferenceBridge::start(video_bridge_config.clone());
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let (tray_tx, tray_rx) = mpsc::channel();
 
@@ -346,6 +391,27 @@ impl PhaseInstallerApp {
             activation_error: None,
             backup_before_install: true,
             restart_studio_hint: true,
+            video_bridge,
+            video_bridge_config,
+            video_bridge_listening: false,
+            video_bridge_connected: false,
+            video_bridge_status: "Starting video bridge.".to_owned(),
+            video_source: String::new(),
+            video_title: String::new(),
+            video_duration_seconds: String::new(),
+            video_fps: "60".to_owned(),
+            video_start_frame: "0".to_owned(),
+            video_offset_seconds: "0".to_owned(),
+            video_playback_rate: "1".to_owned(),
+            video_position_seconds: 0.0,
+            video_position_input: "0".to_owned(),
+            video_sync_enabled: false,
+            video_playing: false,
+            video_play_last_tick: None,
+            video_last_sync_sent: None,
+            video_seq: 0,
+            video_last_plugin_state: "No Studio timeline state yet.".to_owned(),
+            video_last_reference_status: "No reference sent.".to_owned(),
             phase: InstallPhase::Idle,
             active_tab: ViewTab::Install,
             progress: 0.0,
@@ -419,6 +485,8 @@ impl PhaseInstallerApp {
         self.poll_theme_background_fetches(ctx);
         self.ensure_theme_background_fetch(ctx);
         self.poll_tray(ctx);
+        self.poll_video_bridge(ctx);
+        self.tick_video_playback(ctx);
 
         let Some(started_at) = self.phase_started_at else {
             return;
@@ -1947,6 +2015,326 @@ impl PhaseInstallerApp {
         }
     }
 
+    fn poll_video_bridge(&mut self, ctx: &Context) {
+        for event in self.video_bridge.poll() {
+            match event {
+                video_reference::BridgeEvent::Listening { url } => {
+                    self.video_bridge_listening = true;
+                    self.video_bridge_status = format!("Listening on {url}");
+                    self.log(phase::green(), "Video reference bridge is listening.");
+                }
+                video_reference::BridgeEvent::ClientConnected => {
+                    self.video_bridge_connected = true;
+                    self.video_bridge_status = "Studio connected to video bridge.".to_owned();
+                    self.log(phase::green(), "Studio connected to video bridge.");
+                }
+                video_reference::BridgeEvent::ClientDisconnected => {
+                    self.video_bridge_connected = false;
+                    self.video_bridge_status = "Studio disconnected from video bridge.".to_owned();
+                    self.video_playing = false;
+                    self.video_play_last_tick = None;
+                    self.log(phase::warning(), "Studio disconnected from video bridge.");
+                }
+                video_reference::BridgeEvent::PacketReceived(packet) => {
+                    self.handle_video_packet(packet);
+                }
+                video_reference::BridgeEvent::PacketSent { op } => {
+                    self.video_bridge_status = format!("Sent {op} to Studio.");
+                }
+                video_reference::BridgeEvent::SendFailed { op, message } => {
+                    self.video_bridge_status = format!("{op} failed: {message}");
+                    self.log(phase::warning(), self.video_bridge_status.clone());
+                }
+                video_reference::BridgeEvent::Error(error) => {
+                    self.video_bridge_status = error.clone();
+                    self.log(phase::red(), error);
+                }
+                video_reference::BridgeEvent::Stopped => {
+                    self.video_bridge_listening = false;
+                    self.video_bridge_connected = false;
+                    self.video_bridge_status = "Video bridge stopped.".to_owned();
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn handle_video_packet(&mut self, packet: video_reference::VideoPacket) {
+        let payload = video_reference::packet_payload(&packet);
+        match packet.op.as_str() {
+            "hello" => {
+                self.video_last_plugin_state = "Studio hello received.".to_owned();
+            }
+            "ping" => {
+                self.video_bridge_status = "Ping received from Studio.".to_owned();
+            }
+            "ack" | "hello.ok" => {
+                self.video_last_reference_status = payload
+                    .get("video_reference")
+                    .and_then(reference_summary)
+                    .unwrap_or_else(|| "Studio acknowledged video bridge packet.".to_owned());
+                self.video_bridge_status = "Studio acknowledged video bridge packet.".to_owned();
+            }
+            "error" => {
+                let message = payload
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Studio reported a video bridge error.");
+                self.video_bridge_status = message.to_owned();
+                self.log(phase::red(), message);
+            }
+            "reference.status" => {
+                self.video_last_reference_status = payload
+                    .get("video_reference")
+                    .or_else(|| payload.get("reference"))
+                    .and_then(reference_summary)
+                    .or_else(|| {
+                        payload
+                            .get("status")
+                            .or_else(|| payload.get("message"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "Studio reference state received.".to_owned());
+            }
+            "sync.enabled" => {
+                self.video_sync_enabled = payload
+                    .get("enabled")
+                    .or_else(|| payload.get("sync_enabled"))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(self.video_sync_enabled);
+                self.video_last_plugin_state = if self.video_sync_enabled {
+                    "Studio video sync enabled.".to_owned()
+                } else {
+                    "Studio video sync disabled.".to_owned()
+                };
+            }
+            "sync.timeline" | "sync.seek" | "sync.playback" => {
+                self.apply_video_timeline_payload(packet.op.as_str(), payload);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_video_timeline_payload(&mut self, op: &str, payload: &serde_json::Value) {
+        let seconds = payload
+            .get("seconds")
+            .or_else(|| payload.get("video_seconds"))
+            .or_else(|| payload.get("position_seconds"))
+            .and_then(|value| value.as_f64());
+        let frame = payload.get("frame").and_then(|value| value.as_i64());
+        let fps = payload.get("fps").and_then(|value| value.as_f64());
+        let playback_rate = payload
+            .get("playback_rate")
+            .or_else(|| payload.get("PlaybackRate"))
+            .or_else(|| payload.get("rate"))
+            .and_then(|value| value.as_f64());
+        let playing = payload.get("playing").and_then(|value| value.as_bool());
+        if let Some(sync_enabled) = payload
+            .get("sync_enabled")
+            .or_else(|| payload.get("enabled"))
+            .and_then(|value| value.as_bool())
+        {
+            self.video_sync_enabled = sync_enabled;
+        }
+        if let Some(playing) = playing {
+            self.video_playing = playing;
+            self.video_play_last_tick = playing.then(Instant::now);
+        }
+        if let Some(seconds) = seconds {
+            self.video_position_seconds = seconds.max(0.0);
+            self.video_position_input = format_seconds(self.video_position_seconds);
+        }
+        if let Some(fps) = fps {
+            self.video_fps = format_seconds(fps.max(1.0));
+        }
+        if let Some(playback_rate) = playback_rate {
+            self.video_playback_rate = format_seconds(playback_rate.clamp(0.05, 8.0));
+        }
+        let frame_text = frame
+            .map(|frame| format!("frame {frame}"))
+            .unwrap_or_else(|| "frame unknown".to_owned());
+        let seconds_text = seconds
+            .map(|seconds| format!("{seconds:.3}s"))
+            .unwrap_or_else(|| "seconds unknown".to_owned());
+        self.video_last_plugin_state = format!("{op}: {frame_text}, {seconds_text}");
+    }
+
+    fn tick_video_playback(&mut self, ctx: &Context) {
+        if !self.video_playing {
+            self.video_play_last_tick = None;
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some(previous) = self.video_play_last_tick {
+            let rate = parse_f64_or(&self.video_playback_rate, 1.0).clamp(0.05, 8.0);
+            self.video_position_seconds += previous.elapsed().as_secs_f64() * rate;
+            self.video_position_input = format_seconds(self.video_position_seconds);
+        }
+        self.video_play_last_tick = Some(now);
+
+        let should_send = self
+            .video_last_sync_sent
+            .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(100));
+        if should_send {
+            self.send_video_timeline("sync.timeline");
+            self.video_last_sync_sent = Some(now);
+        }
+        ctx.request_repaint_after(Duration::from_millis(33));
+    }
+
+    fn restart_video_bridge(&mut self) {
+        self.video_bridge.stop();
+        std::thread::sleep(Duration::from_millis(80));
+        self.video_bridge =
+            video_reference::VideoReferenceBridge::start(self.video_bridge_config.clone());
+        self.video_bridge_listening = false;
+        self.video_bridge_connected = false;
+        self.video_bridge_status = "Restarting video bridge.".to_owned();
+        self.log(phase::blue(), "Restarting video reference bridge.");
+    }
+
+    fn pick_video_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Video", &["mp4", "mov", "m4v", "webm"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.video_source = path.to_string_lossy().to_string();
+        if self.video_title.trim().is_empty() {
+            self.video_title = video_reference::default_title_for(&self.video_source);
+        }
+        self.video_last_reference_status = "Local video selected.".to_owned();
+    }
+
+    fn send_video_reference(&mut self) {
+        let Ok(draft) = self.video_reference_draft() else {
+            self.video_bridge_status = "Choose a YouTube URL or local MP4 first.".to_owned();
+            self.log(phase::warning(), self.video_bridge_status.clone());
+            return;
+        };
+
+        self.video_reference_source_to_title();
+        self.video_bridge
+            .send("reference.set", draft.payload(), None);
+        self.video_last_reference_status = format!("Queued reference: {}", draft.title);
+    }
+
+    fn video_reference_draft(&self) -> Result<video_reference::ReferenceDraft, String> {
+        let source = self.video_source.trim().to_owned();
+        if source.is_empty() {
+            return Err("Choose a YouTube URL or local MP4 first.".to_owned());
+        }
+
+        let title = self.video_title.trim();
+        Ok(video_reference::ReferenceDraft {
+            source_kind: video_reference::source_kind_for(&source),
+            source: source.clone(),
+            title: if title.is_empty() {
+                video_reference::default_title_for(&source)
+            } else {
+                title.to_owned()
+            },
+            duration_seconds: parse_f64_or(&self.video_duration_seconds, 0.0),
+            fps: parse_f64_or(&self.video_fps, 60.0),
+            start_frame: parse_i64_or(&self.video_start_frame, 0),
+            offset_seconds: parse_f64_or(&self.video_offset_seconds, 0.0),
+            playback_rate: parse_f64_or(&self.video_playback_rate, 1.0),
+        })
+    }
+
+    fn open_video_popup(&mut self) {
+        let draft = match self.video_reference_draft() {
+            Ok(draft) => draft,
+            Err(error) => {
+                self.video_bridge_status = error.clone();
+                self.log(phase::warning(), error);
+                return;
+            }
+        };
+        match video_reference::open_reference_popup(&draft) {
+            Ok(_) => {
+                self.video_bridge
+                    .send("reference.set", draft.payload(), None);
+                self.video_last_reference_status = format!("Opened popup: {}", draft.title);
+                self.video_bridge_status = "Video popup opened.".to_owned();
+            }
+            Err(error) => {
+                self.video_bridge_status = error.clone();
+                self.log(phase::red(), error);
+            }
+        }
+    }
+
+    fn video_reference_source_to_title(&mut self) {
+        if self.video_title.trim().is_empty() && !self.video_source.trim().is_empty() {
+            self.video_title = video_reference::default_title_for(&self.video_source);
+        }
+    }
+
+    fn clear_video_reference(&mut self) {
+        self.video_bridge.send("reference.clear", json!({}), None);
+        self.video_last_reference_status = "Clear request sent.".to_owned();
+    }
+
+    fn send_video_sync_enabled(&mut self) {
+        self.video_bridge.send(
+            "sync.enabled",
+            json!({
+                "enabled": self.video_sync_enabled,
+            }),
+            None,
+        );
+    }
+
+    fn send_video_ping(&mut self) {
+        self.video_bridge.send(
+            "ping",
+            json!({
+                "side": "phase-rust-companion",
+            }),
+            None,
+        );
+    }
+
+    fn send_video_timeline(&mut self, op: &str) {
+        self.video_seq = self.video_seq.saturating_add(1);
+        let fps = parse_f64_or(&self.video_fps, 60.0).max(1.0);
+        let start_frame = parse_i64_or(&self.video_start_frame, 0).max(0);
+        let offset = parse_f64_or(&self.video_offset_seconds, 0.0);
+        let playback_rate = parse_f64_or(&self.video_playback_rate, 1.0).clamp(0.05, 8.0);
+        let frame = start_frame + ((self.video_position_seconds - offset) * fps).round() as i64;
+        self.video_bridge.send(
+            op,
+            json!({
+                "seq": self.video_seq,
+                "frame": frame.max(0),
+                "seconds": self.video_position_seconds,
+                "fps": fps,
+                "playing": self.video_playing,
+                "playback_rate": playback_rate,
+            }),
+            None,
+        );
+    }
+
+    fn seek_video_sync(&mut self) {
+        self.video_position_seconds = parse_f64_or(&self.video_position_input, 0.0).max(0.0);
+        self.video_position_input = format_seconds(self.video_position_seconds);
+        self.send_video_timeline("sync.seek");
+    }
+
+    fn set_video_playing(&mut self, playing: bool) {
+        self.video_position_seconds =
+            parse_f64_or(&self.video_position_input, self.video_position_seconds).max(0.0);
+        self.video_position_input = format_seconds(self.video_position_seconds);
+        self.video_playing = playing;
+        self.video_play_last_tick = playing.then(Instant::now);
+        self.send_video_timeline("sync.playback");
+    }
+
     fn selected_candidate(&self) -> Option<&PluginFolderCandidate> {
         let selected = self.selected_folder.as_ref()?;
         self.candidates
@@ -2402,6 +2790,7 @@ impl eframe::App for PhaseInstallerApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.video_bridge.stop();
         self.cleanup_tray();
     }
 
@@ -2746,7 +3135,8 @@ impl PhaseInstallerApp {
             ViewTab::Install => 0.0,
             ViewTab::Account => 1.0,
             ViewTab::Folders => 2.0,
-            ViewTab::Options => 3.0,
+            ViewTab::Video => 3.0,
+            ViewTab::Options => 4.0,
         };
 
         let diff = target_x - self.tab_lerp;
@@ -2766,7 +3156,7 @@ impl PhaseInstallerApp {
         painter.rect_filled(rect, Rounding::same(8.0), phase::input());
         painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, phase::line()));
 
-        let tab_width = width / 4.0;
+        let tab_width = width / 5.0;
         let highlight_rect = Rect::from_min_max(
             Pos2::new(
                 rect.left() + self.tab_lerp * tab_width + 2.0,
@@ -2793,20 +3183,22 @@ impl PhaseInstallerApp {
                     0 => self.active_tab = ViewTab::Install,
                     1 => self.active_tab = ViewTab::Account,
                     2 => self.active_tab = ViewTab::Folders,
-                    3 => self.active_tab = ViewTab::Options,
+                    3 => self.active_tab = ViewTab::Video,
+                    4 => self.active_tab = ViewTab::Options,
                     _ => {}
                 }
             }
         }
 
-        let labels = ["Install", "Account", "Folders", "Options"];
+        let labels = ["Install", "Account", "Folders", "Video", "Options"];
         let icons = [
             MiniIcon::Bolt,
             MiniIcon::User,
             MiniIcon::Folder,
+            MiniIcon::External,
             MiniIcon::Gear,
         ];
-        for i in 0..4 {
+        for i in 0..5 {
             let x_center = rect.left() + (i as f32 + 0.5) * tab_width;
             let y_center = rect.center().y;
 
@@ -2814,7 +3206,8 @@ impl PhaseInstallerApp {
                 (ViewTab::Install, 0) => true,
                 (ViewTab::Account, 1) => true,
                 (ViewTab::Folders, 2) => true,
-                (ViewTab::Options, 3) => true,
+                (ViewTab::Video, 3) => true,
+                (ViewTab::Options, 4) => true,
                 _ => false,
             };
 
@@ -2967,6 +3360,7 @@ impl PhaseInstallerApp {
             ViewTab::Install => self.install_tab(ui),
             ViewTab::Account => self.account_tab(ui),
             ViewTab::Folders => self.folders_tab(ui),
+            ViewTab::Video => self.video_tab(ui),
             ViewTab::Options => self.options_tab(ui),
         }
     }
@@ -3405,6 +3799,375 @@ impl PhaseInstallerApp {
                     self.refresh_detection();
                 }
             });
+        });
+    }
+
+    fn video_tab(&mut self, ui: &mut Ui) {
+        draw_panel(ui, |ui| {
+            section_label(ui, "Video Reference");
+            ui.add_space(6.0);
+
+            let (bridge_label, bridge_color) = if self.video_bridge_connected {
+                ("Studio linked", phase::green())
+            } else if self.video_bridge_listening {
+                ("Ready for Studio", phase::accent())
+            } else {
+                ("Bridge offline", phase::warning())
+            };
+            let source_hint = if self.video_source.trim().is_empty() {
+                "Paste a YouTube URL or pick a local MP4.".to_owned()
+            } else {
+                self.video_last_reference_status.clone()
+            };
+
+            egui::Frame::none()
+                .fill(phase::input())
+                .stroke(Stroke::new(1.0, phase::line()))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(Margin::symmetric(12.0, 12.0))
+                .show(ui, |ui| {
+                    ui.set_width(CARD_INNER_WIDTH - 16.0);
+                    ui.horizontal(|ui| {
+                        draw_icon(ui, MiniIcon::External, Vec2::splat(30.0), phase::accent());
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            ui.add_sized(
+                                Vec2::new(CARD_INNER_WIDTH - 205.0, 20.0),
+                                egui::Label::new(
+                                    RichText::new("Open and link a video")
+                                        .font(FontId::proportional(14.0))
+                                        .strong()
+                                        .color(phase::text()),
+                                )
+                                .wrap(false),
+                            );
+                            scrolling_label(
+                                ui,
+                                &source_hint,
+                                CARD_INNER_WIDTH - 184.0,
+                                FontId::proportional(11.0),
+                                phase::text_muted(),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            status_pill(ui, bridge_label, bridge_color);
+                        });
+                    });
+
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new("Video")
+                            .font(FontId::proportional(11.0))
+                            .color(phase::text_muted()),
+                    );
+                    ui.horizontal(|ui| {
+                        let source_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.video_source)
+                                .desired_width(CARD_INNER_WIDTH - 142.0)
+                                .hint_text("YouTube URL or local MP4 path"),
+                        );
+                        if source_response.changed() && self.video_title.trim().is_empty() {
+                            self.video_title =
+                                video_reference::default_title_for(&self.video_source);
+                        }
+                        if secondary_button(ui, MiniIcon::Folder, "Browse", Vec2::new(92.0, 32.0))
+                            .clicked()
+                        {
+                            self.pick_video_file();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Name")
+                            .font(FontId::proportional(11.0))
+                            .color(phase::text_muted()),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.video_title)
+                            .desired_width(CARD_INNER_WIDTH - 34.0)
+                            .hint_text("Optional display name"),
+                    );
+
+                    ui.add_space(12.0);
+                    if primary_button(
+                        ui,
+                        MiniIcon::External,
+                        "Open Video",
+                        Vec2::new(CARD_INNER_WIDTH - 34.0, 38.0),
+                    )
+                    .clicked()
+                    {
+                        self.open_video_popup();
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let btn_width = (CARD_INNER_WIDTH - 42.0) / 3.0;
+                        if secondary_button(
+                            ui,
+                            MiniIcon::Bolt,
+                            "Send Link",
+                            Vec2::new(btn_width, 32.0),
+                        )
+                        .clicked()
+                        {
+                            self.send_video_reference();
+                        }
+                        let sync_label = if self.video_sync_enabled {
+                            "Sync On"
+                        } else {
+                            "Sync Off"
+                        };
+                        let sync_icon = if self.video_sync_enabled {
+                            MiniIcon::Check
+                        } else {
+                            MiniIcon::Lock
+                        };
+                        if secondary_button(ui, sync_icon, sync_label, Vec2::new(btn_width, 32.0))
+                            .clicked()
+                        {
+                            self.video_sync_enabled = !self.video_sync_enabled;
+                            self.send_video_sync_enabled();
+                        }
+                        if secondary_button(
+                            ui,
+                            MiniIcon::Refresh,
+                            "Clear",
+                            Vec2::new(btn_width, 32.0),
+                        )
+                        .clicked()
+                        {
+                            self.clear_video_reference();
+                        }
+                    });
+                });
+
+            ui.add_space(10.0);
+            egui::Frame::none()
+                .fill(phase::input())
+                .stroke(Stroke::new(1.0, phase::line()))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(Margin::symmetric(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_width(CARD_INNER_WIDTH - 16.0);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("Studio Sync")
+                                    .font(FontId::proportional(13.0))
+                                    .strong()
+                                    .color(phase::text()),
+                            );
+                            let sync_hint = if self.video_sync_enabled {
+                                "Viewer and Phase are following each other."
+                            } else {
+                                "Mirror play, pause, and scrubbing."
+                            };
+                            scrolling_label(
+                                ui,
+                                sync_hint,
+                                CARD_INNER_WIDTH - 170.0,
+                                FontId::proportional(11.0),
+                                phase::text_muted(),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            status_pill(
+                                ui,
+                                if self.video_sync_enabled { "On" } else { "Off" },
+                                if self.video_sync_enabled {
+                                    phase::green()
+                                } else {
+                                    phase::text_muted()
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(8.0);
+                    scrolling_label(
+                        ui,
+                        &self.video_last_plugin_state,
+                        CARD_INNER_WIDTH - 34.0,
+                        FontId::proportional(11.0),
+                        phase::text_muted(),
+                    );
+                    ui.add_space(4.0);
+                    scrolling_label(
+                        ui,
+                        &self.video_last_reference_status,
+                        CARD_INNER_WIDTH - 34.0,
+                        FontId::proportional(11.0),
+                        phase::text_muted(),
+                    );
+                });
+
+            ui.add_space(12.0);
+            egui::CollapsingHeader::new("Timing")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(phase::input())
+                        .stroke(Stroke::new(1.0, phase::line()))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::symmetric(12.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.set_width(CARD_INNER_WIDTH - 16.0);
+                            ui.horizontal(|ui| {
+                                small_number_field(
+                                    ui,
+                                    "Duration",
+                                    &mut self.video_duration_seconds,
+                                    "0",
+                                );
+                                small_number_field(ui, "FPS", &mut self.video_fps, "60");
+                                small_number_field(ui, "Start", &mut self.video_start_frame, "0");
+                            });
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                small_number_field(
+                                    ui,
+                                    "Offset",
+                                    &mut self.video_offset_seconds,
+                                    "0",
+                                );
+                                small_number_field(ui, "Rate", &mut self.video_playback_rate, "1");
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("TYPE")
+                                            .font(FontId::proportional(10.0))
+                                            .color(phase::text_muted()),
+                                    );
+                                    status_pill(
+                                        ui,
+                                        video_reference::source_kind_for(&self.video_source)
+                                            .as_protocol_str(),
+                                        phase::accent(),
+                                    );
+                                });
+                            });
+                        });
+                });
+
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new("Advanced Connection")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(phase::input())
+                        .stroke(Stroke::new(1.0, phase::line()))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::symmetric(12.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.set_width(CARD_INNER_WIDTH - 16.0);
+                            ui.label(
+                                RichText::new(self.video_bridge_config.url())
+                                    .font(FontId::monospace(12.0))
+                                    .color(phase::text()),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Token")
+                                        .font(FontId::proportional(11.0))
+                                        .color(phase::text_muted()),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.video_bridge_config.token)
+                                        .desired_width(CARD_INNER_WIDTH - 118.0)
+                                        .password(true)
+                                        .hint_text("optional"),
+                                );
+                            });
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                let btn_width = (CARD_INNER_WIDTH - 42.0) / 3.0;
+                                if secondary_button(
+                                    ui,
+                                    MiniIcon::Refresh,
+                                    "Restart",
+                                    Vec2::new(btn_width, 32.0),
+                                )
+                                .clicked()
+                                {
+                                    self.restart_video_bridge();
+                                }
+                                if secondary_button(
+                                    ui,
+                                    MiniIcon::External,
+                                    "Ping",
+                                    Vec2::new(btn_width, 32.0),
+                                )
+                                .clicked()
+                                {
+                                    self.send_video_ping();
+                                }
+                                if secondary_button(
+                                    ui,
+                                    MiniIcon::Check,
+                                    "Apply",
+                                    Vec2::new(btn_width, 32.0),
+                                )
+                                .clicked()
+                                {
+                                    self.send_video_sync_enabled();
+                                }
+                            });
+
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Seconds")
+                                        .font(FontId::proportional(11.0))
+                                        .color(phase::text_muted()),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.video_position_input)
+                                        .desired_width(94.0),
+                                );
+                            });
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let btn_width = (CARD_INNER_WIDTH - 42.0) / 3.0;
+                                if secondary_button(
+                                    ui,
+                                    MiniIcon::Refresh,
+                                    "Seek",
+                                    Vec2::new(btn_width, 32.0),
+                                )
+                                .clicked()
+                                {
+                                    self.seek_video_sync();
+                                }
+                                let play_label = if self.video_playing { "Stop" } else { "Play" };
+                                let play_icon = if self.video_playing {
+                                    MiniIcon::Lock
+                                } else {
+                                    MiniIcon::Bolt
+                                };
+                                if secondary_button(
+                                    ui,
+                                    play_icon,
+                                    play_label,
+                                    Vec2::new(btn_width, 32.0),
+                                )
+                                .clicked()
+                                {
+                                    self.set_video_playing(!self.video_playing);
+                                }
+                                if secondary_button(
+                                    ui,
+                                    MiniIcon::Bolt,
+                                    "State",
+                                    Vec2::new(btn_width, 32.0),
+                                )
+                                .clicked()
+                                {
+                                    self.send_video_timeline("sync.timeline");
+                                }
+                            });
+                        });
+                });
         });
     }
 
@@ -4732,6 +5495,55 @@ fn status_pill(ui: &mut Ui, text: &str, color: Color32) {
                 .wrap(false),
             );
         });
+}
+
+fn small_number_field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
+    ui.vertical(|ui| {
+        ui.label(
+            RichText::new(label)
+                .font(FontId::proportional(10.0))
+                .color(phase::text_muted()),
+        );
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(102.0)
+                .hint_text(hint),
+        );
+    });
+}
+
+fn parse_f64_or(text: &str, fallback: f64) -> f64 {
+    text.trim().parse::<f64>().unwrap_or(fallback)
+}
+
+fn parse_i64_or(text: &str, fallback: i64) -> i64 {
+    text.trim().parse::<i64>().unwrap_or(fallback)
+}
+
+fn format_seconds(value: f64) -> String {
+    if value.fract().abs() < 0.0005 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.3}")
+    }
+}
+
+fn reference_summary(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let source = object
+        .get("Source")
+        .or_else(|| object.get("source"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let title = object
+        .get("Title")
+        .or_else(|| object.get("title"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("Video Reference");
+    if source.trim().is_empty() {
+        return Some("No video reference linked.".to_owned());
+    }
+    Some(format!("{title}: {source}"))
 }
 
 fn phase_text(phase: InstallPhase) -> &'static str {

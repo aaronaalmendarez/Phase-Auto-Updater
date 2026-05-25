@@ -22,13 +22,17 @@ The updater connects to Phase, checks for the latest release, and installs the p
 - supports Roblox OAuth verification
 - supports license key activation
 - can apply public Phase marketplace themes to the installer UI
+- opens a Video Reference tab for syncing Phase Animator to YouTube or local video files
+- runs a local `ws://127.0.0.1:27731/phase-video-reference` bridge for Studio timeline/playback sync
+- renders local MP4/MOV/M4V/WebM files in a native popup with custom controls, volume, scrubbing, rate, loop, fullscreen, swap video, and show-folder actions
+- embeds YouTube with the native YouTube player while still listening for play, pause, seek, and rate sync events
 - watches for new updater events and sends a desktop notification
 - downloads the plugin `.rbxm`
 - checks the file hash before replacing local files
 - makes a backup of the existing plugin file first
 - checks GitHub Releases for newer installer builds
 
-The UI is compact and shaped like a small installer. Long account names and file paths use horizontal scrolling so they do not break the layout.
+The UI is compact and shaped like a small installer. Long account names, file paths, and video references use horizontal scrolling so they do not break the layout.
 
 ## building it
 
@@ -68,16 +72,26 @@ For just running locally:
 cargo run --bin phase-tool
 ```
 
+For video popup debugging:
+
+```bash
+cargo run --bin phase-tool -- --video-popup <path-to-rendered-player-html>
+```
+
 ## github builds
 
 There are GitHub Actions in `.github/workflows`:
 
 - `build.yml` builds Windows and macOS on pushes / PRs and uploads artifacts.
-- `release.yml` builds `PhaseAnimatorSetup.exe`, the Windows MSI, and the macOS zip when a tag like `v0.19.3` is pushed.
+- `release.yml` builds `PhaseAnimatorSetup.exe`, the Windows MSI, and the macOS zip when a tag like `v0.19.5` is pushed.
 
 When a GitHub Release has a newer `PhaseAutoUpdater-*.msi` asset, the app shows it in the Options tab and can launch the installer update.
 
 macOS still needs signing and notarization before a public customer release. The app bundle script is here, but the Apple packaging pass still needs to happen on macOS or CI.
+
+## latest update
+
+`0.19.5` adds the Phase Video Reference companion surface. The updater now owns the local video bridge and standalone player window while keeping existing marketplace themes, tray controls, app self-update checks, and plugin install behavior.
 
 ## repo notes
 
