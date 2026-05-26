@@ -1747,6 +1747,139 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
         font-size: 10px;
       }}
     }}
+    @media (max-width: 460px), (max-height: 380px) {{
+      header {{
+        left: 6px;
+        right: 6px;
+        top: 6px;
+        min-height: 32px;
+        padding: 6px 7px;
+      }}
+      header .title {{
+        font-size: 11px;
+      }}
+      .pill {{
+        padding: 2px 6px;
+        font-size: 10px;
+      }}
+      .top-metrics {{
+        display: none;
+      }}
+      .top-action {{
+        height: 26px;
+        padding: 0 8px;
+        font-size: 10px;
+      }}
+      .media-popover {{
+        width: min(var(--popover-width, 360px), calc(100vw - 12px));
+        max-height: calc(100vh - var(--popover-top, 52px) - 6px);
+        padding: 8px;
+      }}
+      .phase-controls {{
+        left: 6px;
+        right: 6px;
+        bottom: 6px;
+        gap: 5px;
+        padding: 6px;
+        transform: translateY(12px) scale(.86);
+        transform-origin: bottom center;
+      }}
+      body.controls-visible .phase-controls,
+      .phase-controls:focus-within {{
+        transform: translateY(0) scale(.88);
+      }}
+      .scrub-row {{
+        grid-template-columns: 34px minmax(0, 1fr) 34px;
+        gap: 6px;
+      }}
+      .timecode {{
+        font-size: 10px;
+      }}
+      #phase-scrub {{
+        height: 14px;
+      }}
+      #phase-scrub::-webkit-slider-runnable-track {{
+        height: 4px;
+      }}
+      #phase-scrub::-webkit-slider-thumb {{
+        width: 13px;
+        height: 13px;
+        margin-top: -5px;
+      }}
+      .control-strip {{
+        gap: 5px;
+        flex-wrap: wrap;
+      }}
+      .control-button {{
+        height: 28px;
+        min-width: 42px;
+        padding: 0 8px;
+        font-size: 10px;
+      }}
+      .control-button.primary {{
+        height: 32px;
+        min-width: 68px;
+      }}
+      .frame-button {{
+        min-width: 40px;
+        padding: 0 7px;
+      }}
+      .utility-button {{
+        min-width: 45px;
+      }}
+      .rate-control,
+      .volume-control {{
+        height: 32px;
+        min-width: 98px;
+        gap: 5px;
+        padding: 0 5px 0 8px;
+        font-size: 10px;
+      }}
+      .rate-button,
+      .volume-mute {{
+        height: 24px;
+        min-width: 44px;
+        padding: 0 7px;
+        font-size: 10px;
+      }}
+      .volume-control {{
+        min-width: 128px;
+      }}
+      #phase-volume-slider {{
+        width: 46px;
+      }}
+      #phase-volume-value {{
+        display: none;
+      }}
+      .rate-menu {{
+        min-width: 96px;
+      }}
+      .rate-option {{
+        height: 25px;
+        font-size: 10px;
+      }}
+      .scrub-preview {{
+        bottom: 26px;
+        width: 118px;
+      }}
+      .scrub-preview canvas {{
+        width: 110px;
+        height: 62px;
+      }}
+    }}
+    @media (max-height: 300px) {{
+      header {{
+        transform: translateY(-9px) scale(.92);
+        transform-origin: top center;
+      }}
+      .phase-controls {{
+        gap: 4px;
+        padding: 5px;
+      }}
+      .utility-group {{
+        display: none;
+      }}
+    }}
   </style>
 </head>
 <body>
@@ -2239,7 +2372,7 @@ pub fn run_popup_window(html_path: &Path) -> Result<(), String> {
     let window = tao::window::WindowBuilder::new()
         .with_title("Phase Video Reference")
         .with_inner_size(tao::dpi::LogicalSize::new(1040.0, 640.0))
-        .with_min_inner_size(tao::dpi::LogicalSize::new(720.0, 420.0))
+        .with_min_inner_size(tao::dpi::LogicalSize::new(360.0, 260.0))
         .with_always_on_top(true)
         .with_window_icon(popup_icon)
         .build(&event_loop)
@@ -3256,6 +3389,11 @@ mod tests {
         assert!(html.contains("new Image()"));
         assert!(html.contains("showScrubPreview"));
         assert!(html.contains("@media (max-width: 820px), (max-height: 560px)"));
+        assert!(html.contains("@media (max-width: 460px), (max-height: 380px)"));
+        assert!(html.contains("grid-template-columns: 34px minmax(0, 1fr) 34px"));
+        assert!(html.contains("#phase-volume-value"));
+        assert!(html.contains("display: none"));
+        assert!(html.contains("@media (max-height: 300px)"));
         assert!(!html.contains(".control-group:hover"));
         assert!(html.contains("pointerleave"));
         assert!(html.contains("controls-visible"));
