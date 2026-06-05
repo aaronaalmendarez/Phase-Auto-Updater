@@ -4,7 +4,6 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 
 pub const DEFAULT_BASE_URL: &str = "https://phase.motioncore.xyz";
 pub const VERSION_ENDPOINT: &str = "/plugin/version";
@@ -482,13 +481,9 @@ fn site_url(url: &str) -> String {
 }
 
 fn http_agent() -> Result<ureq::Agent, String> {
-    // native-tls keeps Windows/macOS using the OS trust store. rustls would be
-    // fine too, but it needs a little more release packaging care.
-    let connector = ureq::native_tls::TlsConnector::new()
-        .map_err(|error| format!("Native TLS setup failed: {error}"))?;
-    Ok(ureq::AgentBuilder::new()
-        .tls_connector(Arc::new(connector))
-        .build())
+    // rustls avoids Windows SChannel-specific failures such as
+    // SEC_E_INVALID_TOKEN while keeping certificate validation enabled.
+    Ok(ureq::AgentBuilder::new().build())
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -27,7 +27,7 @@ use tray_icon::{
 };
 
 const APP_NAME: &str = "Phase Animator Installer";
-const CURRENT_BUILD_ID: &str = "phase-2026-05-18-custom";
+const CURRENT_BUILD_ID: &str = "phase-2026-06-05-rustls-v0-19-8";
 const PHOSPHOR_FONT: &str = "phosphor-icons";
 const APP_WIDTH: f32 = 450.0;
 const CONTENT_WIDTH: f32 = 410.0;
