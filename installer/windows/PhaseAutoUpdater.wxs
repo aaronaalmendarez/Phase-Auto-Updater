@@ -2,13 +2,13 @@
   xmlns="http://wixtoolset.org/schemas/v4/wxs"
   xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
-    Name="Phase Auto Updater"
+    Name="Phase Companion"
     Manufacturer="Phase"
     Version="$(var.PackageVersion)"
     UpgradeCode="7c34ec8f-7732-4f3a-8d4e-5c6c9ff8aa08"
     Scope="perUser">
 
-    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Phase Auto Updater is already installed." />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Phase Companion is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="AppIcon" SourceFile="$(var.SourceDir)\PhaseAnimator.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
@@ -18,19 +18,19 @@
 
     <ui:WixUI Id="WixUI_Minimal" />
 
-    <Feature Id="MainFeature" Title="Phase Auto Updater" Level="1">
+    <Feature Id="MainFeature" Title="Phase Companion" Level="1">
       <ComponentGroupRef Id="AppComponents" />
     </Feature>
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="LocalProgramsFolder" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="Phase Auto Updater" />
+        <Directory Id="INSTALLFOLDER" Name="Phase Companion" />
       </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="DesktopFolder" />
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ApplicationProgramsFolder" Name="Phase Auto Updater" />
+      <Directory Id="ApplicationProgramsFolder" Name="Phase Companion" />
     </StandardDirectory>
 
     <ComponentGroup Id="AppComponents">
@@ -39,14 +39,14 @@
           <Shortcut
             Id="DesktopShortcut"
             Directory="DesktopFolder"
-            Name="Phase Auto Updater"
+            Name="Phase Companion"
             WorkingDirectory="INSTALLFOLDER"
             Icon="AppIcon"
             Advertise="no" />
           <Shortcut
             Id="StartMenuShortcut"
             Directory="ApplicationProgramsFolder"
-            Name="Phase Auto Updater"
+            Name="Phase Companion"
             WorkingDirectory="INSTALLFOLDER"
             Icon="AppIcon"
             Advertise="no" />
@@ -73,7 +73,7 @@
         <RegistryValue
           Root="HKCU"
           Key="Software\Microsoft\Windows\CurrentVersion\Run"
-          Name="PhaseAutoUpdater"
+          Name="PhaseCompanion"
           Value="&quot;[INSTALLFOLDER]PhaseAnimatorInstaller.exe&quot;"
           Type="string"
           KeyPath="yes" />

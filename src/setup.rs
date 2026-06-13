@@ -7,7 +7,14 @@ use std::process::Command;
 
 const MSI_BYTES: &[u8] = include_bytes!(env!("PHASE_MSI_PATH"));
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
-const INSTALLER_TITLE: &str = "Phase Animator Setup";
+const INSTALLER_TITLE: &str = "Phase Companion Setup";
+const WINDOWS_ARCH: &str = if cfg!(target_arch = "x86") {
+    "x86"
+} else if cfg!(target_arch = "aarch64") {
+    "arm64"
+} else {
+    "x64"
+};
 
 fn main() {
     if std::env::args().any(|arg| arg == "--smoke-test") {
@@ -25,7 +32,9 @@ fn main() {
 
 fn run_setup() -> Result<(), String> {
     let mut msi_path = std::env::temp_dir();
-    msi_path.push(format!("PhaseAutoUpdater-{PACKAGE_VERSION}.msi"));
+    msi_path.push(format!(
+        "PhaseAutoUpdater-{PACKAGE_VERSION}-{WINDOWS_ARCH}.msi"
+    ));
 
     let mut file =
         fs::File::create(&msi_path).map_err(|error| format!("Could not prepare MSI: {error}"))?;
@@ -83,7 +92,7 @@ fn launch_installed_app() -> Result<(), String> {
     command
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("Could not launch Phase Auto Updater: {error}"))
+        .map_err(|error| format!("Could not launch Phase Companion: {error}"))
 }
 
 fn installed_app_path() -> Option<PathBuf> {
@@ -93,7 +102,7 @@ fn installed_app_path() -> Option<PathBuf> {
 
     let app_path = PathBuf::from(local_app_data)
         .join("Programs")
-        .join("Phase Auto Updater")
+        .join("Phase Companion")
         .join("PhaseAnimatorInstaller.exe");
     Some(app_path)
 }
@@ -130,7 +139,7 @@ fn refresh_desktop_shortcut() -> Result<(), String> {
         "$desktop=[Environment]::GetFolderPath('DesktopDirectory');\
          $target={};\
          $icon={};\
-         $link=Join-Path $desktop 'Phase Auto Updater.lnk';\
+         $link=Join-Path $desktop 'Phase Companion.lnk';\
          $shell=New-Object -ComObject WScript.Shell;\
          $shortcut=$shell.CreateShortcut($link);\
          $shortcut.TargetPath=$target;\

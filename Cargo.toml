@@ -1,8 +1,8 @@
 [package]
 name = "phase-updater"
-version = "0.19.8"
+version = "0.20.0"
 edition = "2024"
-description = "Native updater for the Phase Animator Roblox Studio plugin."
+description = "Native companion app for the Phase Animator Roblox Studio plugin."
 license = "MIT"
 publish = false
 
@@ -33,7 +33,7 @@ sha2 = "0.10"
 tao = "0.35"
 tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tray-icon = { version = "0.24", default-features = false }
-ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+ureq = { version = "2.12", default-features = false, features = ["json", "tls", "native-certs", "proxy-from-env"] }
 uuid = { version = "1.8", features = ["v4"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
 wry = "0.55"

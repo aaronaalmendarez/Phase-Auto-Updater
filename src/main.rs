@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod companion;
 mod detector;
+mod diagnostics;
 mod verification;
 mod video_reference;
 
@@ -26,7 +28,7 @@ use tray_icon::{
     Icon as TrayIconImage, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
-const APP_NAME: &str = "Phase Animator Installer";
+const APP_NAME: &str = "Phase Companion";
 const CURRENT_BUILD_ID: &str = "phase-2026-06-05-rustls-v0-19-8";
 const PHOSPHOR_FONT: &str = "phosphor-icons";
 const APP_WIDTH: f32 = 450.0;
@@ -40,6 +42,7 @@ const THEME_ROW_INNER_WIDTH: f32 = THEME_ROW_WIDTH - THEME_ROW_MARGIN * 2.0;
 const TRAY_PANEL_WIDTH: f32 = 302.0;
 const TRAY_PANEL_HEIGHT: f32 = 286.0;
 const TRAY_VIEWPORT_KEY: &str = "phase-tray-controls";
+const DIAGNOSTICS_VIEWPORT_KEY: &str = "phase-connection-diagnostics";
 const PARKED_WINDOW_POS: f32 = -32_000.0;
 const PARKED_WINDOW_SIZE: f32 = 1.0;
 #[cfg(target_os = "windows")]
@@ -151,6 +154,14 @@ struct ThemeBackgroundFetchResult {
     image: Result<ColorImage, String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct BoostDoctorFinding {
+    severity: String,
+    title: String,
+    detail: String,
+    module: String,
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThemeSelection {
@@ -253,6 +264,10 @@ struct PhaseInstallerApp {
     theme_fetch_rx: Option<Receiver<Result<Vec<verification::PhaseThemeAsset>, String>>>,
     theme_apply_rx: Option<Receiver<Result<ThemeSelection, String>>>,
     theme_error: Option<String>,
+    diagnostics_rx: Option<Receiver<diagnostics::DiagnosticReport>>,
+    diagnostics_report: Option<diagnostics::DiagnosticReport>,
+    diagnostics_open: bool,
+    diagnostics_started_at: Option<Instant>,
     selected_theme: Option<ThemeSelection>,
     theme_search: String,
     visible_theme_count: usize,
@@ -281,6 +296,15 @@ struct PhaseInstallerApp {
     video_bridge_listening: bool,
     video_bridge_connected: bool,
     video_bridge_status: String,
+    companion_bridge: companion::CompanionBridge,
+    companion_bridge_config: companion::CompanionConfig,
+    companion_bridge_listening: bool,
+    companion_bridge_connected: bool,
+    companion_bridge_status: String,
+    companion_snapshot_received_at: Option<Instant>,
+    companion_snapshot_finding_count: usize,
+    companion_snapshot_findings: Vec<BoostDoctorFinding>,
+    companion_snapshot_overview: String,
     video_source: String,
     video_title: String,
     video_duration_seconds: String,
@@ -333,6 +357,8 @@ impl PhaseInstallerApp {
         let video_bridge_config = video_reference::BridgeConfig::default_local();
         let video_bridge =
             video_reference::VideoReferenceBridge::start(video_bridge_config.clone());
+        let companion_bridge_config = companion::CompanionConfig::default_local();
+        let companion_bridge = companion::CompanionBridge::start(companion_bridge_config.clone());
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let (tray_tx, tray_rx) = mpsc::channel();
 
@@ -369,6 +395,10 @@ impl PhaseInstallerApp {
             theme_fetch_rx: None,
             theme_apply_rx: None,
             theme_error: None,
+            diagnostics_rx: None,
+            diagnostics_report: None,
+            diagnostics_open: false,
+            diagnostics_started_at: None,
             selected_theme: None,
             theme_search: String::new(),
             visible_theme_count: 6,
@@ -396,6 +426,15 @@ impl PhaseInstallerApp {
             video_bridge_listening: false,
             video_bridge_connected: false,
             video_bridge_status: "Starting video bridge.".to_owned(),
+            companion_bridge,
+            companion_bridge_config,
+            companion_bridge_listening: false,
+            companion_bridge_connected: false,
+            companion_bridge_status: "Starting companion acceleration bridge.".to_owned(),
+            companion_snapshot_received_at: None,
+            companion_snapshot_finding_count: 0,
+            companion_snapshot_findings: Vec::new(),
+            companion_snapshot_overview: "Waiting for Studio performance snapshot.".to_owned(),
             video_source: String::new(),
             video_title: String::new(),
             video_duration_seconds: String::new(),
@@ -435,6 +474,7 @@ impl PhaseInstallerApp {
         };
 
         app.load_cached_accounts(&cc.egui_ctx);
+        app.load_cached_companion_snapshot();
 
         app.log(
             phase::blue(),
@@ -480,11 +520,13 @@ impl PhaseInstallerApp {
         self.poll_app_update_install(ctx);
         self.poll_theme_fetch(ctx);
         self.poll_theme_apply(ctx);
+        self.poll_connection_diagnostics(ctx);
         self.poll_avatar_fetches(ctx);
         self.ensure_avatar_fetches(ctx);
         self.poll_theme_background_fetches(ctx);
         self.ensure_theme_background_fetch(ctx);
         self.poll_tray(ctx);
+        self.poll_companion_bridge(ctx);
         self.poll_video_bridge(ctx);
         self.tick_video_playback(ctx);
 
@@ -932,6 +974,48 @@ impl PhaseInstallerApp {
             Err(_) => {}
         }
         self.begin_update_stream(ctx);
+        ctx.request_repaint();
+    }
+
+    fn start_connection_diagnostics(&mut self, ctx: &Context) {
+        self.diagnostics_open = true;
+        if self.diagnostics_rx.is_some() {
+            return;
+        }
+
+        let selected_folder = self.selected_folder.clone();
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        self.diagnostics_rx = Some(rx);
+        self.diagnostics_started_at = Some(Instant::now());
+        self.log(phase::blue(), "Running connection diagnostics.");
+
+        std::thread::spawn(move || {
+            let report = diagnostics::run(CURRENT_BUILD_ID, selected_folder);
+            let _ = tx.send(report);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_connection_diagnostics(&mut self, ctx: &Context) {
+        let Some(report) = self
+            .diagnostics_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.diagnostics_rx = None;
+        self.diagnostics_started_at = None;
+        let status = report.overall_status();
+        let summary = report.summary.clone();
+        self.diagnostics_report = Some(report);
+        match status {
+            diagnostics::DiagnosticStatus::Good => self.log(phase::green(), summary),
+            diagnostics::DiagnosticStatus::Warning => self.log(phase::warning(), summary),
+            diagnostics::DiagnosticStatus::Problem => self.log(phase::red(), summary),
+        }
         ctx.request_repaint();
     }
 
@@ -1634,7 +1718,7 @@ impl PhaseInstallerApp {
                     format!("Installer update {} is available.", update.version),
                 );
                 show_system_notification(
-                    "Phase Auto Updater",
+                    "Phase Companion",
                     &format!("Installer update {} is available", update.version),
                 );
                 self.app_update = Some(update);
@@ -2059,6 +2143,111 @@ impl PhaseInstallerApp {
         }
     }
 
+    fn poll_companion_bridge(&mut self, ctx: &Context) {
+        for event in self.companion_bridge.poll() {
+            match event {
+                companion::CompanionEvent::Listening { url } => {
+                    self.companion_bridge_listening = true;
+                    self.companion_bridge_status =
+                        format!("Acceleration bridge listening on {url}");
+                    self.log(
+                        phase::green(),
+                        "Phase Companion acceleration bridge is listening.",
+                    );
+                }
+                companion::CompanionEvent::ClientConnected => {
+                    self.companion_bridge_connected = true;
+                    self.companion_bridge_status =
+                        "Studio connected to companion acceleration.".to_owned();
+                    self.log(
+                        phase::green(),
+                        "Studio connected to companion acceleration.",
+                    );
+                }
+                companion::CompanionEvent::ClientDisconnected => {
+                    self.companion_bridge_connected = false;
+                    self.companion_bridge_status =
+                        "Studio disconnected from companion acceleration.".to_owned();
+                    self.log(
+                        phase::warning(),
+                        "Studio disconnected from companion acceleration.",
+                    );
+                }
+                companion::CompanionEvent::PacketReceived(packet) => {
+                    if packet.op == "perf.snapshot" {
+                        self.handle_companion_perf_snapshot(&packet.payload);
+                    } else {
+                        self.companion_bridge_status =
+                            format!("Received {} from Studio.", packet.op);
+                    }
+                    if packet.op == "hello" || packet.op == "status.get" {
+                        self.log(phase::blue(), "Studio requested companion capabilities.");
+                    }
+                }
+                companion::CompanionEvent::PacketSent { op } => {
+                    self.companion_bridge_status = format!("Sent {op} to Studio.");
+                }
+                companion::CompanionEvent::SendFailed { op, message } => {
+                    self.companion_bridge_status = format!("{op} failed: {message}");
+                    self.log(phase::warning(), self.companion_bridge_status.clone());
+                }
+                companion::CompanionEvent::Error(error) => {
+                    self.companion_bridge_status = error.clone();
+                    self.log(phase::red(), error);
+                }
+                companion::CompanionEvent::Stopped => {
+                    self.companion_bridge_listening = false;
+                    self.companion_bridge_connected = false;
+                    self.companion_bridge_status =
+                        "Companion acceleration bridge stopped.".to_owned();
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn load_cached_companion_snapshot(&mut self) {
+        let path = companion_snapshot_cache_path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        self.apply_companion_perf_snapshot(&payload, false);
+        self.companion_bridge_status = format!(
+            "Loaded cached Boost Doctor snapshot from {}.",
+            compact_path(&path, 34)
+        );
+    }
+
+    fn handle_companion_perf_snapshot(&mut self, payload: &serde_json::Value) {
+        self.apply_companion_perf_snapshot(payload, true);
+        self.log(
+            phase::blue(),
+            format!(
+                "Boost Doctor snapshot: {} finding(s).",
+                self.companion_snapshot_finding_count
+            ),
+        );
+    }
+
+    fn apply_companion_perf_snapshot(&mut self, payload: &serde_json::Value, fresh: bool) {
+        let findings = parse_boost_doctor_findings(payload);
+        self.companion_snapshot_finding_count = findings.len();
+        self.companion_snapshot_findings = findings;
+        self.companion_snapshot_overview = format_boost_doctor_overview(payload);
+        if fresh {
+            self.companion_snapshot_received_at = Some(Instant::now());
+            self.companion_bridge_status = format!(
+                "Boost Doctor received {} finding(s) from Studio.",
+                self.companion_snapshot_finding_count
+            );
+        } else {
+            self.companion_snapshot_received_at = None;
+        }
+    }
+
     fn handle_video_packet(&mut self, packet: video_reference::VideoPacket) {
         let payload = video_reference::packet_payload(&packet);
         match packet.op.as_str() {
@@ -2378,10 +2567,15 @@ fn run_install_worker(
 
 fn download_and_launch_app_update(update: verification::AppUpdateInfo) -> Result<PathBuf, String> {
     let mut path = std::env::temp_dir();
-    path.push(format!(
-        "PhaseAutoUpdater-{}.msi",
-        safe_file_fragment(&update.version)
-    ));
+    let file_name = if update.asset_name.trim().is_empty() {
+        format!(
+            "PhaseAutoUpdater-{}.msi",
+            safe_file_fragment(&update.version)
+        )
+    } else {
+        safe_file_fragment(&update.asset_name)
+    };
+    path.push(file_name);
     verification::download_url_to_file(&update.download_url, &path)?;
 
     Command::new("msiexec")
@@ -2788,10 +2982,12 @@ impl eframe::App for PhaseInstallerApp {
         if !self.hidden_to_tray {
             self.draw_close_dialog(ctx);
             self.show_tray_popup_viewport(ctx);
+            self.show_diagnostics_viewport(ctx);
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.companion_bridge.stop();
         self.video_bridge.stop();
         self.cleanup_tray();
     }
@@ -2802,6 +2998,166 @@ impl eframe::App for PhaseInstallerApp {
 }
 
 impl PhaseInstallerApp {
+    fn show_diagnostics_viewport(&mut self, ctx: &Context) {
+        if !self.diagnostics_open {
+            return;
+        }
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Phase Connection Diagnostics")
+            .with_inner_size(Vec2::new(520.0, 540.0))
+            .with_min_inner_size(Vec2::new(420.0, 420.0))
+            .with_transparent(false)
+            .with_resizable(true)
+            .with_taskbar(true)
+            .with_visible(true);
+
+        ctx.show_viewport_immediate(diagnostics_viewport_id(), builder, |diag_ctx, _class| {
+            if diag_ctx.input(|input| input.viewport().close_requested()) {
+                self.diagnostics_open = false;
+                return;
+            }
+
+            if diag_ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.diagnostics_open = false;
+                return;
+            }
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(phase::background()))
+                .show(diag_ctx, |ui| {
+                    self.diagnostics_panel(ui);
+                });
+        });
+    }
+
+    fn diagnostics_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(14.0);
+        ui.vertical_centered(|ui| {
+            ui.set_width((ui.available_width() - 28.0).clamp(360.0, 472.0));
+            ui.horizontal(|ui| {
+                if let Some(logo) = &self.logo {
+                    let image = egui::Image::new(logo).fit_to_exact_size(Vec2::splat(38.0));
+                    ui.add(image);
+                }
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Connection Diagnostics")
+                            .font(FontId::proportional(18.0))
+                            .strong()
+                            .color(phase::text()),
+                    );
+                    ui.label(
+                        RichText::new("Checks Phase servers and local install access.")
+                            .font(FontId::proportional(11.5))
+                            .color(phase::text_secondary()),
+                    );
+                });
+            });
+
+            ui.add_space(14.0);
+            let running = self.diagnostics_rx.is_some();
+            let status = self
+                .diagnostics_report
+                .as_ref()
+                .map(diagnostics::DiagnosticReport::overall_status);
+            let summary = if running {
+                self.diagnostics_started_at
+                    .map(|started| format!("Checking... {}s", started.elapsed().as_secs()))
+                    .unwrap_or_else(|| "Checking...".to_owned())
+            } else {
+                self.diagnostics_report
+                    .as_ref()
+                    .map(|report| report.summary.clone())
+                    .unwrap_or_else(|| "Run a check to see what is blocking connection.".to_owned())
+            };
+            let summary_color = match status {
+                Some(diagnostics::DiagnosticStatus::Good) => phase::green(),
+                Some(diagnostics::DiagnosticStatus::Warning) => phase::warning(),
+                Some(diagnostics::DiagnosticStatus::Problem) => phase::red(),
+                None => phase::blue(),
+            };
+
+            egui::Frame::none()
+                .fill(phase::surface())
+                .stroke(Stroke::new(1.0, phase::line()))
+                .rounding(Rounding::same(10.0))
+                .inner_margin(Margin::symmetric(14.0, 12.0))
+                .show(ui, |ui| {
+                    let width = (ui.available_width() - 8.0).max(300.0);
+                    ui.set_width(width);
+                    ui.horizontal(|ui| {
+                        status_pill(
+                            ui,
+                            status
+                                .map(diagnostics::DiagnosticStatus::label)
+                                .unwrap_or("Ready"),
+                            summary_color,
+                        );
+                        ui.add_space(8.0);
+                        scrolling_label(
+                            ui,
+                            &summary,
+                            width - 92.0,
+                            FontId::proportional(13.0),
+                            phase::text_secondary(),
+                        );
+                    });
+                });
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 18.0) / 3.0;
+                ui.add_enabled_ui(!running, |ui| {
+                    let label = if running { "Checking" } else { "Run Check" };
+                    if primary_button(ui, MiniIcon::Search, label, Vec2::new(width, 34.0)).clicked()
+                    {
+                        self.start_connection_diagnostics(ui.ctx());
+                    }
+                });
+                if secondary_button(ui, MiniIcon::Refresh, "Retry", Vec2::new(width, 34.0))
+                    .clicked()
+                {
+                    self.start_connection_diagnostics(ui.ctx());
+                }
+                ui.add_enabled_ui(self.diagnostics_report.is_some(), |ui| {
+                    let copy_label =
+                        if matches!(status, Some(diagnostics::DiagnosticStatus::Problem)) {
+                            "Copy Error"
+                        } else {
+                            "Copy Report"
+                        };
+                    if secondary_button(ui, MiniIcon::External, copy_label, Vec2::new(width, 34.0))
+                        .clicked()
+                    {
+                        if let Some(report) = &self.diagnostics_report {
+                            ui.output_mut(|output| output.copied_text = report.to_plain_text());
+                            self.log(phase::blue(), "Copied diagnostic report.");
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            egui::ScrollArea::vertical()
+                .id_source("phase-diagnostics-report")
+                .max_height((ui.available_height() - 12.0).max(180.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if running && self.diagnostics_report.is_none() {
+                        diagnostics_waiting_card(ui);
+                    }
+                    if let Some(report) = &self.diagnostics_report {
+                        for check in &report.checks {
+                            diagnostics_check_card(ui, check);
+                            ui.add_space(8.0);
+                        }
+                    }
+                });
+        });
+    }
+
     fn show_tray_popup_viewport(&mut self, ctx: &Context) {
         if !self.tray_panel_open {
             return;
@@ -3804,6 +4160,120 @@ impl PhaseInstallerApp {
         });
     }
 
+    fn boost_doctor_block(&self, ui: &mut Ui) {
+        egui::Frame::none()
+            .fill(Color32::from_rgb(13, 10, 22))
+            .stroke(Stroke::new(1.0, phase::accent_dim()))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(10.0, 9.0))
+            .show(ui, |ui| {
+                ui.set_width(CARD_INNER_WIDTH - 36.0);
+                ui.horizontal(|ui| {
+                    draw_icon(ui, MiniIcon::Search, Vec2::splat(24.0), phase::accent());
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Boost Doctor")
+                                .font(FontId::proportional(13.0))
+                                .strong()
+                                .color(phase::text()),
+                        );
+                        scrolling_label(
+                            ui,
+                            &self.companion_snapshot_overview,
+                            CARD_INNER_WIDTH - 168.0,
+                            FontId::proportional(11.0),
+                            phase::text_muted(),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (text, color) = if self.companion_snapshot_findings.is_empty() {
+                            ("Waiting", phase::text_muted())
+                        } else if self
+                            .companion_snapshot_findings
+                            .iter()
+                            .any(|finding| finding.severity == "high")
+                        {
+                            ("High", phase::red())
+                        } else {
+                            ("Ready", phase::green())
+                        };
+                        status_pill(ui, text, color);
+                    });
+                });
+
+                ui.add_space(8.0);
+                if self.companion_snapshot_findings.is_empty() {
+                    ui.label(
+                        RichText::new("Enable Companion Boost in Studio, then open or edit a Phase file. The next snapshot will rank which systems are worth accelerating first.")
+                            .font(FontId::proportional(11.0))
+                            .color(phase::text_secondary()),
+                    );
+                    return;
+                }
+
+                for finding in self.companion_snapshot_findings.iter().take(3) {
+                    ui.add_space(5.0);
+                    egui::Frame::none()
+                        .fill(phase::surface())
+                        .stroke(Stroke::new(1.0, boost_severity_color(&finding.severity)))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::symmetric(8.0, 7.0))
+                        .show(ui, |ui| {
+                            ui.set_width(CARD_INNER_WIDTH - 58.0);
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.add_sized(
+                                        Vec2::new(CARD_INNER_WIDTH - 158.0, 18.0),
+                                        egui::Label::new(
+                                            RichText::new(&finding.title)
+                                                .font(FontId::proportional(11.5))
+                                                .strong()
+                                                .color(phase::text()),
+                                        )
+                                        .wrap(false),
+                                    );
+                                    let detail = if finding.module.is_empty() {
+                                        finding.detail.clone()
+                                    } else {
+                                        format!("{} - {}", finding.module, finding.detail)
+                                    };
+                                    scrolling_label(
+                                        ui,
+                                        &detail,
+                                        CARD_INNER_WIDTH - 158.0,
+                                        FontId::proportional(10.5),
+                                        phase::text_muted(),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        status_pill(
+                                            ui,
+                                            boost_severity_label(&finding.severity),
+                                            boost_severity_color(&finding.severity),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+                }
+
+                if self.companion_snapshot_finding_count > 3 {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "+{} more findings in the cached snapshot.",
+                            self.companion_snapshot_finding_count - 3
+                        ))
+                        .font(FontId::proportional(10.5))
+                        .color(phase::text_muted()),
+                    );
+                }
+            });
+    }
+
     fn video_tab(&mut self, ui: &mut Ui) {
         draw_panel(ui, |ui| {
             section_label(ui, "Video Reference");
@@ -3855,6 +4325,53 @@ impl PhaseInstallerApp {
                             status_pill(ui, bridge_label, bridge_color);
                         });
                     });
+
+                    ui.add_space(12.0);
+                    let (companion_label, companion_color) = if self.companion_bridge_connected {
+                        ("Boost linked", phase::green())
+                    } else if self.companion_bridge_listening {
+                        ("Boost ready", phase::accent())
+                    } else {
+                        ("Boost offline", phase::warning())
+                    };
+                    ui.horizontal(|ui| {
+                        draw_icon(ui, MiniIcon::Bolt, Vec2::splat(30.0), companion_color);
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            ui.add_sized(
+                                Vec2::new(CARD_INNER_WIDTH - 205.0, 20.0),
+                                egui::Label::new(
+                                    RichText::new("Companion Boost")
+                                        .font(FontId::proportional(14.0))
+                                        .strong()
+                                        .color(phase::text()),
+                                )
+                                .wrap(false),
+                            );
+                            scrolling_label(
+                                ui,
+                                &self.companion_bridge_status,
+                                CARD_INNER_WIDTH - 184.0,
+                                FontId::proportional(11.0),
+                                phase::text_muted(),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            status_pill(ui, companion_label, companion_color);
+                        });
+                    });
+
+                    ui.add_space(6.0);
+                    scrolling_label(
+                        ui,
+                        &self.companion_bridge_config.url(),
+                        CARD_INNER_WIDTH - 24.0,
+                        FontId::monospace(11.0),
+                        phase::text_muted(),
+                    );
+
+                    ui.add_space(10.0);
+                    self.boost_doctor_block(ui);
 
                     ui.add_space(12.0);
                     ui.label(
@@ -4450,6 +4967,86 @@ impl PhaseInstallerApp {
 
                 ui.add_space(16.0);
 
+                section_label(ui, "Connection Diagnostics");
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(phase::input())
+                    .stroke(Stroke::new(1.0, phase::line()))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(14.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(CARD_INNER_WIDTH - 16.0);
+                        let status = self
+                            .diagnostics_report
+                            .as_ref()
+                            .map(diagnostics::DiagnosticReport::overall_status);
+                        let status_text = if self.diagnostics_rx.is_some() {
+                            "Checking"
+                        } else {
+                            status
+                                .map(diagnostics::DiagnosticStatus::label)
+                                .unwrap_or("Ready")
+                        };
+                        let status_color = match status {
+                            Some(diagnostics::DiagnosticStatus::Good) => phase::green(),
+                            Some(diagnostics::DiagnosticStatus::Warning) => phase::warning(),
+                            Some(diagnostics::DiagnosticStatus::Problem) => phase::red(),
+                            None => phase::blue(),
+                        };
+                        ui.horizontal(|ui| {
+                            draw_icon(ui, MiniIcon::Search, Vec2::splat(16.0), status_color);
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("Phase server and install checks")
+                                        .font(FontId::proportional(12.5))
+                                        .color(phase::text_secondary()),
+                                );
+                                scrolling_label(
+                                    ui,
+                                    self.diagnostics_report
+                                        .as_ref()
+                                        .map(|report| report.summary.as_str())
+                                        .unwrap_or("Open a simple connection check window."),
+                                    CARD_INNER_WIDTH - 148.0,
+                                    FontId::proportional(11.0),
+                                    phase::text_muted(),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    status_pill(ui, status_text, status_color);
+                                },
+                            );
+                        });
+                    });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let btn_width = (CARD_INNER_WIDTH - 8.0) / 2.0;
+                    let running = self.diagnostics_rx.is_some();
+                    ui.add_enabled_ui(!running, |ui| {
+                        if secondary_button(
+                            ui,
+                            MiniIcon::Search,
+                            if running { "Checking" } else { "Diagnose" },
+                            Vec2::new(btn_width, 36.0),
+                        )
+                        .clicked()
+                        {
+                            self.start_connection_diagnostics(ui.ctx());
+                        }
+                    });
+                    if secondary_button(ui, MiniIcon::External, "Open", Vec2::new(btn_width, 36.0))
+                        .clicked()
+                    {
+                        self.diagnostics_open = true;
+                    }
+                });
+
+                ui.add_space(16.0);
+
                 section_label(ui, "About");
                 ui.add_space(6.0);
                 egui::Frame::none()
@@ -4828,6 +5425,10 @@ fn load_tray_icon() -> Option<TrayIconImage> {
 
 fn tray_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of(TRAY_VIEWPORT_KEY)
+}
+
+fn diagnostics_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(DIAGNOSTICS_VIEWPORT_KEY)
 }
 
 #[cfg(target_os = "windows")]
@@ -5499,6 +6100,102 @@ fn status_pill(ui: &mut Ui, text: &str, color: Color32) {
         });
 }
 
+fn diagnostics_waiting_card(ui: &mut Ui) {
+    egui::Frame::none()
+        .fill(phase::surface())
+        .stroke(Stroke::new(1.0, phase::line()))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            ui.set_width((ui.available_width() - 8.0).max(300.0));
+            ui.horizontal(|ui| {
+                draw_icon(ui, MiniIcon::Refresh, Vec2::splat(18.0), phase::blue());
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Checking connection")
+                            .font(FontId::proportional(13.5))
+                            .strong()
+                            .color(phase::text()),
+                    );
+                    ui.label(
+                        RichText::new("This should only take a few seconds.")
+                            .font(FontId::proportional(11.0))
+                            .color(phase::text_muted()),
+                    );
+                });
+            });
+        });
+}
+
+fn diagnostics_check_card(ui: &mut Ui, check: &diagnostics::DiagnosticCheck) {
+    let color = match check.status {
+        diagnostics::DiagnosticStatus::Good => phase::green(),
+        diagnostics::DiagnosticStatus::Warning => phase::warning(),
+        diagnostics::DiagnosticStatus::Problem => phase::red(),
+    };
+    let icon = match check.status {
+        diagnostics::DiagnosticStatus::Good => MiniIcon::Check,
+        diagnostics::DiagnosticStatus::Warning | diagnostics::DiagnosticStatus::Problem => {
+            MiniIcon::Gear
+        }
+    };
+
+    egui::Frame::none()
+        .fill(phase::surface())
+        .stroke(Stroke::new(1.0, phase::line()))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            let width = (ui.available_width() - 8.0).max(300.0);
+            ui.set_width(width);
+            ui.horizontal(|ui| {
+                draw_icon(ui, icon, Vec2::splat(20.0), color);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        status_pill(ui, check.status.label(), color);
+                        ui.add_space(6.0);
+                        let elapsed = check
+                            .elapsed_ms
+                            .map(|value| format!("{value} ms"))
+                            .unwrap_or_default();
+                        scrolling_label(
+                            ui,
+                            &elapsed,
+                            80.0,
+                            FontId::proportional(10.5),
+                            phase::text_muted(),
+                        );
+                    });
+                    ui.add_space(3.0);
+                    scrolling_label(
+                        ui,
+                        &check.title,
+                        width - 42.0,
+                        FontId::proportional(14.0),
+                        phase::text(),
+                    );
+                    ui.add_space(3.0);
+                    ui.label(
+                        RichText::new(&check.detail)
+                            .font(FontId::proportional(11.5))
+                            .color(phase::text_secondary()),
+                    );
+                    if !check.next_step.trim().is_empty() && check.next_step != "No action needed."
+                    {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!("Try: {}", check.next_step))
+                                .font(FontId::proportional(11.0))
+                                .color(color),
+                        );
+                    }
+                });
+            });
+        });
+}
+
 fn small_number_field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
     ui.vertical(|ui| {
         ui.label(
@@ -5546,6 +6243,109 @@ fn reference_summary(value: &serde_json::Value) -> Option<String> {
         return Some("No video reference linked.".to_owned());
     }
     Some(format!("{title}: {source}"))
+}
+
+fn companion_snapshot_cache_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("PhaseCompanion")
+        .join("latest-perf-snapshot.json")
+}
+
+fn json_child<'a>(
+    value: &'a serde_json::Value,
+    upper: &str,
+    lower: &str,
+) -> Option<&'a serde_json::Value> {
+    value.get(upper).or_else(|| value.get(lower))
+}
+
+fn json_str(value: &serde_json::Value, upper: &str, lower: &str) -> String {
+    json_child(value, upper, lower)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned()
+}
+
+fn json_u64(value: &serde_json::Value, upper: &str, lower: &str) -> u64 {
+    json_child(value, upper, lower)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+}
+
+fn parse_boost_doctor_findings(payload: &serde_json::Value) -> Vec<BoostDoctorFinding> {
+    let Some(items) =
+        json_child(payload, "Findings", "findings").and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut findings = items
+        .iter()
+        .filter_map(|item| {
+            let title = json_str(item, "Title", "title");
+            if title.is_empty() {
+                return None;
+            }
+            Some(BoostDoctorFinding {
+                severity: json_str(item, "Severity", "severity"),
+                title,
+                detail: json_str(item, "Detail", "detail"),
+                module: json_str(item, "Module", "module"),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    findings.sort_by_key(|finding| match finding.severity.as_str() {
+        "high" => 0,
+        "medium" => 1,
+        "low" => 2,
+        "info" => 3,
+        _ => 4,
+    });
+    findings
+}
+
+fn format_boost_doctor_overview(payload: &serde_json::Value) -> String {
+    let overview = json_child(payload, "Stats", "stats")
+        .and_then(|stats| json_child(stats, "Overview", "overview"));
+    let Some(overview) = overview else {
+        return "No document overview was included in this snapshot.".to_owned();
+    };
+
+    let tracks = json_u64(overview, "TrackCount", "trackCount");
+    let keys = json_u64(overview, "KeyCount", "keyCount");
+    let ik_tracks = json_u64(overview, "IKControlTrackCount", "ikControlTrackCount");
+    let duration = json_u64(overview, "DurationFrames", "durationFrames");
+    let fps = json_u64(overview, "FPS", "fps");
+
+    if tracks == 0 && keys == 0 && duration == 0 {
+        "No active animation document in the latest snapshot.".to_owned()
+    } else {
+        format!(
+            "{tracks} tracks, {keys} keys, {ik_tracks} IK tracks, {duration} frames at {fps} FPS"
+        )
+    }
+}
+
+fn boost_severity_label(severity: &str) -> &'static str {
+    match severity {
+        "high" => "High",
+        "medium" => "Med",
+        "low" => "Low",
+        "info" => "Info",
+        _ => "Note",
+    }
+}
+
+fn boost_severity_color(severity: &str) -> Color32 {
+    match severity {
+        "high" => phase::red(),
+        "medium" => phase::warning(),
+        "low" => phase::blue(),
+        "info" => phase::green(),
+        _ => phase::text_muted(),
+    }
 }
 
 fn phase_text(phase: InstallPhase) -> &'static str {

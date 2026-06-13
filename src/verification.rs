@@ -313,10 +313,28 @@ pub fn fetch_latest_app_update(current_version: &str) -> Result<Option<AppUpdate
         return Ok(None);
     }
 
-    let Some(asset) = release.assets.into_iter().find(|asset| {
-        let name = asset.name.to_ascii_lowercase();
-        name.ends_with(".msi") && name.contains("phaseautoupdater")
-    }) else {
+    let assets = release.assets;
+    let arch = current_windows_arch();
+    let preferred_suffix = format!("-{arch}.msi");
+    let asset = assets
+        .iter()
+        .find(|asset| {
+            let name = asset.name.to_ascii_lowercase();
+            name.ends_with(&preferred_suffix) && name.contains("phaseautoupdater")
+        })
+        .or_else(|| {
+            assets.iter().find(|asset| {
+                let name = asset.name.to_ascii_lowercase();
+                name.ends_with(".msi")
+                    && name.contains("phaseautoupdater")
+                    && !name.ends_with("-x64.msi")
+                    && !name.ends_with("-x86.msi")
+                    && !name.ends_with("-arm64.msi")
+            })
+        })
+        .cloned();
+
+    let Some(asset) = asset else {
         return Ok(None);
     };
 
@@ -484,6 +502,16 @@ fn http_agent() -> Result<ureq::Agent, String> {
     // rustls avoids Windows SChannel-specific failures such as
     // SEC_E_INVALID_TOKEN while keeping certificate validation enabled.
     Ok(ureq::AgentBuilder::new().build())
+}
+
+fn current_windows_arch() -> &'static str {
+    if cfg!(target_arch = "x86") {
+        "x86"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

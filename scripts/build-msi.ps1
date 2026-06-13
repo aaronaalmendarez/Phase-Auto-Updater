@@ -1,10 +1,36 @@
+param(
+    [ValidateSet("x64", "x86", "arm64")]
+    [string] $Arch = "x64"
+)
+
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-& (Join-Path $PSScriptRoot "build-windows.ps1")
+function Get-RustTarget {
+    param([string] $Arch)
+    switch ($Arch) {
+        "x64" { "x86_64-pc-windows-msvc" }
+        "x86" { "i686-pc-windows-msvc" }
+        "arm64" { "aarch64-pc-windows-msvc" }
+        default { throw "Unsupported Windows architecture: $Arch" }
+    }
+}
+
+function Test-CanRunBuiltExe {
+    param([string] $Arch)
+
+    $ProcessArch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+    if ($Arch -eq "arm64" -and $ProcessArch -ne "Arm64") {
+        return $false
+    }
+
+    $true
+}
+
+& (Join-Path $PSScriptRoot "build-windows.ps1") -Arch $Arch
 
 $ToolDir = Join-Path $Root ".tools\wix"
 $WixExe = Join-Path $ToolDir "wix.exe"
@@ -29,10 +55,12 @@ if ($CargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
 }
 $PackageVersion = $Matches[1]
 
-$DistDir = Join-Path $Root "dist\windows"
+$DistRoot = Join-Path $Root "dist\windows"
+$DistDir = Join-Path $DistRoot $Arch
 $WxsPath = Join-Path $Root "installer\windows\PhaseAutoUpdater.wxs"
-$MsiPath = Join-Path $DistDir "PhaseAutoUpdater-$PackageVersion.msi"
-$SetupPath = Join-Path $DistDir "PhaseAnimatorSetup.exe"
+$MsiPath = Join-Path $DistDir "PhaseAutoUpdater-$PackageVersion-$Arch.msi"
+$SetupPath = Join-Path $DistDir "PhaseAnimatorSetup-$Arch.exe"
+$Target = Get-RustTarget $Arch
 
 function New-InstallerBitmap {
     param(
@@ -111,7 +139,7 @@ New-InstallerBitmap `
 
 & $WixExe build $WxsPath `
     -ext WixToolset.UI.wixext `
-    -arch x64 `
+    -arch $Arch `
     -d "SourceDir=$DistDir" `
     -d "InstallerDir=$(Join-Path $Root "installer\windows")" `
     -d "PackageVersion=$PackageVersion" `
@@ -122,12 +150,21 @@ if (!(Test-Path $MsiPath)) {
 }
 
 $env:PHASE_MSI_PATH = $MsiPath
-cargo build --release --bin phase-setup --features embed-msi
-& (Join-Path $Root "target\release\phase-setup.exe") --smoke-test
-Copy-Item -Force (Join-Path $Root "target\release\phase-setup.exe") $SetupPath
+cargo build --release --target $Target --bin phase-setup --features embed-msi
+if (Test-CanRunBuiltExe $Arch) {
+    & (Join-Path $Root "target\$Target\release\phase-setup.exe") --smoke-test
+} else {
+    Write-Warning "Skipping $Arch phase-setup smoke test because this machine cannot run $Arch Windows executables."
+}
+Copy-Item -Force (Join-Path $Root "target\$Target\release\phase-setup.exe") $SetupPath
 
 if (!(Test-Path $SetupPath)) {
     throw "Setup executable was not created"
+}
+
+if ($Arch -eq "x64") {
+    Copy-Item -Force $MsiPath (Join-Path $DistRoot "PhaseAutoUpdater-$PackageVersion.msi")
+    Copy-Item -Force $SetupPath (Join-Path $DistRoot "PhaseAnimatorSetup.exe")
 }
 
 Write-Host "Built $MsiPath"
