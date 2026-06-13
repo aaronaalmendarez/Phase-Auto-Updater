@@ -13,6 +13,7 @@ use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 use detector::{
@@ -291,6 +292,11 @@ struct PhaseInstallerApp {
     activation_error: Option<String>,
     backup_before_install: bool,
     restart_studio_hint: bool,
+    plugin_settings_reset_themes: bool,
+    plugin_settings_reset_keybinds: bool,
+    plugin_settings_inventory: PluginSettingsInventory,
+    plugin_data_reset_confirm: bool,
+    plugin_data_reset_status: Option<String>,
     video_bridge: video_reference::VideoReferenceBridge,
     video_bridge_config: video_reference::BridgeConfig,
     video_bridge_listening: bool,
@@ -421,6 +427,11 @@ impl PhaseInstallerApp {
             activation_error: None,
             backup_before_install: true,
             restart_studio_hint: true,
+            plugin_settings_reset_themes: true,
+            plugin_settings_reset_keybinds: true,
+            plugin_settings_inventory: phase_plugin_settings_inventory(),
+            plugin_data_reset_confirm: false,
+            plugin_data_reset_status: None,
             video_bridge,
             video_bridge_config,
             video_bridge_listening: false,
@@ -1896,6 +1907,50 @@ impl PhaseInstallerApp {
         self.theme_background_key = None;
         self.save_account_cache();
         self.log(phase::green(), "Restored default Phase theme.");
+    }
+
+    fn reset_phase_plugin_data(&mut self) {
+        let categories = self.selected_plugin_settings_categories();
+        if categories.is_empty() {
+            self.plugin_data_reset_status =
+                Some("Choose at least one settings category.".to_owned());
+            return;
+        }
+
+        match reset_phase_plugin_settings(&categories) {
+            Ok(summary) => {
+                self.plugin_data_reset_confirm = false;
+                let message = if summary.removed_keys == 0 {
+                    "No matching Phase Animator plugin settings were found.".to_owned()
+                } else {
+                    format!(
+                        "Backed up and deleted {} Phase setting{} across {} Roblox settings file{}.",
+                        summary.removed_keys,
+                        plural(summary.removed_keys),
+                        summary.files_changed,
+                        plural(summary.files_changed)
+                    )
+                };
+                self.plugin_data_reset_status = Some(message.clone());
+                self.log(phase::green(), message);
+                self.plugin_settings_inventory = phase_plugin_settings_inventory();
+            }
+            Err(error) => {
+                self.plugin_data_reset_status = Some(error.clone());
+                self.log(phase::red(), error);
+            }
+        }
+    }
+
+    fn selected_plugin_settings_categories(&self) -> Vec<PluginSettingsCategory> {
+        let mut categories = Vec::new();
+        if self.plugin_settings_reset_themes {
+            categories.push(PluginSettingsCategory::Themes);
+        }
+        if self.plugin_settings_reset_keybinds {
+            categories.push(PluginSettingsCategory::Keybinds);
+        }
+        categories
     }
 
     fn disconnect_roblox_account(&mut self) {
@@ -4897,6 +4952,139 @@ impl PhaseInstallerApp {
 
                 ui.add_space(16.0);
 
+                section_label(ui, "Plugin Recovery");
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(phase::input())
+                    .stroke(Stroke::new(1.0, phase::line()))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(14.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(CARD_INNER_WIDTH - 16.0);
+                        ui.label(
+                            RichText::new("Reset Roblox plugin data")
+                                .font(FontId::proportional(14.0))
+                                .strong()
+                                .color(phase::text()),
+                        );
+                        ui.add_space(4.0);
+                        scrolling_label(
+                            ui,
+                            "Scans Roblox Studio plugin settings, backs up selected Phase data, then deletes only those keys. Close Studio first.",
+                            CARD_INNER_WIDTH - 16.0,
+                            FontId::proportional(11.0),
+                            phase::text_muted(),
+                        );
+                        ui.add_space(10.0);
+
+                        info_row_width(
+                            ui,
+                            "Files",
+                            &self.plugin_settings_inventory.files_with_phase_keys.to_string(),
+                            CARD_INNER_WIDTH - 16.0,
+                        );
+                        ui.add_space(4.0);
+                        info_row_width(
+                            ui,
+                            "Themes",
+                            &self.plugin_settings_inventory.theme_keys.to_string(),
+                            CARD_INNER_WIDTH - 16.0,
+                        );
+                        ui.add_space(4.0);
+                        info_row_width(
+                            ui,
+                            "Keybinds",
+                            &self.plugin_settings_inventory.keybind_keys.to_string(),
+                            CARD_INNER_WIDTH - 16.0,
+                        );
+                        ui.add_space(10.0);
+
+                        ui.checkbox(
+                            &mut self.plugin_settings_reset_themes,
+                            RichText::new("Themes")
+                                .font(FontId::proportional(13.0))
+                                .color(phase::text_secondary()),
+                        );
+                        ui.add_space(6.0);
+                        ui.checkbox(
+                            &mut self.plugin_settings_reset_keybinds,
+                            RichText::new("Keybinds")
+                                .font(FontId::proportional(13.0))
+                                .color(phase::text_secondary()),
+                        );
+                        ui.add_space(10.0);
+
+                        if secondary_button(
+                            ui,
+                            MiniIcon::Refresh,
+                            "Scan Settings",
+                            Vec2::new(CARD_INNER_WIDTH - 16.0, 34.0),
+                        )
+                        .clicked()
+                        {
+                            self.plugin_settings_inventory = phase_plugin_settings_inventory();
+                            self.plugin_data_reset_status =
+                                Some("Refreshed Roblox plugin settings scan.".to_owned());
+                        }
+                        ui.add_space(8.0);
+
+                        if self.plugin_data_reset_confirm {
+                            scrolling_label(
+                                ui,
+                                "Are you sure? Selected settings will be backed up, then removed from Roblox Studio plugin storage.",
+                                CARD_INNER_WIDTH - 16.0,
+                                FontId::proportional(11.0),
+                                phase::warning(),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let btn_width = (CARD_INNER_WIDTH - 24.0) / 2.0;
+                                if secondary_button(
+                                    ui,
+                                    MiniIcon::Check,
+                                    "Backup + Delete",
+                                    Vec2::new(btn_width, 34.0),
+                                )
+                                .clicked()
+                                {
+                                    self.reset_phase_plugin_data();
+                                }
+                                if secondary_button(
+                                    ui,
+                                    MiniIcon::External,
+                                    "Cancel",
+                                    Vec2::new(btn_width, 34.0),
+                                )
+                                .clicked()
+                                {
+                                    self.plugin_data_reset_confirm = false;
+                                }
+                            });
+                        } else if secondary_button(
+                            ui,
+                            MiniIcon::Refresh,
+                            "Backup + Delete Selected",
+                            Vec2::new(CARD_INNER_WIDTH - 16.0, 36.0),
+                        )
+                        .clicked()
+                        {
+                            self.plugin_data_reset_confirm = true;
+                        }
+
+                        if let Some(status) = &self.plugin_data_reset_status {
+                            ui.add_space(8.0);
+                            scrolling_label(
+                                ui,
+                                status,
+                                CARD_INNER_WIDTH - 16.0,
+                                FontId::proportional(11.0),
+                                phase::text_secondary(),
+                            );
+                        }
+                    });
+
+                ui.add_space(16.0);
+
                 section_label(ui, "App Updates");
                 ui.add_space(6.0);
                 egui::Frame::none()
@@ -6443,6 +6631,260 @@ fn save_account_cache(cache: &AccountCache) {
     if let Ok(text) = serde_json::to_string_pretty(cache) {
         let _ = std::fs::write(path, text);
     }
+}
+
+#[derive(Default)]
+struct PluginSettingsResetSummary {
+    files_changed: usize,
+    removed_keys: usize,
+}
+
+#[derive(Default)]
+struct PluginSettingsInventory {
+    files_with_phase_keys: usize,
+    theme_keys: usize,
+    keybind_keys: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginSettingsCategory {
+    Themes,
+    Keybinds,
+}
+
+fn reset_phase_plugin_settings(
+    categories: &[PluginSettingsCategory],
+) -> Result<PluginSettingsResetSummary, String> {
+    let paths = discover_roblox_plugin_settings_files();
+    let mut summary = PluginSettingsResetSummary::default();
+
+    for path in paths {
+        let text = std::fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "Could not read Roblox plugin settings at {}: {error}",
+                compact_path(&path, 44)
+            )
+        })?;
+        let mut value = serde_json::from_str::<serde_json::Value>(&text).map_err(|error| {
+            format!(
+                "Could not parse Roblox plugin settings at {}: {error}",
+                compact_path(&path, 44)
+            )
+        })?;
+
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+
+        let keys = object
+            .keys()
+            .filter(|key| phase_setting_matches_any_category(key, categories))
+            .cloned()
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            continue;
+        }
+
+        let mut selected = serde_json::Map::new();
+        for key in &keys {
+            if let Some(value) = object.get(key) {
+                selected.insert(key.clone(), value.clone());
+            }
+        }
+
+        backup_roblox_settings_file(&path, &text, &selected)?;
+        let removed = keys.len();
+        for key in keys {
+            object.remove(&key);
+        }
+
+        let updated = serde_json::to_string_pretty(&value).map_err(|error| {
+            format!(
+                "Could not serialize Roblox plugin settings at {}: {error}",
+                compact_path(&path, 44)
+            )
+        })?;
+        std::fs::write(&path, updated).map_err(|error| {
+            format!(
+                "Could not update Roblox plugin settings at {}: {error}",
+                compact_path(&path, 44)
+            )
+        })?;
+        summary.files_changed += 1;
+        summary.removed_keys += removed;
+    }
+
+    Ok(summary)
+}
+
+fn phase_plugin_settings_inventory() -> PluginSettingsInventory {
+    let mut inventory = PluginSettingsInventory::default();
+
+    for path in discover_roblox_plugin_settings_files() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+
+        let mut file_has_phase_keys = false;
+        for key in object.keys() {
+            if !key.starts_with("PhaseAnimator") {
+                continue;
+            }
+            file_has_phase_keys = true;
+            if phase_setting_matches_category(key, PluginSettingsCategory::Themes) {
+                inventory.theme_keys += 1;
+            }
+            if phase_setting_matches_category(key, PluginSettingsCategory::Keybinds) {
+                inventory.keybind_keys += 1;
+            }
+        }
+        if file_has_phase_keys {
+            inventory.files_with_phase_keys += 1;
+        }
+    }
+
+    inventory
+}
+
+fn phase_setting_matches_any_category(key: &str, categories: &[PluginSettingsCategory]) -> bool {
+    categories
+        .iter()
+        .any(|category| phase_setting_matches_category(key, *category))
+}
+
+fn phase_setting_matches_category(key: &str, category: PluginSettingsCategory) -> bool {
+    match category {
+        PluginSettingsCategory::Themes => matches!(
+            key,
+            "PhaseAnimatorThemeV2"
+                | "PhaseAnimatorTheme"
+                | "PhaseAnimatorThemeName"
+                | "PhaseAnimatorThemePresets"
+                | "PhaseAnimatorFontProfile"
+                | "PhaseAnimatorGlassSettings"
+                | "PhaseAnimatorMotionSettings"
+                | "PhaseAnimatorTimelineSettings"
+                | "PhaseAnimator_ViewTransitionProfile_v1"
+        ),
+        PluginSettingsCategory::Keybinds => key == "PhaseAnimator_Keybinds_V1",
+    }
+}
+
+fn discover_roblox_plugin_settings_files() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            collect_roblox_plugin_settings_files(
+                &PathBuf::from(local_app_data).join("Roblox"),
+                &mut paths,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(data_dir) = dirs::data_dir() {
+            collect_roblox_plugin_settings_files(&data_dir.join("Roblox"), &mut paths);
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Some(data_dir) = dirs::data_dir() {
+            collect_roblox_plugin_settings_files(&data_dir.join("Roblox"), &mut paths);
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn collect_roblox_plugin_settings_files(root: &Path, paths: &mut Vec<PathBuf>) {
+    let Ok(users) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for user in users.flatten() {
+        let Ok(file_type) = user.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let user_path = user.path();
+        let user_name = user.file_name().to_string_lossy().to_string();
+        if !user_name.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+
+        let installed_plugins = user_path.join("InstalledPlugins");
+        let Ok(plugins) = std::fs::read_dir(installed_plugins) else {
+            continue;
+        };
+        for plugin_dir in plugins.flatten() {
+            let settings_path = plugin_dir.path().join("settings.json");
+            if settings_path.is_file() && settings_file_mentions_phase_animator(&settings_path) {
+                paths.push(settings_path);
+            }
+        }
+    }
+}
+
+fn settings_file_mentions_phase_animator(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| text.contains("\"PhaseAnimator"))
+        .unwrap_or(false)
+}
+
+fn backup_roblox_settings_file(
+    path: &Path,
+    contents: &str,
+    selected: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let full_backup_path =
+        path.with_file_name(format!("settings.phase-full-backup-{timestamp}.json"));
+    std::fs::write(&full_backup_path, contents).map_err(|error| {
+        format!(
+            "Could not back up Roblox plugin settings to {}: {error}",
+            compact_path(&full_backup_path, 44)
+        )
+    })?;
+
+    let selected_backup_path =
+        path.with_file_name(format!("settings.phase-selected-backup-{timestamp}.json"));
+    let backup = json!({
+        "sourcePath": path.to_string_lossy(),
+        "backedUpAtUnix": timestamp,
+        "settings": selected,
+    });
+    let selected_text = serde_json::to_string_pretty(&backup)
+        .map_err(|error| format!("Could not prepare selected settings backup: {error}"))?;
+    std::fs::write(&selected_backup_path, selected_text).map_err(|error| {
+        format!(
+            "Could not back up selected Phase settings to {}: {error}",
+            compact_path(&selected_backup_path, 44)
+        )
+    })?;
+
+    Ok(())
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }
 
 fn sha256_file(path: &std::path::Path) -> Result<String, String> {

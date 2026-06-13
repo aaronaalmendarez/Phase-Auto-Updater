@@ -100,6 +100,8 @@ macOS still needs signing and notarization before a public customer release. The
 
 ## latest update
 
+`0.20.2` adds a guarded Roblox plugin settings recovery tool with selectable backup/delete for Phase themes and keybinds.
+
 `0.20.1` fixes marketplace theme application for the current PA2 JSON theme-code format.
 
 `0.20.0` adds architecture-specific Windows setup packages for x64, x86, and arm64 so customers on 32-bit Windows or Windows on ARM do not receive an incompatible setup executable.
