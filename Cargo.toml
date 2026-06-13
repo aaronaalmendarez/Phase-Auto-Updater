@@ -1,6 +1,6 @@
 [package]
 name = "phase-updater"
-version = "0.20.0"
+version = "0.20.1"
 edition = "2024"
 description = "Native companion app for the Phase Animator Roblox Studio plugin."
 license = "MIT"

@@ -6527,12 +6527,32 @@ fn human_size(bytes: u64) -> String {
 }
 
 fn parse_theme_background_image_id(theme_code: &str) -> Option<String> {
-    theme_code
-        .split('|')
-        .find_map(|part| part.strip_prefix('i'))
-        .map(str::trim)
-        .filter(|value| value.chars().all(|ch| ch.is_ascii_digit()) && !value.is_empty())
-        .map(|value| value.to_owned())
+    if let Some(image_id) = parse_theme_background_image_id_from_json(theme_code) {
+        return Some(image_id);
+    }
+
+    theme_code.split('|').find_map(normalize_roblox_image_id)
+}
+
+fn parse_theme_background_image_id_from_json(theme_code: &str) -> Option<String> {
+    let payload = theme_code.split('|').nth(2)?.trim();
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    value
+        .get("background")
+        .and_then(|background| background.get("imageId"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_roblox_image_id)
+}
+
+fn normalize_roblox_image_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value.strip_prefix('i').unwrap_or(value).trim();
+    let value = value.strip_prefix("rbxassetid://").unwrap_or(value).trim();
+    if value.chars().all(|ch| ch.is_ascii_digit()) && !value.is_empty() {
+        Some(value.to_owned())
+    } else {
+        None
+    }
 }
 
 fn display_theme_owner(owner: &verification::PhaseThemeOwner) -> String {
@@ -6798,6 +6818,10 @@ mod phase {
     }
 
     pub fn palette_from_theme_code(code: &str) -> Option<Palette> {
+        if let Some(palette) = palette_from_theme_json(code) {
+            return Some(palette);
+        }
+
         let colors = code
             .split('|')
             .nth(2)?
@@ -6826,6 +6850,41 @@ mod phase {
             text_secondary: colors[17],
             text_muted: colors[18],
             text_on_accent: colors[19],
+        })
+    }
+
+    fn palette_from_theme_json(code: &str) -> Option<Palette> {
+        let payload = code.split('|').nth(2)?.trim();
+        if !payload.starts_with('{') {
+            return None;
+        }
+
+        let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+        let palette = value.get("palette")?.as_object()?;
+
+        Some(Palette {
+            background: color_field(palette, "Background")?,
+            surface: color_field(palette, "PanelBackground")
+                .or_else(|| color_field(palette, "Surface"))?,
+            surface_hover: color_field(palette, "SurfaceHover")?,
+            surface_active: color_field(palette, "SurfaceActive")?,
+            input: color_field(palette, "Input")?,
+            line: color_field(palette, "Line")
+                .or_else(|| color_field(palette, "Separator"))
+                .or_else(|| color_field(palette, "PanelBorder"))?,
+            accent: color_field(palette, "Accent")?,
+            accent_hover: color_field(palette, "AccentHover")?,
+            accent_dim: color_field(palette, "AccentDim")
+                .or_else(|| color_field(palette, "AccentMuted"))?,
+            blue: color_field(palette, "Blue")?,
+            green: color_field(palette, "Green")?,
+            red: color_field(palette, "Red")?,
+            warning: color_field(palette, "Warning")?,
+            text: color_field(palette, "TextPrimary").or_else(|| color_field(palette, "Text"))?,
+            text_secondary: color_field(palette, "TextSecondary")?,
+            text_muted: color_field(palette, "TextMuted")
+                .or_else(|| color_field(palette, "TextDim"))?,
+            text_on_accent: color_field(palette, "TextOnAccent")?,
         })
     }
 
@@ -6910,8 +6969,15 @@ mod phase {
         }
     }
 
+    fn color_field(
+        palette: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+    ) -> Option<Color32> {
+        palette.get(field)?.as_str().and_then(hex_color)
+    }
+
     fn hex_color(value: &str) -> Option<Color32> {
-        let value = value.trim();
+        let value = value.trim().trim_start_matches('#');
         if value.len() != 6 {
             return None;
         }
@@ -6921,5 +6987,33 @@ mod phase {
             ((rgb >> 8) & 0xff) as u8,
             (rgb & 0xff) as u8,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PA2_THEME_CODE: &str = r##"PA2|Violet Nebula|{"schemaVersion":2,"name":"Violet Nebula","palette":{"Background":"#080713","PanelBackground":"#21153D","SurfaceHover":"#3A345A","SurfaceActive":"#433B63","Input":"#0D0818","Line":"#5A348A","Accent":"#B985E8","AccentHover":"#E7C7FF","AccentDim":"#7442A8","Blue":"#85C7FF","Green":"#4BC67A","Red":"#E04E4E","Warning":"#E4A940","TextPrimary":"#F3EEFF","TextSecondary":"#D8B6F2","TextMuted":"#A36BD2","TextOnAccent":"#05040A"},"background":{"imageId":"rbxassetid://1161841954"}}"##;
+
+    #[test]
+    fn parses_pa2_theme_json_palette() {
+        assert!(phase::palette_from_theme_code(PA2_THEME_CODE).is_some());
+    }
+
+    #[test]
+    fn parses_pa2_theme_background_image_id() {
+        assert_eq!(
+            parse_theme_background_image_id(PA2_THEME_CODE).as_deref(),
+            Some("1161841954")
+        );
+    }
+
+    #[test]
+    fn parses_legacy_theme_background_image_id() {
+        assert_eq!(
+            parse_theme_background_image_id("PA1|Theme|000000.111111|i96046223266953").as_deref(),
+            Some("96046223266953")
+        );
     }
 }
