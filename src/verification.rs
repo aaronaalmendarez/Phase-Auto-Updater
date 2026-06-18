@@ -676,6 +676,8 @@ pub struct PhaseThemePreview {
     #[serde(default)]
     pub background: String,
     #[serde(default)]
+    pub background_image: String,
+    #[serde(default)]
     pub panel: String,
     #[serde(default)]
     pub accent: String,
