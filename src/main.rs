@@ -309,8 +309,12 @@ struct PhaseInstallerApp {
     theme_error: Option<String>,
     diagnostics_rx: Option<Receiver<diagnostics::DiagnosticReport>>,
     diagnostics_report: Option<diagnostics::DiagnosticReport>,
+    diagnostics_fix_rx: Option<Receiver<diagnostics::RepairEvent>>,
+    diagnostics_fix_report: Option<diagnostics::RepairReport>,
+    diagnostics_fix_steps: Vec<diagnostics::RepairStep>,
     diagnostics_open: bool,
     diagnostics_started_at: Option<Instant>,
+    diagnostics_fix_started_at: Option<Instant>,
     selected_theme: Option<ThemeSelection>,
     theme_search: String,
     visible_theme_count: usize,
@@ -439,8 +443,12 @@ impl PhaseInstallerApp {
             theme_error: None,
             diagnostics_rx: None,
             diagnostics_report: None,
+            diagnostics_fix_rx: None,
+            diagnostics_fix_report: None,
+            diagnostics_fix_steps: Vec::new(),
             diagnostics_open: false,
             diagnostics_started_at: None,
+            diagnostics_fix_started_at: None,
             selected_theme: None,
             theme_search: String::new(),
             visible_theme_count: 6,
@@ -575,6 +583,7 @@ impl PhaseInstallerApp {
         self.poll_theme_fetch(ctx);
         self.poll_theme_apply(ctx);
         self.poll_connection_diagnostics(ctx);
+        self.poll_connection_fix(ctx);
         self.poll_avatar_fetches(ctx);
         self.ensure_avatar_fetches(ctx);
         self.poll_theme_background_fetches(ctx);
@@ -1073,6 +1082,81 @@ impl PhaseInstallerApp {
             diagnostics::DiagnosticStatus::Problem => self.log(phase::red(), summary),
         }
         ctx.request_repaint();
+    }
+
+    fn start_connection_fix(&mut self, ctx: &Context) {
+        self.diagnostics_open = true;
+        if self.diagnostics_rx.is_some() || self.diagnostics_fix_rx.is_some() {
+            return;
+        }
+
+        let selected_folder = self.selected_folder.clone();
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        self.diagnostics_fix_rx = Some(rx);
+        self.diagnostics_fix_report = None;
+        self.diagnostics_fix_steps.clear();
+        self.diagnostics_fix_started_at = Some(Instant::now());
+        self.log(phase::blue(), "Running Phase fix assistant.");
+
+        std::thread::spawn(move || {
+            let report =
+                diagnostics::run_fix_assistant(CURRENT_BUILD_ID, selected_folder, |step| {
+                    let _ = tx.send(diagnostics::RepairEvent::Step(step));
+                    repaint.request_repaint();
+                });
+            let _ = tx.send(diagnostics::RepairEvent::Finished(report));
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_connection_fix(&mut self, ctx: &Context) {
+        let mut finished = None;
+        let mut disconnected = false;
+
+        if let Some(rx) = &self.diagnostics_fix_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(diagnostics::RepairEvent::Step(step)) => {
+                        self.diagnostics_fix_steps.push(step);
+                    }
+                    Ok(diagnostics::RepairEvent::Finished(report)) => {
+                        finished = Some(report);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(report) = finished {
+            let status = report.overall_status();
+            let summary = report.summary.clone();
+            self.diagnostics_report = Some(report.final_diagnostics.clone());
+            self.diagnostics_fix_report = Some(report);
+            self.diagnostics_fix_rx = None;
+            self.diagnostics_fix_started_at = None;
+            match status {
+                diagnostics::DiagnosticStatus::Good => self.log(phase::green(), summary),
+                diagnostics::DiagnosticStatus::Warning => self.log(phase::warning(), summary),
+                diagnostics::DiagnosticStatus::Problem => self.log(phase::red(), summary),
+            }
+            ctx.request_repaint();
+        } else if disconnected {
+            self.diagnostics_fix_rx = None;
+            self.diagnostics_fix_started_at = None;
+            self.log(
+                phase::red(),
+                "Phase fix assistant stopped before finishing.",
+            );
+            ctx.request_repaint();
+        } else if self.diagnostics_fix_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 
     fn local_matches_latest(&self, release: &verification::VersionResponse) -> bool {
@@ -3083,7 +3167,9 @@ impl PhaseInstallerApp {
     fn diagnostics_panel(&mut self, ui: &mut Ui) {
         ui.add_space(14.0);
         ui.vertical_centered(|ui| {
-            ui.set_width((ui.available_width() - 28.0).clamp(360.0, 472.0));
+            let panel_width = (ui.available_width() - 28.0).clamp(360.0, 560.0);
+            ui.set_min_width(panel_width);
+            ui.set_max_width(panel_width);
             ui.horizontal(|ui| {
                 if let Some(logo) = &self.logo {
                     let image = egui::Image::new(logo).fit_to_exact_size(Vec2::splat(38.0));
@@ -3107,25 +3193,56 @@ impl PhaseInstallerApp {
 
             ui.add_space(14.0);
             let running = self.diagnostics_rx.is_some();
+            let fix_running = self.diagnostics_fix_rx.is_some();
+            let busy = running || fix_running;
             let status = self
-                .diagnostics_report
+                .diagnostics_fix_report
                 .as_ref()
-                .map(diagnostics::DiagnosticReport::overall_status);
+                .map(diagnostics::RepairReport::overall_status)
+                .or_else(|| {
+                    self.diagnostics_report
+                        .as_ref()
+                        .map(diagnostics::DiagnosticReport::overall_status)
+                });
             let summary = if running {
                 self.diagnostics_started_at
                     .map(|started| format!("Checking... {}s", started.elapsed().as_secs()))
                     .unwrap_or_else(|| "Checking...".to_owned())
+            } else if fix_running {
+                self.diagnostics_fix_started_at
+                    .map(|started| {
+                        format!("Fix assistant running... {}s", started.elapsed().as_secs())
+                    })
+                    .unwrap_or_else(|| "Fix assistant running...".to_owned())
             } else {
-                self.diagnostics_report
+                self.diagnostics_fix_report
                     .as_ref()
                     .map(|report| report.summary.clone())
+                    .or_else(|| {
+                        self.diagnostics_report
+                            .as_ref()
+                            .map(|report| report.summary.clone())
+                    })
                     .unwrap_or_else(|| "Run a check to see what is blocking connection.".to_owned())
             };
-            let summary_color = match status {
-                Some(diagnostics::DiagnosticStatus::Good) => phase::green(),
-                Some(diagnostics::DiagnosticStatus::Warning) => phase::warning(),
-                Some(diagnostics::DiagnosticStatus::Problem) => phase::red(),
-                None => phase::blue(),
+            let status_label = if running {
+                "Checking"
+            } else if fix_running {
+                "Fixing"
+            } else {
+                status
+                    .map(diagnostics::DiagnosticStatus::label)
+                    .unwrap_or("Ready")
+            };
+            let summary_color = if running || fix_running {
+                phase::blue()
+            } else {
+                match status {
+                    Some(diagnostics::DiagnosticStatus::Good) => phase::green(),
+                    Some(diagnostics::DiagnosticStatus::Warning) => phase::warning(),
+                    Some(diagnostics::DiagnosticStatus::Problem) => phase::red(),
+                    None => phase::blue(),
+                }
             };
 
             egui::Frame::none()
@@ -3134,66 +3251,86 @@ impl PhaseInstallerApp {
                 .rounding(Rounding::same(10.0))
                 .inner_margin(Margin::symmetric(14.0, 12.0))
                 .show(ui, |ui| {
-                    let width = (ui.available_width() - 8.0).max(300.0);
-                    ui.set_width(width);
+                    let width = (ui.available_width() - 28.0).max(260.0);
+                    ui.set_min_width(width);
+                    ui.set_max_width(width);
                     ui.horizontal(|ui| {
-                        status_pill(
-                            ui,
-                            status
-                                .map(diagnostics::DiagnosticStatus::label)
-                                .unwrap_or("Ready"),
-                            summary_color,
-                        );
+                        status_pill(ui, status_label, summary_color);
                         ui.add_space(8.0);
-                        scrolling_label(
-                            ui,
-                            &summary,
-                            width - 92.0,
-                            FontId::proportional(13.0),
-                            phase::text_secondary(),
+                        ui.add_sized(
+                            Vec2::new((width - 92.0).max(120.0), 18.0),
+                            egui::Label::new(
+                                RichText::new(&summary)
+                                    .font(FontId::proportional(13.0))
+                                    .color(phase::text_secondary()),
+                            )
+                            .wrap(false),
                         );
                     });
                 });
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let width = (ui.available_width() - 18.0) / 3.0;
-                ui.add_enabled_ui(!running, |ui| {
+                let width = (ui.available_width() - 27.0) / 4.0;
+                ui.add_enabled_ui(!busy, |ui| {
                     let label = if running { "Checking" } else { "Run Check" };
                     if primary_button(ui, MiniIcon::Search, label, Vec2::new(width, 34.0)).clicked()
                     {
                         self.start_connection_diagnostics(ui.ctx());
                     }
                 });
-                if secondary_button(ui, MiniIcon::Refresh, "Retry", Vec2::new(width, 34.0))
-                    .clicked()
-                {
-                    self.start_connection_diagnostics(ui.ctx());
-                }
-                ui.add_enabled_ui(self.diagnostics_report.is_some(), |ui| {
-                    let copy_label =
-                        if matches!(status, Some(diagnostics::DiagnosticStatus::Problem)) {
-                            "Copy Error"
-                        } else {
-                            "Copy Report"
-                        };
-                    if secondary_button(ui, MiniIcon::External, copy_label, Vec2::new(width, 34.0))
+                ui.add_enabled_ui(!busy, |ui| {
+                    if secondary_button(ui, MiniIcon::Gear, "Fix Assist", Vec2::new(width, 34.0))
                         .clicked()
                     {
-                        if let Some(report) = &self.diagnostics_report {
-                            ui.output_mut(|output| output.copied_text = report.to_plain_text());
-                            self.log(phase::blue(), "Copied diagnostic report.");
-                        }
+                        self.start_connection_fix(ui.ctx());
                     }
                 });
+                ui.add_enabled_ui(!busy, |ui| {
+                    if secondary_button(ui, MiniIcon::Refresh, "Retry", Vec2::new(width, 34.0))
+                        .clicked()
+                    {
+                        self.start_connection_diagnostics(ui.ctx());
+                    }
+                });
+                ui.add_enabled_ui(
+                    self.diagnostics_report.is_some() || self.diagnostics_fix_report.is_some(),
+                    |ui| {
+                        let copy_label =
+                            if matches!(status, Some(diagnostics::DiagnosticStatus::Problem)) {
+                                "Copy Log"
+                            } else {
+                                "Copy"
+                            };
+                        if secondary_button(
+                            ui,
+                            MiniIcon::External,
+                            copy_label,
+                            Vec2::new(width, 34.0),
+                        )
+                        .clicked()
+                        {
+                            if let Some(report) = &self.diagnostics_fix_report {
+                                ui.output_mut(|output| output.copied_text = report.to_plain_text());
+                                self.log(phase::blue(), "Copied fix assistant log.");
+                            } else if let Some(report) = &self.diagnostics_report {
+                                ui.output_mut(|output| output.copied_text = report.to_plain_text());
+                                self.log(phase::blue(), "Copied diagnostic report.");
+                            }
+                        }
+                    },
+                );
             });
 
             ui.add_space(12.0);
+            let report_width = ui.available_width();
             egui::ScrollArea::vertical()
                 .id_source("phase-diagnostics-report")
                 .max_height((ui.available_height() - 12.0).max(180.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    ui.set_min_width(report_width);
+                    ui.set_max_width(report_width);
                     if running && self.diagnostics_report.is_none() {
                         diagnostics_waiting_card(ui);
                     }
@@ -3202,6 +3339,27 @@ impl PhaseInstallerApp {
                             diagnostics_check_card(ui, check);
                             ui.add_space(8.0);
                         }
+                    }
+                    let repair_steps = self
+                        .diagnostics_fix_report
+                        .as_ref()
+                        .map(|report| report.steps.as_slice())
+                        .unwrap_or(self.diagnostics_fix_steps.as_slice());
+                    if fix_running && repair_steps.is_empty() {
+                        diagnostics_fix_waiting_card(ui);
+                    }
+                    if !repair_steps.is_empty() {
+                        ui.add_space(8.0);
+                        section_label(ui, "Assisted Fix Log");
+                        ui.add_space(8.0);
+                        for step in repair_steps {
+                            diagnostics_repair_card(ui, step, fix_running);
+                            ui.add_space(8.0);
+                        }
+                    }
+                    if let Some(report) = &self.diagnostics_fix_report {
+                        ui.add_space(2.0);
+                        diagnostics_likely_cause_card(ui, report);
                     }
                 });
         });
@@ -5244,21 +5402,34 @@ impl PhaseInstallerApp {
                     .show(ui, |ui| {
                         ui.set_width(card_inner() - 16.0);
                         let status = self
-                            .diagnostics_report
+                            .diagnostics_fix_report
                             .as_ref()
-                            .map(diagnostics::DiagnosticReport::overall_status);
-                        let status_text = if self.diagnostics_rx.is_some() {
+                            .map(diagnostics::RepairReport::overall_status)
+                            .or_else(|| {
+                                self.diagnostics_report
+                                    .as_ref()
+                                    .map(diagnostics::DiagnosticReport::overall_status)
+                            });
+                        let status_text = if self.diagnostics_fix_rx.is_some() {
+                            "Fixing"
+                        } else if self.diagnostics_rx.is_some() {
                             "Checking"
                         } else {
                             status
                                 .map(diagnostics::DiagnosticStatus::label)
                                 .unwrap_or("Ready")
                         };
-                        let status_color = match status {
-                            Some(diagnostics::DiagnosticStatus::Good) => phase::green(),
-                            Some(diagnostics::DiagnosticStatus::Warning) => phase::warning(),
-                            Some(diagnostics::DiagnosticStatus::Problem) => phase::red(),
-                            None => phase::blue(),
+                        let status_color = if self.diagnostics_fix_rx.is_some()
+                            || self.diagnostics_rx.is_some()
+                        {
+                            phase::blue()
+                        } else {
+                            match status {
+                                Some(diagnostics::DiagnosticStatus::Good) => phase::green(),
+                                Some(diagnostics::DiagnosticStatus::Warning) => phase::warning(),
+                                Some(diagnostics::DiagnosticStatus::Problem) => phase::red(),
+                                None => phase::blue(),
+                            }
                         };
                         ui.horizontal(|ui| {
                             draw_icon(ui, MiniIcon::Search, Vec2::splat(16.0), status_color);
@@ -5271,9 +5442,14 @@ impl PhaseInstallerApp {
                                 );
                                 scrolling_label(
                                     ui,
-                                    self.diagnostics_report
+                                    self.diagnostics_fix_report
                                         .as_ref()
                                         .map(|report| report.summary.as_str())
+                                        .or_else(|| {
+                                            self.diagnostics_report
+                                                .as_ref()
+                                                .map(|report| report.summary.as_str())
+                                        })
                                         .unwrap_or("Open a simple connection check window."),
                                     card_inner() - 148.0,
                                     FontId::proportional(11.0),
@@ -5291,18 +5467,38 @@ impl PhaseInstallerApp {
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let btn_width = (card_inner() - 8.0) / 2.0;
-                    let running = self.diagnostics_rx.is_some();
+                    let btn_width = (card_inner() - 16.0) / 3.0;
+                    let running = self.diagnostics_rx.is_some() || self.diagnostics_fix_rx.is_some();
                     ui.add_enabled_ui(!running, |ui| {
                         if secondary_button(
                             ui,
                             MiniIcon::Search,
-                            if running { "Checking" } else { "Diagnose" },
+                            if self.diagnostics_rx.is_some() {
+                                "Checking"
+                            } else {
+                                "Diagnose"
+                            },
                             Vec2::new(btn_width, 36.0),
                         )
                         .clicked()
                         {
                             self.start_connection_diagnostics(ui.ctx());
+                        }
+                    });
+                    ui.add_enabled_ui(!running, |ui| {
+                        if secondary_button(
+                            ui,
+                            MiniIcon::Gear,
+                            if self.diagnostics_fix_rx.is_some() {
+                                "Fixing"
+                            } else {
+                                "Fix"
+                            },
+                            Vec2::new(btn_width, 36.0),
+                        )
+                        .clicked()
+                        {
+                            self.start_connection_fix(ui.ctx());
                         }
                     });
                     if secondary_button(ui, MiniIcon::External, "Open", Vec2::new(btn_width, 36.0))
@@ -6607,7 +6803,9 @@ fn diagnostics_waiting_card(ui: &mut Ui) {
         .rounding(Rounding::same(8.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
-            ui.set_width((ui.available_width() - 8.0).max(300.0));
+            let width = (ui.available_width() - 28.0).max(260.0);
+            ui.set_min_width(width);
+            ui.set_max_width(width);
             ui.horizontal(|ui| {
                 draw_icon(ui, MiniIcon::Refresh, Vec2::splat(18.0), phase::blue());
                 ui.add_space(8.0);
@@ -6623,6 +6821,47 @@ fn diagnostics_waiting_card(ui: &mut Ui) {
                             .font(FontId::proportional(11.0))
                             .color(phase::text_muted()),
                     );
+                });
+            });
+        });
+}
+
+fn diagnostics_fix_waiting_card(ui: &mut Ui) {
+    let time = ui.ctx().input(|input| input.time) as f32;
+    let pulse = 0.55 + 0.45 * ((time * 4.0).sin() * 0.5 + 0.5);
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
+
+    egui::Frame::none()
+        .fill(phase::surface())
+        .stroke(Stroke::new(1.0, phase::line()))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            let width = (ui.available_width() - 28.0).max(260.0);
+            ui.set_min_width(width);
+            ui.set_max_width(width);
+            ui.horizontal(|ui| {
+                draw_icon(
+                    ui,
+                    MiniIcon::Gear,
+                    Vec2::splat(18.0),
+                    color_with_alpha(phase::accent(), pulse),
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Preparing fix assistant")
+                            .font(FontId::proportional(13.5))
+                            .strong()
+                            .color(phase::text()),
+                    );
+                    ui.label(
+                        RichText::new("Safe network checks will appear here as they finish.")
+                            .font(FontId::proportional(11.0))
+                            .color(phase::text_muted()),
+                    );
+                    ui.add_space(8.0);
+                    animated_diagnostics_bar(ui, width - 48.0, pulse);
                 });
             });
         });
@@ -6647,8 +6886,9 @@ fn diagnostics_check_card(ui: &mut Ui, check: &diagnostics::DiagnosticCheck) {
         .rounding(Rounding::same(8.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
-            let width = (ui.available_width() - 8.0).max(300.0);
-            ui.set_width(width);
+            let width = (ui.available_width() - 28.0).max(260.0);
+            ui.set_min_width(width);
+            ui.set_max_width(width);
             ui.horizontal(|ui| {
                 draw_icon(ui, icon, Vec2::splat(20.0), color);
                 ui.add_space(8.0);
@@ -6660,21 +6900,25 @@ fn diagnostics_check_card(ui: &mut Ui, check: &diagnostics::DiagnosticCheck) {
                             .elapsed_ms
                             .map(|value| format!("{value} ms"))
                             .unwrap_or_default();
-                        scrolling_label(
-                            ui,
-                            &elapsed,
-                            80.0,
-                            FontId::proportional(10.5),
-                            phase::text_muted(),
+                        ui.add_sized(
+                            Vec2::new(80.0, 15.0),
+                            egui::Label::new(
+                                RichText::new(&elapsed)
+                                    .font(FontId::proportional(10.5))
+                                    .color(phase::text_muted()),
+                            )
+                            .wrap(false),
                         );
                     });
                     ui.add_space(3.0);
-                    scrolling_label(
-                        ui,
-                        &check.title,
-                        width - 42.0,
-                        FontId::proportional(14.0),
-                        phase::text(),
+                    ui.add_sized(
+                        Vec2::new((width - 42.0).max(140.0), 19.0),
+                        egui::Label::new(
+                            RichText::new(&check.title)
+                                .font(FontId::proportional(14.0))
+                                .color(phase::text()),
+                        )
+                        .wrap(false),
                     );
                     ui.add_space(3.0);
                     ui.label(
@@ -6694,6 +6938,926 @@ fn diagnostics_check_card(ui: &mut Ui, check: &diagnostics::DiagnosticCheck) {
                 });
             });
         });
+}
+
+fn diagnostics_repair_card(ui: &mut Ui, step: &diagnostics::RepairStep, animate: bool) {
+    let color = match step.status {
+        diagnostics::DiagnosticStatus::Good => phase::green(),
+        diagnostics::DiagnosticStatus::Warning => phase::warning(),
+        diagnostics::DiagnosticStatus::Problem => phase::red(),
+    };
+    let icon = match step.status {
+        diagnostics::DiagnosticStatus::Good => MiniIcon::Check,
+        diagnostics::DiagnosticStatus::Warning => MiniIcon::Info,
+        diagnostics::DiagnosticStatus::Problem => MiniIcon::Gear,
+    };
+    let t = if animate {
+        let id = ui.make_persistent_id(("phase-repair-step", &step.title, &step.action));
+        motion::ease_out_cubic(ui.ctx().animate_bool_with_time(id, true, 0.22))
+    } else {
+        1.0
+    };
+
+    ui.add_space((1.0 - t) * 7.0);
+    ui.scope(|ui| {
+        ui.set_opacity(0.28 + 0.72 * t);
+        egui::Frame::none()
+            .fill(phase::surface())
+            .stroke(Stroke::new(1.0, color_with_alpha(phase::line(), 0.82)))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(14.0, 12.0))
+            .show(ui, |ui| {
+                let width = (ui.available_width() - 28.0).max(260.0);
+                ui.set_min_width(width);
+                ui.set_max_width(width);
+                ui.horizontal(|ui| {
+                    draw_icon(ui, icon, Vec2::splat(16.0), color);
+                    ui.add_space(6.0);
+                    status_pill(ui, step.status.label(), color);
+                    ui.add_space(6.0);
+                    let elapsed = step
+                        .elapsed_ms
+                        .map(|value| format!("{value} ms"))
+                        .unwrap_or_else(|| "logged".to_owned());
+                    ui.add_sized(
+                        Vec2::new(76.0, 15.0),
+                        egui::Label::new(
+                            RichText::new(&elapsed)
+                                .font(FontId::proportional(10.5))
+                                .color(phase::text_muted()),
+                        )
+                        .wrap(false),
+                    );
+                });
+                ui.add_space(5.0);
+                ui.add_sized(
+                    Vec2::new((width - 4.0).max(140.0), 19.0),
+                    egui::Label::new(
+                        RichText::new(&step.title)
+                            .font(FontId::proportional(14.0))
+                            .color(phase::text()),
+                    )
+                    .wrap(false),
+                );
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&step.detail)
+                            .font(FontId::proportional(11.5))
+                            .color(phase::text_secondary()),
+                    )
+                    .wrap(true),
+                );
+                if !step.action.trim().is_empty() {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("Action: {}", step.action))
+                                .font(FontId::proportional(10.8))
+                                .color(phase::text_muted()),
+                        )
+                        .wrap(true),
+                    );
+                }
+                if let Some(output) = step
+                    .raw_output
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    ui.add_space(7.0);
+                    diagnostics_output_panel(ui, output, width);
+                }
+            });
+    });
+}
+
+fn diagnostics_output_panel(ui: &mut Ui, output: &str, width: f32) {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if let Some(snapshot) = parse_diagnostic_snapshot(trimmed) {
+        diagnostics_snapshot_panel(ui, &snapshot, width);
+        return;
+    }
+
+    let command = parse_command_output(trimmed);
+    let success = command.exit.as_deref() == Some("0") && command.stderr.is_empty();
+    let accent = if success {
+        phase::green()
+    } else {
+        phase::warning()
+    };
+
+    egui::Frame::none()
+        .fill(phase::input())
+        .stroke(Stroke::new(1.0, color_with_alpha(accent, 0.36)))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 9.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 20.0).max(220.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                draw_icon(
+                    ui,
+                    if success {
+                        MiniIcon::Check
+                    } else {
+                        MiniIcon::Info
+                    },
+                    Vec2::splat(14.0),
+                    accent,
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(if success {
+                        "Command succeeded"
+                    } else {
+                        "Command output"
+                    })
+                    .font(FontId::proportional(11.4))
+                    .strong()
+                    .color(phase::text()),
+                );
+                if let Some(exit) = &command.exit {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("exit {exit}"))
+                            .font(FontId::monospace(9.6))
+                            .color(accent),
+                    );
+                }
+            });
+
+            let mut wrote = false;
+            if let Some(status) = &command.status_code {
+                ui.add_space(7.0);
+                command_meta_row(
+                    ui,
+                    "HTTP",
+                    if status == "200" { "200 OK" } else { status },
+                    status == "200",
+                    inner_width,
+                );
+                wrote = true;
+            }
+            if let Some(content_type) = &command.content_type {
+                ui.add_space(if wrote { 4.0 } else { 7.0 });
+                command_meta_row(
+                    ui,
+                    "Content",
+                    clean_content_type(content_type),
+                    true,
+                    inner_width,
+                );
+                wrote = true;
+            }
+
+            if let Some(body) = &command.body_prefix {
+                ui.add_space(8.0);
+                if !phase_response_summary(ui, body, inner_width) {
+                    command_text_block(
+                        ui,
+                        "Response",
+                        &[body.to_owned()],
+                        inner_width,
+                        phase::text_muted(),
+                    );
+                }
+                wrote = true;
+            }
+
+            let proxy_summary = proxy_settings_summary(&command.stdout);
+            let winhttp_summary = winhttp_proxy_summary(&command.stdout);
+            let dns_flushed = dns_flush_succeeded(&command.stdout);
+
+            if let Some(proxy) = &proxy_summary {
+                ui.add_space(if wrote { 8.0 } else { 7.0 });
+                proxy_settings_panel(ui, proxy, inner_width);
+                wrote = true;
+            } else if let Some(winhttp) = &winhttp_summary {
+                ui.add_space(if wrote { 8.0 } else { 7.0 });
+                winhttp_proxy_panel(ui, winhttp, inner_width);
+                wrote = true;
+            } else if dns_flushed {
+                ui.add_space(if wrote { 8.0 } else { 7.0 });
+                simple_command_summary(
+                    ui,
+                    MiniIcon::Check,
+                    "DNS cache flushed",
+                    "Windows resolver cache was cleared.",
+                    phase::green(),
+                    inner_width,
+                );
+                wrote = true;
+            }
+
+            if !command.stdout.is_empty() {
+                let show_stdout = command.body_prefix.is_none()
+                    && proxy_summary.is_none()
+                    && winhttp_summary.is_none()
+                    && !dns_flushed;
+                if show_stdout {
+                    ui.add_space(if wrote { 8.0 } else { 7.0 });
+                    command_text_block(
+                        ui,
+                        "Stdout",
+                        &command.stdout,
+                        inner_width,
+                        phase::text_secondary(),
+                    );
+                    wrote = true;
+                }
+            }
+
+            if !command.stderr.is_empty() {
+                ui.add_space(if wrote { 8.0 } else { 7.0 });
+                command_text_block(ui, "Stderr", &command.stderr, inner_width, phase::warning());
+            }
+        });
+}
+
+#[derive(Default)]
+struct CommandOutputView {
+    exit: Option<String>,
+    status_code: Option<String>,
+    content_type: Option<String>,
+    body_prefix: Option<String>,
+    stdout: Vec<String>,
+    stderr: Vec<String>,
+}
+
+fn parse_command_output(output: &str) -> CommandOutputView {
+    let mut parsed = CommandOutputView::default();
+    let mut section = "";
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match trimmed {
+            "Stdout:" => {
+                section = "stdout";
+                continue;
+            }
+            "Stderr:" => {
+                section = "stderr";
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Exit:") {
+            parsed.exit = Some(value.trim().to_owned());
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("StatusCode=") {
+            parsed.status_code = Some(value.trim().to_owned());
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("ContentType=") {
+            parsed.content_type = Some(value.trim().to_owned());
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("BodyPrefix=") {
+            parsed.body_prefix = Some(value.trim().to_owned());
+            continue;
+        }
+
+        match section {
+            "stderr" => parsed.stderr.push(trimmed.to_owned()),
+            _ => parsed.stdout.push(trimmed.to_owned()),
+        }
+    }
+
+    parsed
+}
+
+fn command_meta_row(ui: &mut Ui, label: &str, value: &str, positive: bool, width: f32) {
+    let color = if positive {
+        phase::green()
+    } else {
+        phase::warning()
+    };
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.06))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::symmetric(8.0, 5.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 16.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(label)
+                        .font(FontId::proportional(10.2))
+                        .strong()
+                        .color(phase::text_muted()),
+                );
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(value)
+                            .font(FontId::proportional(10.5))
+                            .color(color),
+                    )
+                    .wrap(true),
+                );
+            });
+        });
+}
+
+fn phase_response_summary(ui: &mut Ui, body: &str, width: f32) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+
+    let latest = value
+        .get("latestVersion")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown version");
+    let build = value
+        .get("latestBuildId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown build");
+    let message = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+
+    egui::Frame::none()
+        .fill(color_with_alpha(phase::green(), 0.07))
+        .stroke(Stroke::new(1.0, color_with_alpha(phase::green(), 0.22)))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 20.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                draw_icon(ui, MiniIcon::Check, Vec2::splat(14.0), phase::green());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Phase responded")
+                        .font(FontId::proportional(11.0))
+                        .strong()
+                        .color(phase::text()),
+                );
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("{latest}  -  {build}"))
+                    .font(FontId::monospace(10.0))
+                    .color(phase::text_secondary()),
+            );
+            if let Some(message) = message {
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(message)
+                            .font(FontId::proportional(10.2))
+                            .color(phase::text_muted()),
+                    )
+                    .wrap(true),
+                );
+            }
+        });
+    true
+}
+
+struct UserProxySummary {
+    enabled: bool,
+    server: String,
+    pac: String,
+}
+
+fn proxy_settings_summary(lines: &[String]) -> Option<UserProxySummary> {
+    let mut enabled = None;
+    let mut server = String::new();
+    let mut pac = String::new();
+
+    for line in lines {
+        if let Some(value) = line.strip_prefix("ProxyEnable=") {
+            enabled = Some(value.trim() == "1");
+        } else if let Some(value) = line.strip_prefix("ProxyServer=") {
+            server = value.trim().to_owned();
+        } else if let Some(value) = line.strip_prefix("AutoConfigURL=") {
+            pac = value.trim().to_owned();
+        }
+    }
+
+    enabled.map(|enabled| UserProxySummary {
+        enabled,
+        server,
+        pac,
+    })
+}
+
+fn proxy_settings_panel(ui: &mut Ui, proxy: &UserProxySummary, width: f32) {
+    let has_pac = !proxy.pac.trim().is_empty();
+    let has_proxy = proxy.enabled || !proxy.server.trim().is_empty() || has_pac;
+    let color = if has_proxy {
+        phase::warning()
+    } else {
+        phase::green()
+    };
+    let title = if has_proxy {
+        "Windows proxy configured"
+    } else {
+        "Windows proxy disabled"
+    };
+    let detail = if has_proxy {
+        "Windows user proxy/PAC settings may affect browsers and web requests."
+    } else {
+        "No user proxy server or PAC URL is enabled."
+    };
+
+    simple_command_summary(
+        ui,
+        if has_proxy {
+            MiniIcon::Info
+        } else {
+            MiniIcon::Check
+        },
+        title,
+        detail,
+        color,
+        width,
+    );
+    if has_proxy {
+        ui.add_space(5.0);
+        if !proxy.server.trim().is_empty() {
+            command_meta_row(ui, "Server", &proxy.server, false, width);
+        }
+        if has_pac {
+            ui.add_space(4.0);
+            command_meta_row(ui, "PAC", &proxy.pac, false, width);
+        }
+    }
+}
+
+struct WinHttpSummary {
+    direct: bool,
+    detail: String,
+}
+
+fn winhttp_proxy_summary(lines: &[String]) -> Option<WinHttpSummary> {
+    let joined = lines.join(" ");
+    let lower = joined.to_ascii_lowercase();
+    if !lower.contains("winhttp") && !lower.contains("proxy") {
+        return None;
+    }
+    let direct = lower.contains("direct access") || lower.contains("no proxy server");
+    Some(WinHttpSummary {
+        direct,
+        detail: joined.trim().to_owned(),
+    })
+}
+
+fn winhttp_proxy_panel(ui: &mut Ui, summary: &WinHttpSummary, width: f32) {
+    let color = if summary.direct {
+        phase::green()
+    } else {
+        phase::warning()
+    };
+    simple_command_summary(
+        ui,
+        if summary.direct {
+            MiniIcon::Check
+        } else {
+            MiniIcon::Info
+        },
+        if summary.direct {
+            "WinHTTP direct access"
+        } else {
+            "WinHTTP proxy configured"
+        },
+        if summary.direct {
+            "System web requests are not using a WinHTTP proxy."
+        } else {
+            summary.detail.as_str()
+        },
+        color,
+        width,
+    );
+}
+
+fn dns_flush_succeeded(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("successfully flushed"))
+}
+
+fn simple_command_summary(
+    ui: &mut Ui,
+    icon: MiniIcon,
+    title: &str,
+    detail: &str,
+    color: Color32,
+    width: f32,
+) {
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.07))
+        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.22)))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 20.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                draw_icon(ui, icon, Vec2::splat(14.0), color);
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(title)
+                        .font(FontId::proportional(11.0))
+                        .strong()
+                        .color(phase::text()),
+                );
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(detail)
+                        .font(FontId::proportional(10.2))
+                        .color(phase::text_secondary()),
+                )
+                .wrap(true),
+            );
+        });
+}
+
+fn command_text_block(ui: &mut Ui, title: &str, lines: &[String], width: f32, color: Color32) {
+    if lines.is_empty() {
+        return;
+    }
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .font(FontId::proportional(9.3))
+            .strong()
+            .color(phase::text_muted()),
+    );
+    ui.add_space(3.0);
+    let preview = lines
+        .iter()
+        .take(5)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.05))
+        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.16)))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 16.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(preview)
+                        .font(FontId::monospace(9.7))
+                        .color(color),
+                )
+                .wrap(true),
+            );
+            if lines.len() > 5 {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("+{} more lines in copied log", lines.len() - 5))
+                        .font(FontId::proportional(9.6))
+                        .color(phase::text_muted()),
+                );
+            }
+        });
+}
+
+fn clean_content_type(value: &str) -> &str {
+    value.split(';').next().unwrap_or(value).trim()
+}
+
+#[derive(Clone)]
+struct DiagnosticSnapshot {
+    summary: String,
+    checked_at: Option<String>,
+    checks: Vec<DiagnosticSnapshotCheck>,
+}
+
+#[derive(Clone)]
+struct DiagnosticSnapshotCheck {
+    status: String,
+    title: String,
+    elapsed: Option<String>,
+    detail: String,
+    raw_error: Option<String>,
+    next_step: Option<String>,
+}
+
+fn parse_diagnostic_snapshot(output: &str) -> Option<DiagnosticSnapshot> {
+    let mut lines = output.lines();
+    let first = lines.next()?.trim();
+    let summary = first
+        .strip_prefix("Phase connection diagnostics:")?
+        .trim()
+        .to_owned();
+
+    let mut checked_at = None;
+    let mut checks = Vec::new();
+    let mut current: Option<DiagnosticSnapshotCheck> = None;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Checked at Unix time:") {
+            checked_at = Some(value.trim().to_owned());
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("- [") {
+            if let Some(check) = current.take() {
+                checks.push(check);
+            }
+            let Some((status, body)) = rest.split_once("] ") else {
+                continue;
+            };
+            let Some((title_part, detail)) = body.split_once(": ") else {
+                continue;
+            };
+            let (title, elapsed) = split_title_elapsed(title_part);
+            current = Some(DiagnosticSnapshotCheck {
+                status: status.trim().to_owned(),
+                title,
+                elapsed,
+                detail: detail.trim().to_owned(),
+                raw_error: None,
+                next_step: None,
+            });
+            continue;
+        }
+        if let Some(check) = current.as_mut() {
+            if let Some(value) = trimmed.strip_prefix("Raw error:") {
+                check.raw_error = Some(value.trim().to_owned());
+            } else if let Some(value) = trimmed.strip_prefix("Try:") {
+                check.next_step = Some(value.trim().to_owned());
+            }
+        }
+    }
+
+    if let Some(check) = current {
+        checks.push(check);
+    }
+
+    Some(DiagnosticSnapshot {
+        summary,
+        checked_at,
+        checks,
+    })
+}
+
+fn split_title_elapsed(value: &str) -> (String, Option<String>) {
+    let value = value.trim();
+    if let Some(open) = value.rfind(" (") {
+        if value.ends_with(')') {
+            return (
+                value[..open].trim().to_owned(),
+                Some(value[open + 2..value.len() - 1].trim().to_owned()),
+            );
+        }
+    }
+    (value.to_owned(), None)
+}
+
+fn diagnostics_snapshot_panel(ui: &mut Ui, snapshot: &DiagnosticSnapshot, width: f32) {
+    let status_color = snapshot_color(snapshot);
+    egui::Frame::none()
+        .fill(phase::input())
+        .stroke(Stroke::new(1.0, color_with_alpha(status_color, 0.42)))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 9.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 20.0).max(220.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                draw_icon(ui, MiniIcon::Search, Vec2::splat(14.0), status_color);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width((inner_width - 26.0).max(180.0));
+                    ui.set_max_width((inner_width - 26.0).max(180.0));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("Diagnostic snapshot")
+                                .font(FontId::proportional(10.8))
+                                .strong()
+                                .color(phase::text()),
+                        );
+                        if let Some(checked_at) = &snapshot.checked_at {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(format!("Unix {checked_at}"))
+                                    .font(FontId::monospace(9.3))
+                                    .color(phase::text_muted()),
+                            );
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&snapshot.summary)
+                                .font(FontId::proportional(10.5))
+                                .color(phase::text_secondary()),
+                        )
+                        .wrap(true),
+                    );
+                });
+            });
+
+            ui.add_space(8.0);
+            for check in &snapshot.checks {
+                diagnostics_snapshot_row(ui, check, inner_width);
+                ui.add_space(6.0);
+            }
+        });
+}
+
+fn diagnostics_snapshot_row(ui: &mut Ui, check: &DiagnosticSnapshotCheck, width: f32) {
+    let color = status_label_color(&check.status);
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.055))
+        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.22)))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::symmetric(8.0, 7.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 16.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal_wrapped(|ui| {
+                draw_icon(
+                    ui,
+                    if check.status == "Good" {
+                        MiniIcon::Check
+                    } else {
+                        MiniIcon::Info
+                    },
+                    Vec2::splat(13.0),
+                    color,
+                );
+                ui.add_space(5.0);
+                output_tag(ui, &check.status, color);
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new(&check.title)
+                        .font(FontId::proportional(10.8))
+                        .strong()
+                        .color(phase::text()),
+                );
+                if let Some(elapsed) = &check.elapsed {
+                    ui.add_space(5.0);
+                    ui.label(
+                        RichText::new(elapsed)
+                            .font(FontId::monospace(9.2))
+                            .color(phase::text_muted()),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&check.detail)
+                        .font(FontId::proportional(10.4))
+                        .color(phase::text_secondary()),
+                )
+                .wrap(true),
+            );
+            if let Some(next_step) = &check.next_step {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Try: {next_step}"))
+                            .font(FontId::proportional(10.0))
+                            .color(color),
+                    )
+                    .wrap(true),
+                );
+            }
+            if let Some(raw_error) = &check.raw_error {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(raw_error)
+                            .font(FontId::monospace(9.4))
+                            .color(phase::warning()),
+                    )
+                    .wrap(true),
+                );
+            }
+        });
+}
+
+fn snapshot_color(snapshot: &DiagnosticSnapshot) -> Color32 {
+    if snapshot
+        .checks
+        .iter()
+        .any(|check| check.status == "Problem")
+    {
+        phase::red()
+    } else if snapshot
+        .checks
+        .iter()
+        .any(|check| check.status == "Check" || check.status == "Warning")
+    {
+        phase::warning()
+    } else {
+        phase::green()
+    }
+}
+
+fn output_tag(ui: &mut Ui, text: &str, color: Color32) {
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.12))
+        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.45)))
+        .rounding(Rounding::same(999.0))
+        .inner_margin(Margin::symmetric(7.0, 2.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .font(FontId::proportional(9.8))
+                    .strong()
+                    .color(color),
+            );
+        });
+}
+
+fn status_label_color(label: &str) -> Color32 {
+    match label {
+        "Good" => phase::green(),
+        "Check" | "Warning" => phase::warning(),
+        "Problem" | "Error" => phase::red(),
+        _ => phase::text_muted(),
+    }
+}
+
+fn diagnostics_likely_cause_card(ui: &mut Ui, report: &diagnostics::RepairReport) {
+    if report.likely_cause.trim().is_empty() {
+        return;
+    }
+    let color = match report.overall_status() {
+        diagnostics::DiagnosticStatus::Good => phase::green(),
+        diagnostics::DiagnosticStatus::Warning => phase::warning(),
+        diagnostics::DiagnosticStatus::Problem => phase::red(),
+    };
+
+    egui::Frame::none()
+        .fill(phase::input())
+        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.65)))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            let width = (ui.available_width() - 28.0).max(260.0);
+            ui.set_min_width(width);
+            ui.set_max_width(width);
+            ui.horizontal(|ui| {
+                draw_icon(ui, MiniIcon::Info, Vec2::splat(18.0), color);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Most likely cause")
+                            .font(FontId::proportional(13.5))
+                            .strong()
+                            .color(phase::text()),
+                    );
+                    ui.add_space(3.0);
+                    ui.label(
+                        RichText::new(&report.likely_cause)
+                            .font(FontId::proportional(11.5))
+                            .color(phase::text_secondary()),
+                    );
+                });
+            });
+        });
+}
+
+fn animated_diagnostics_bar(ui: &mut Ui, width: f32, pulse: f32) {
+    let width = width.max(96.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 5.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(999.0), phase::input());
+    let fill = Rect::from_min_max(
+        rect.left_top(),
+        Pos2::new(
+            rect.left() + rect.width() * (0.24 + 0.52 * pulse),
+            rect.bottom(),
+        ),
+    );
+    painter.rect_filled(
+        fill,
+        Rounding::same(999.0),
+        color_with_alpha(phase::accent(), 0.45 + 0.45 * pulse),
+    );
 }
 
 fn small_number_field(ui: &mut Ui, label: &str, value: &mut String, hint: &str, width: f32) {
