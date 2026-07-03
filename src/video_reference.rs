@@ -311,6 +311,7 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
   let previewPending = false;
   let suppressLocalSyncUntil = 0;
   let desiredPlaying = false;
+  let phaseDrivenPlayback = false;
   let playPromise = null;
   function setChromeVisible(visible) {{
     document.body.classList.toggle('controls-visible', visible);
@@ -419,6 +420,7 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
             const remoteRate = playbackRateFromPayload(payload);
             if (remoteRate !== undefined) setRate(remoteRate, {{ send: false }});
             suppressLocalSyncFor(520);
+            phaseDrivenPlayback = payload.playing === true;
             if (payload.playing === false) requestPlayback(false);
             applyRemoteSeconds(payload.seconds, true);
             if (payload.playing === true) requestPlayback(true);
@@ -500,6 +502,7 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
     }}, extra || {{}});
   }}
   function seekTo(seconds) {{
+    phaseDrivenPlayback = false;
     const max = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : seconds;
     video.currentTime = Math.max(0, Math.min(max, seconds));
     sendBridge('sync.seek', timelinePayload());
@@ -603,7 +606,7 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
   video.addEventListener('loadedmetadata', refresh);
   video.addEventListener('timeupdate', () => {{
     refresh();
-    if (!video.paused && canSendLocalSync()) sendBridge('sync.timeline', timelinePayload());
+    if (!video.paused && !phaseDrivenPlayback && canSendLocalSync()) sendBridge('sync.timeline', timelinePayload());
   }});
   video.addEventListener('play', () => {{
     desiredPlaying = true;
@@ -612,6 +615,7 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
   }});
   video.addEventListener('pause', () => {{
     desiredPlaying = false;
+    phaseDrivenPlayback = false;
     refresh();
     if (canSendLocalSync()) sendBridge('sync.playback', timelinePayload({{ playing: false }}));
   }});
@@ -620,6 +624,7 @@ fn render_player_html(draft: &ReferenceDraft) -> Result<String, String> {
     document.getElementById('phase-error').textContent = 'Could not load this MP4. Check the path or codec.';
   }});
   play.addEventListener('click', () => {{
+    phaseDrivenPlayback = false;
     suppressLocalSyncUntil = 0;
     requestPlayback(video.paused && !desiredPlaying);
   }});
@@ -2157,6 +2162,7 @@ fn render_youtube_media_html(
   }}
   function seekTo(seconds, send) {{
     if (!playerReady) return;
+    phaseDrivenPlayback = false;
     const target = Math.max(0, seconds);
     player.seekTo(target, true);
     refresh();
@@ -2217,7 +2223,7 @@ fn render_youtube_media_html(
       return;
     }}
     const now = Date.now();
-    if (playing && now - lastTimelineSent >= 100) {{
+    if (playing && !phaseDrivenPlayback && now - lastTimelineSent >= 100) {{
       lastTimelineSent = now;
       sendBridge('sync.timeline', timelinePayload());
     }}
@@ -2248,6 +2254,7 @@ fn render_youtube_media_html(
     if ((event.data === 1 || event.data === 2 || event.data === 0) && canSendLocalSync()) {{
       sendBridge('sync.playback', timelinePayload({{ playing: nextPlaying }}));
     }}
+    if (!nextPlaying) phaseDrivenPlayback = false;
     if (!canSendLocalSync()) setTimeout(enforceDesiredPlayback, 120);
   }}
   function onPlayerError(event) {{

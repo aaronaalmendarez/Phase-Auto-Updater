@@ -359,6 +359,7 @@ struct PhaseInstallerApp {
     video_position_input: String,
     video_sync_enabled: bool,
     video_playing: bool,
+    video_phase_driven_playback: bool,
     video_play_last_tick: Option<Instant>,
     video_last_sync_sent: Option<Instant>,
     video_seq: u64,
@@ -492,6 +493,7 @@ impl PhaseInstallerApp {
             video_position_input: "0".to_owned(),
             video_sync_enabled: false,
             video_playing: false,
+            video_phase_driven_playback: false,
             video_play_last_tick: None,
             video_last_sync_sent: None,
             video_seq: 0,
@@ -2447,6 +2449,7 @@ impl PhaseInstallerApp {
         if op == "sync.playback" {
             if let Some(playing) = playing {
                 self.video_playing = playing;
+                self.video_phase_driven_playback = playing;
                 self.video_play_last_tick = playing.then(Instant::now);
             }
         }
@@ -2487,7 +2490,9 @@ impl PhaseInstallerApp {
             .video_last_sync_sent
             .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(100));
         if should_send {
-            self.send_video_timeline("sync.timeline");
+            if !self.video_phase_driven_playback {
+                self.send_video_timeline("sync.timeline");
+            }
             self.video_last_sync_sent = Some(now);
         }
         ctx.request_repaint_after(Duration::from_millis(33));
@@ -2630,12 +2635,14 @@ impl PhaseInstallerApp {
     }
 
     fn seek_video_sync(&mut self) {
+        self.video_phase_driven_playback = false;
         self.video_position_seconds = parse_f64_or(&self.video_position_input, 0.0).max(0.0);
         self.video_position_input = format_seconds(self.video_position_seconds);
         self.send_video_timeline("sync.seek");
     }
 
     fn set_video_playing(&mut self, playing: bool) {
+        self.video_phase_driven_playback = false;
         self.video_position_seconds =
             parse_f64_or(&self.video_position_input, self.video_position_seconds).max(0.0);
         self.video_position_input = format_seconds(self.video_position_seconds);
