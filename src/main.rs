@@ -1,7 +1,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod companion;
 mod detector;
 mod diagnostics;
+mod discord_presence;
 mod motion;
 mod verification;
 mod video_reference;
@@ -348,6 +350,10 @@ struct PhaseInstallerApp {
     video_bridge_listening: bool,
     video_bridge_connected: bool,
     video_bridge_status: String,
+    companion_bridge: companion::CompanionBridge,
+    companion_bridge_listening: bool,
+    companion_bridge_connected: bool,
+    companion_bridge_status: String,
     video_source: String,
     video_title: String,
     video_duration_seconds: String,
@@ -401,6 +407,8 @@ impl PhaseInstallerApp {
         let video_bridge_config = video_reference::BridgeConfig::default_local();
         let video_bridge =
             video_reference::VideoReferenceBridge::start(video_bridge_config.clone());
+        let companion_bridge_config = companion::CompanionConfig::default_local();
+        let companion_bridge = companion::CompanionBridge::start(companion_bridge_config.clone());
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let (tray_tx, tray_rx) = mpsc::channel();
 
@@ -482,6 +490,10 @@ impl PhaseInstallerApp {
             video_bridge_listening: false,
             video_bridge_connected: false,
             video_bridge_status: "Starting video bridge.".to_owned(),
+            companion_bridge,
+            companion_bridge_listening: false,
+            companion_bridge_connected: false,
+            companion_bridge_status: "Starting companion bridge.".to_owned(),
             video_source: String::new(),
             video_title: String::new(),
             video_duration_seconds: String::new(),
@@ -593,6 +605,7 @@ impl PhaseInstallerApp {
         self.poll_theme_preview_fetches(ctx);
         self.poll_tray(ctx);
         self.poll_video_bridge(ctx);
+        self.poll_companion_bridge(ctx);
         self.tick_video_playback(ctx);
 
         let Some(started_at) = self.phase_started_at else {
@@ -2368,6 +2381,80 @@ impl PhaseInstallerApp {
         }
     }
 
+    fn poll_companion_bridge(&mut self, ctx: &Context) {
+        for event in self.companion_bridge.poll() {
+            match event {
+                companion::CompanionEvent::Listening { url } => {
+                    self.companion_bridge_listening = true;
+                    self.companion_bridge_status = format!("Listening on {url}");
+                    self.log(phase::green(), "Phase Companion bridge is listening.");
+                }
+                companion::CompanionEvent::ClientConnected => {
+                    self.companion_bridge_connected = true;
+                    self.companion_bridge_status =
+                        "Studio connected to companion bridge.".to_owned();
+                    self.log(phase::green(), "Studio connected to companion bridge.");
+                }
+                companion::CompanionEvent::ClientDisconnected => {
+                    self.companion_bridge_connected = false;
+                    self.companion_bridge_status =
+                        "Studio disconnected from companion bridge.".to_owned();
+                    self.log(
+                        phase::warning(),
+                        "Studio disconnected from companion bridge.",
+                    );
+                }
+                companion::CompanionEvent::PacketReceived(packet) => {
+                    self.handle_companion_packet(packet);
+                }
+                companion::CompanionEvent::PacketSent { op } => {
+                    self.companion_bridge_status = format!("Sent {op} to Studio.");
+                }
+                companion::CompanionEvent::SendFailed { op, message } => {
+                    self.companion_bridge_status = format!("{op} failed: {message}");
+                    self.log(phase::warning(), self.companion_bridge_status.clone());
+                }
+                companion::CompanionEvent::Error(error) => {
+                    self.companion_bridge_status = error.clone();
+                    self.log(phase::red(), error);
+                }
+                companion::CompanionEvent::Stopped => {
+                    self.companion_bridge_listening = false;
+                    self.companion_bridge_connected = false;
+                    self.companion_bridge_status = "Companion bridge stopped.".to_owned();
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn handle_companion_packet(&mut self, packet: companion::CompanionPacket) {
+        let payload = packet.payload;
+        match packet.op.as_str() {
+            "hello" => {
+                self.companion_bridge_status = "Studio hello received.".to_owned();
+            }
+            "ping" => {
+                self.companion_bridge_status = "Ping received from Studio.".to_owned();
+            }
+            "discord_presence.update" => {
+                self.companion_bridge_status = "Discord Presence update received.".to_owned();
+            }
+            "discord_presence.clear" => {
+                self.companion_bridge_status = "Discord Presence cleared.".to_owned();
+            }
+            "error" => {
+                let message = payload
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Studio reported a companion bridge error.");
+                self.companion_bridge_status = message.to_owned();
+                self.log(phase::red(), message);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_video_packet(&mut self, packet: video_reference::VideoPacket) {
         let payload = video_reference::packet_payload(&packet);
         match packet.op.as_str() {
@@ -3127,6 +3214,7 @@ impl eframe::App for PhaseInstallerApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.video_bridge.stop();
+        self.companion_bridge.stop();
         self.cleanup_tray();
     }
 
