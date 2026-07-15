@@ -1,6 +1,6 @@
 [package]
 name = "phase-updater"
-version = "0.20.7"
+version = "0.20.8"
 edition = "2024"
 description = "Native companion app for the Phase Animator Roblox Studio plugin."
 license = "MIT"
@@ -24,7 +24,6 @@ discord-rich-presence = "1.1.0"
 eframe = { version = "0.27", default-features = true }
 egui_extras = "0.27"
 image = { version = "0.24", default-features = false, features = ["png"] }
-notify-rust = "4.11"
 open = "5.3"
 rfd = "0.14"
 raw-window-handle = "0.6"

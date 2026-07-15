@@ -10,7 +10,7 @@ mod video_reference;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "windows")]
@@ -43,14 +43,24 @@ const APP_WIDTH: f32 = 450.0;
 // shrink to fit instead of clipping.
 const MAX_CONTENT_WIDTH: f32 = 560.0;
 const MIN_CONTENT_WIDTH: f32 = 296.0;
+const PAGE_H_INSET: f32 = 20.0;
+const PAGE_BOTTOM_INSET: f32 = 16.0;
+const SCROLLBAR_GUTTER: f32 = 12.0;
+const BODY_RIGHT_INSET: f32 = 8.0;
 const CARD_H_MARGIN: f32 = 14.0;
 const THEME_ROW_MARGIN: f32 = 12.0;
 const TRAY_PANEL_WIDTH: f32 = 302.0;
-const TRAY_PANEL_HEIGHT: f32 = 286.0;
+const TRAY_PANEL_HEIGHT: f32 = 326.0;
+const TRAY_CLOSE_DURATION: Duration = Duration::from_millis(180);
+const THEME_PALETTE_TRANSITION_SECS: f32 = 1.25;
+const THEME_BACKGROUND_TRANSITION_SECS: f32 = 1.0;
+const TOAST_WIDTH: f32 = 360.0;
+const TOAST_HEIGHT: f32 = 104.0;
+const TOAST_LIFETIME: Duration = Duration::from_secs(5);
 const TRAY_VIEWPORT_KEY: &str = "phase-tray-controls";
 const DIAGNOSTICS_VIEWPORT_KEY: &str = "phase-connection-diagnostics";
+const NOTIFICATION_VIEWPORT_KEY: &str = "phase-notification";
 const PARKED_WINDOW_POS: f32 = -32_000.0;
-const PARKED_WINDOW_SIZE: f32 = 1.0;
 #[cfg(target_os = "windows")]
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -78,6 +88,11 @@ fn card_inner() -> f32 {
     (content_w() - CARD_H_MARGIN * 2.0).max(1.0)
 }
 
+fn responsive_content_width(available_width: f32) -> f32 {
+    let usable_width = (available_width - SCROLLBAR_GUTTER - BODY_RIGHT_INSET).max(1.0);
+    usable_width.clamp(MIN_CONTENT_WIDTH.min(usable_width), MAX_CONTENT_WIDTH)
+}
+
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|arg| arg == "--smoke-test") {
         if run_smoke_test().is_err() {
@@ -102,6 +117,7 @@ fn main() -> eframe::Result<()> {
             .with_title(APP_NAME)
             .with_icon(load_window_icon()),
         persist_window: false,
+        vsync: true,
         ..Default::default()
     };
 
@@ -202,6 +218,29 @@ struct ThemePreviewFetchResult {
     image: Result<ColorImage, String>,
 }
 
+#[derive(Clone)]
+struct ThemeTransition {
+    from: phase::Palette,
+    to: phase::Palette,
+    started_at: Instant,
+    title: String,
+}
+
+#[derive(Clone, Copy)]
+enum NotificationTone {
+    Info,
+    Success,
+}
+
+#[derive(Clone)]
+struct PhaseNotification {
+    title: String,
+    body: String,
+    tone: NotificationTone,
+    created_at: Instant,
+    closing_started: Option<Instant>,
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThemeSelection {
@@ -280,7 +319,9 @@ struct PhaseInstallerApp {
     avatar_tx: Sender<AvatarFetchResult>,
     avatar_rx: Receiver<AvatarFetchResult>,
     theme_background: Option<TextureHandle>,
+    theme_outgoing_background: Option<TextureHandle>,
     theme_background_key: Option<String>,
+    theme_background_fade_started: Option<Instant>,
     theme_background_tx: Sender<ThemeBackgroundFetchResult>,
     theme_background_rx: Receiver<ThemeBackgroundFetchResult>,
     theme_preview_tx: Sender<ThemePreviewFetchResult>,
@@ -289,6 +330,7 @@ struct PhaseInstallerApp {
     theme_preview_loading: HashSet<String>,
     candidates: Vec<PluginFolderCandidate>,
     selected_folder: Option<PathBuf>,
+    folder_picker_open: bool,
     release: Option<verification::VersionResponse>,
     local_release_current: bool,
     release_error: Option<String>,
@@ -308,6 +350,8 @@ struct PhaseInstallerApp {
     theme_assets: Vec<verification::PhaseThemeAsset>,
     theme_fetch_rx: Option<Receiver<Result<Vec<verification::PhaseThemeAsset>, String>>>,
     theme_apply_rx: Option<Receiver<Result<ThemeSelection, String>>>,
+    theme_applying_asset_id: Option<String>,
+    theme_transition: Option<ThemeTransition>,
     theme_error: Option<String>,
     diagnostics_rx: Option<Receiver<diagnostics::DiagnosticReport>>,
     diagnostics_report: Option<diagnostics::DiagnosticReport>,
@@ -373,6 +417,7 @@ struct PhaseInstallerApp {
     video_last_reference_status: String,
     phase: InstallPhase,
     active_tab: ViewTab,
+    reset_body_scroll: bool,
     progress: f32,
     phase_started_at: Option<Instant>,
     activity: Vec<ActivityLine>,
@@ -389,10 +434,16 @@ struct PhaseInstallerApp {
     hidden_to_tray: bool,
     tray_notice_shown: bool,
     tray_panel_open: bool,
+    tray_panel_closing: bool,
+    tray_panel_opened_at: Option<Instant>,
+    tray_panel_close_started: Option<Instant>,
+    tray_panel_had_focus: bool,
     tray_panel_pos: Pos2,
     main_window_pos: Option<Pos2>,
     tray_anim_nonce: u64,
     dialog_anim_nonce: u64,
+    notifications: VecDeque<PhaseNotification>,
+    notification_window_styled: bool,
 }
 
 impl PhaseInstallerApp {
@@ -421,7 +472,9 @@ impl PhaseInstallerApp {
             avatar_tx,
             avatar_rx,
             theme_background: None,
+            theme_outgoing_background: None,
             theme_background_key: None,
+            theme_background_fade_started: None,
             theme_background_tx,
             theme_background_rx,
             theme_preview_tx,
@@ -430,6 +483,7 @@ impl PhaseInstallerApp {
             theme_preview_loading: HashSet::new(),
             candidates,
             selected_folder,
+            folder_picker_open: false,
             release: None,
             local_release_current: false,
             release_error: None,
@@ -449,6 +503,8 @@ impl PhaseInstallerApp {
             theme_assets: Vec::new(),
             theme_fetch_rx: None,
             theme_apply_rx: None,
+            theme_applying_asset_id: None,
+            theme_transition: None,
             theme_error: None,
             diagnostics_rx: None,
             diagnostics_report: None,
@@ -513,6 +569,7 @@ impl PhaseInstallerApp {
             video_last_reference_status: "No reference sent.".to_owned(),
             phase: InstallPhase::Idle,
             active_tab: ViewTab::Install,
+            reset_body_scroll: false,
             progress: 0.0,
             phase_started_at: None,
             activity: Vec::new(),
@@ -528,10 +585,16 @@ impl PhaseInstallerApp {
             hidden_to_tray: false,
             tray_notice_shown: false,
             tray_panel_open: false,
+            tray_panel_closing: false,
+            tray_panel_opened_at: None,
+            tray_panel_close_started: None,
+            tray_panel_had_focus: false,
             tray_panel_pos: Pos2::new(64.0, 64.0),
             main_window_pos: None,
             tray_anim_nonce: 0,
             dialog_anim_nonce: 0,
+            notifications: VecDeque::new(),
+            notification_window_styled: false,
         };
 
         app.load_cached_accounts(&cc.egui_ctx);
@@ -574,6 +637,7 @@ impl PhaseInstallerApp {
         let direction = tab.index() as f32 - self.active_tab.index() as f32;
         self.tab_page_motion.set_target(tab, direction);
         self.active_tab = tab;
+        self.reset_body_scroll = true;
     }
 
     fn refresh_local_release_status(&mut self) {
@@ -602,11 +666,28 @@ impl PhaseInstallerApp {
         self.ensure_avatar_fetches(ctx);
         self.poll_theme_background_fetches(ctx);
         self.ensure_theme_background_fetch(ctx);
+        self.tick_theme_transition(ctx);
         self.poll_theme_preview_fetches(ctx);
         self.poll_tray(ctx);
         self.poll_video_bridge(ctx);
         self.poll_companion_bridge(ctx);
         self.tick_video_playback(ctx);
+        self.finish_tray_close(ctx);
+
+        if self.hidden_to_tray && self.tray_panel_open && !self.tray_panel_closing {
+            match ctx.input(|input| input.viewport().focused) {
+                Some(true) => self.tray_panel_had_focus = true,
+                Some(false)
+                    if self.tray_panel_had_focus
+                        && self.tray_panel_opened_at.is_some_and(|opened| {
+                            opened.elapsed() > Duration::from_millis(250)
+                        }) =>
+                {
+                    self.close_tray_popup(ctx);
+                }
+                _ => {}
+            }
+        }
 
         let Some(started_at) = self.phase_started_at else {
             return;
@@ -665,7 +746,11 @@ impl PhaseInstallerApp {
                 }
                 TraySignal::ShowPanel { x, y } => {
                     log_tray_debug(format!("app received show panel at {x:.0},{y:.0}"));
-                    self.show_tray_panel(ctx, x, y);
+                    if self.tray_panel_open && !self.tray_panel_closing {
+                        self.close_tray_popup(ctx);
+                    } else {
+                        self.show_tray_panel(ctx, x, y);
+                    }
                 }
             }
         }
@@ -687,7 +772,10 @@ impl PhaseInstallerApp {
 
     fn show_main_window(&mut self, ctx: &Context) {
         self.hidden_to_tray = false;
-        self.close_tray_popup(ctx);
+        self.tray_panel_open = false;
+        self.tray_panel_closing = false;
+        self.tray_panel_close_started = None;
+        ctx.send_viewport_cmd_to(tray_viewport_id(), egui::ViewportCommand::Close);
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
             egui::ViewportCommand::MousePassthrough(false),
@@ -733,6 +821,10 @@ impl PhaseInstallerApp {
             self.tray_anim_nonce = self.tray_anim_nonce.wrapping_add(1);
         }
         self.tray_panel_open = true;
+        self.tray_panel_closing = false;
+        self.tray_panel_opened_at = Some(Instant::now());
+        self.tray_panel_close_started = None;
+        self.tray_panel_had_focus = false;
         self.close_dialog_open = false;
 
         let panel_x = (x - TRAY_PANEL_WIDTH + 14.0).max(8.0);
@@ -747,7 +839,26 @@ impl PhaseInstallerApp {
     }
 
     fn close_tray_popup(&mut self, ctx: &Context) {
+        if !self.tray_panel_open || self.tray_panel_closing {
+            return;
+        }
+        self.tray_panel_closing = true;
+        self.tray_panel_close_started = Some(Instant::now());
+        ctx.request_repaint();
+    }
+
+    fn finish_tray_close(&mut self, ctx: &Context) {
+        if !self.tray_panel_closing
+            || !self
+                .tray_panel_close_started
+                .is_some_and(|started| started.elapsed() >= TRAY_CLOSE_DURATION)
+        {
+            return;
+        }
+
         self.tray_panel_open = false;
+        self.tray_panel_closing = false;
+        self.tray_panel_close_started = None;
         if self.hidden_to_tray {
             self.park_root_for_tray(ctx);
         } else {
@@ -760,12 +871,17 @@ impl PhaseInstallerApp {
         self.remember_main_window_position(ctx);
         self.hidden_to_tray = true;
         self.close_dialog_open = false;
-        self.close_tray_popup(ctx);
+        self.tray_panel_open = false;
+        self.tray_panel_closing = false;
+        self.tray_panel_close_started = None;
+        self.park_root_for_tray(ctx);
         if !self.tray_notice_shown {
             self.tray_notice_shown = true;
-            show_system_notification(
+            self.push_notification(
+                ctx,
                 "Phase Animator",
                 "Still running in the tray. Right-click for install actions.",
+                NotificationTone::Info,
             );
         }
     }
@@ -777,7 +893,7 @@ impl PhaseInstallerApp {
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
-            egui::ViewportCommand::Transparent(false),
+            egui::ViewportCommand::Transparent(true),
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
@@ -789,7 +905,7 @@ impl PhaseInstallerApp {
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
-            egui::ViewportCommand::MinInnerSize(Vec2::new(TRAY_PANEL_WIDTH, 180.0)),
+            egui::ViewportCommand::MinInnerSize(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)),
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
@@ -822,11 +938,11 @@ impl PhaseInstallerApp {
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
-            egui::ViewportCommand::MinInnerSize(Vec2::splat(PARKED_WINDOW_SIZE)),
+            egui::ViewportCommand::MinInnerSize(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)),
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
-            egui::ViewportCommand::InnerSize(Vec2::splat(PARKED_WINDOW_SIZE)),
+            egui::ViewportCommand::InnerSize(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)),
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
@@ -1048,7 +1164,12 @@ impl PhaseInstallerApp {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or("new version");
                 self.log(phase::green(), format!("Update available: {version}."));
-                show_update_notification(version);
+                self.push_notification(
+                    ctx,
+                    "Phase Animator",
+                    &format!("Update available: {version}"),
+                    NotificationTone::Success,
+                );
                 self.begin_version_check(Some(ctx.clone()));
             }
             Err(_) => {}
@@ -1872,9 +1993,11 @@ impl PhaseInstallerApp {
                     phase::blue(),
                     format!("Installer update {} is available.", update.version),
                 );
-                show_system_notification(
+                self.push_notification(
+                    ctx,
                     "Phase Companion",
                     &format!("Installer update {} is available", update.version),
+                    NotificationTone::Info,
                 );
                 self.app_update = Some(update);
                 self.app_update_error = None;
@@ -1987,6 +2110,7 @@ impl PhaseInstallerApp {
         let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
         let (tx, rx) = mpsc::channel();
         self.theme_apply_rx = Some(rx);
+        self.theme_applying_asset_id = Some(asset.id.clone());
         self.theme_error = None;
         self.log(phase::blue(), format!("Applying {} theme.", asset.title));
         let repaint = ctx.clone();
@@ -2021,21 +2145,24 @@ impl PhaseInstallerApp {
         match result {
             Ok(selection) => {
                 if let Some(palette) = phase::palette_from_theme_code(&selection.theme_code) {
-                    phase::set_palette(palette);
-                    configure_style(ctx);
-                    self.theme_background = None;
+                    self.theme_transition = Some(ThemeTransition {
+                        from: phase::snapshot(),
+                        to: palette,
+                        started_at: Instant::now(),
+                        title: selection.title.clone(),
+                    });
+                    self.theme_outgoing_background = self.theme_background.take();
                     self.theme_background_key = None;
+                    self.theme_background_fade_started = None;
                     self.selected_theme = Some(selection.clone());
                     self.save_account_cache();
-                    self.log(
-                        phase::green(),
-                        format!("Theme applied: {}", selection.title),
-                    );
                 } else {
+                    self.theme_applying_asset_id = None;
                     self.theme_error = Some("Theme code did not include enough colors.".to_owned());
                 }
             }
             Err(error) => {
+                self.theme_applying_asset_id = None;
                 self.theme_error = Some(error.clone());
                 self.log(phase::red(), error);
             }
@@ -2043,12 +2170,49 @@ impl PhaseInstallerApp {
         ctx.request_repaint();
     }
 
+    fn tick_theme_transition(&mut self, ctx: &Context) {
+        if let Some(transition) = self.theme_transition.clone() {
+            let linear = (transition.started_at.elapsed().as_secs_f32()
+                / THEME_PALETTE_TRANSITION_SECS)
+                .clamp(0.0, 1.0);
+            let blend = linear * linear * (3.0 - 2.0 * linear);
+            phase::set_palette(phase::blend(transition.from, transition.to, blend));
+            configure_style(ctx);
+            // Continuous repaint is paced by eframe's vsync, so 120/144/240 Hz
+            // displays receive native-refresh animation instead of a 60 FPS cap.
+            ctx.request_repaint();
+
+            if linear >= 1.0 {
+                phase::set_palette(transition.to);
+                configure_style(ctx);
+                self.theme_transition = None;
+                self.theme_applying_asset_id = None;
+                self.log(
+                    phase::green(),
+                    format!("Theme applied: {}", transition.title),
+                );
+            }
+        }
+
+        if let Some(started) = self.theme_background_fade_started {
+            ctx.request_repaint();
+            if started.elapsed().as_secs_f32() >= THEME_BACKGROUND_TRANSITION_SECS {
+                self.theme_outgoing_background = None;
+                self.theme_background_fade_started = None;
+            }
+        }
+    }
+
     fn reset_theme(&mut self, ctx: &Context) {
         phase::reset_palette();
         configure_style(ctx);
         self.selected_theme = None;
         self.theme_background = None;
+        self.theme_outgoing_background = None;
         self.theme_background_key = None;
+        self.theme_background_fade_started = None;
+        self.theme_transition = None;
+        self.theme_applying_asset_id = None;
         self.save_account_cache();
         self.log(phase::green(), "Restored default Phase theme.");
     }
@@ -2255,6 +2419,7 @@ impl PhaseInstallerApp {
                 image,
                 TextureOptions::LINEAR,
             ));
+            self.theme_background_fade_started = Some(Instant::now());
             ctx.request_repaint();
         }
     }
@@ -3071,18 +3236,6 @@ impl TrayController {
             let signal = match event {
                 TrayIconEvent::Click {
                     button: MouseButton::Right,
-                    button_state: MouseButtonState::Down,
-                    position,
-                    ..
-                } => {
-                    log_tray_debug("right down");
-                    Some(TraySignal::ShowPanel {
-                        x: position.x as f32,
-                        y: position.y as f32,
-                    })
-                }
-                TrayIconEvent::Click {
-                    button: MouseButton::Right,
                     button_state: MouseButtonState::Up,
                     position,
                     ..
@@ -3096,14 +3249,11 @@ impl TrayController {
                 TrayIconEvent::Click {
                     button: MouseButton::Left,
                     button_state: MouseButtonState::Up,
-                    position,
                     ..
                 } => {
                     log_tray_debug("left up");
-                    Some(TraySignal::ShowPanel {
-                        x: position.x as f32,
-                        y: position.y as f32,
-                    })
+                    reveal_window_for_tray_signal();
+                    Some(TraySignal::ShowWindow)
                 }
                 TrayIconEvent::DoubleClick {
                     button: MouseButton::Left,
@@ -3139,18 +3289,14 @@ impl Drop for TrayController {
 
 impl eframe::App for PhaseInstallerApp {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
-        apply_windows_title_bar(frame);
+        apply_windows_title_bar(frame, self.hidden_to_tray && self.tray_panel_open);
         self.remember_main_window_position(ctx);
         self.handle_close_request(ctx);
         self.tick(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(if self.hidden_to_tray {
-                if self.tray_panel_open {
-                    phase::background()
-                } else {
-                    Color32::TRANSPARENT
-                }
+                Color32::TRANSPARENT
             } else {
                 phase::background()
             }))
@@ -3165,36 +3311,58 @@ impl eframe::App for PhaseInstallerApp {
                 }
 
                 self.paint_theme_background(ui);
-                // Responsive column: track the window width, reserve a small
-                // scrollbar gutter, then clamp to a comfortable reading range so
-                // the layout never sprawls on wide windows or clips on narrow.
-                let column =
-                    (ui.available_width() - 12.0).clamp(MIN_CONTENT_WIDTH, MAX_CONTENT_WIDTH);
-                set_content_width(column);
-                ui.vertical_centered(|ui| {
-                    ui.set_width(content_w() + 12.0);
-                    ui.add_space(SP_6);
-                    self.identity_strip(ui);
-                    self.title_block(ui);
-                    ui.add_space(SP_5);
-
-                    // Underline tab selector
-                    self.draw_custom_tabs(ui);
-
-                    ui.add_space(SP_5);
-                    egui::ScrollArea::vertical()
-                        .id_source("phase-installer-body")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.vertical_centered(|ui| {
+                egui::Frame::none()
+                    .inner_margin(Margin::symmetric(PAGE_H_INSET, 0.0))
+                    .show(ui, |ui| {
+                        // The frame is the hard page boundary. Child panels and
+                        // scroll content cannot paint into either outer inset.
+                        let column = responsive_content_width(ui.available_width());
+                        set_content_width(column);
+                        ui.vertical_centered(|ui| {
+                            ui.set_width(content_w() + SCROLLBAR_GUTTER + BODY_RIGHT_INSET);
+                            ui.add_space(SP_6);
+                            ui.scope(|ui| {
                                 ui.set_width(content_w());
-                                self.current_tab(ui);
-                                ui.add_space(8.0);
-                                self.activity_block(ui);
+                                self.identity_strip(ui);
+                                self.title_block(ui);
+                                ui.add_space(SP_5);
+
+                                // Underline tab selector
+                                self.draw_custom_tabs(ui);
+                                ui.add_space(SP_5);
                             });
+
+                            egui::Frame::none()
+                                .inner_margin(Margin {
+                                    left: 0.0,
+                                    right: BODY_RIGHT_INSET,
+                                    top: 0.0,
+                                    bottom: 0.0,
+                                })
+                                .show(ui, |ui| {
+                                    let mut body_scroll = egui::ScrollArea::vertical()
+                                        .id_source("phase-installer-body")
+                                        .auto_shrink([false, false]);
+                                    if self.reset_body_scroll {
+                                        body_scroll = body_scroll.vertical_scroll_offset(0.0);
+                                    }
+                                    body_scroll.show(ui, |ui| {
+                                        ui.vertical_centered(|ui| {
+                                            ui.set_width(content_w());
+                                            self.current_tab(ui);
+                                            if self.active_tab == ViewTab::Install {
+                                                ui.add_space(8.0);
+                                                self.activity_block(ui);
+                                            }
+                                            ui.add_space(PAGE_BOTTOM_INSET);
+                                        });
+                                    });
+                                    self.reset_body_scroll = false;
+                                });
                         });
-                });
+                    });
             });
+        self.show_notification_viewport(ctx);
         if !self.hidden_to_tray {
             self.draw_close_dialog(ctx);
             self.show_tray_popup_viewport(ctx);
@@ -3224,6 +3392,105 @@ impl eframe::App for PhaseInstallerApp {
 }
 
 impl PhaseInstallerApp {
+    fn push_notification(
+        &mut self,
+        ctx: &Context,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        tone: NotificationTone,
+    ) {
+        if self.notifications.is_empty() {
+            self.notification_window_styled = false;
+        }
+        if self.notifications.len() >= 3 {
+            self.notifications.pop_back();
+        }
+        self.notifications.push_back(PhaseNotification {
+            title: title.into(),
+            body: body.into(),
+            tone,
+            created_at: Instant::now(),
+            closing_started: None,
+        });
+        ctx.request_repaint();
+    }
+
+    fn show_notification_viewport(&mut self, ctx: &Context) {
+        let Some(front) = self.notifications.front_mut() else {
+            return;
+        };
+        if front.closing_started.is_none() && front.created_at.elapsed() >= TOAST_LIFETIME {
+            front.closing_started = Some(Instant::now());
+        }
+        if front
+            .closing_started
+            .is_some_and(|started| started.elapsed() >= Duration::from_millis(180))
+        {
+            self.notifications.pop_front();
+            if let Some(next) = self.notifications.front_mut() {
+                next.created_at = Instant::now();
+                next.closing_started = None;
+            } else {
+                self.notification_window_styled = false;
+                ctx.send_viewport_cmd_to(notification_viewport_id(), egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        let notification = self.notifications.front().cloned().unwrap();
+        let monitor = ctx
+            .input(|input| input.viewport().monitor_size)
+            .unwrap_or(Vec2::new(1920.0, 1080.0));
+        let position = Pos2::new(
+            (monitor.x - TOAST_WIDTH - 18.0).max(8.0),
+            (monitor.y - TOAST_HEIGHT - 54.0).max(8.0),
+        );
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Phase notification")
+            .with_position(position)
+            .with_inner_size(Vec2::new(TOAST_WIDTH, TOAST_HEIGHT))
+            .with_min_inner_size(Vec2::new(TOAST_WIDTH, TOAST_HEIGHT))
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(false)
+            .with_visible(true);
+
+        ctx.show_viewport_immediate(notification_viewport_id(), builder, |toast_ctx, _class| {
+            if !self.notification_window_styled {
+                self.notification_window_styled = apply_notification_window_style();
+            }
+            if toast_ctx.input(|input| input.viewport().close_requested()) {
+                toast_ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if let Some(front) = self.notifications.front_mut() {
+                    front.closing_started.get_or_insert_with(Instant::now);
+                }
+            }
+
+            let open = (notification.created_at.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0);
+            let open = ease_out_cubic(open);
+            let close = notification
+                .closing_started
+                .map(|started| (started.elapsed().as_secs_f32() / 0.18).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+            let visibility = open * (1.0 - ease_out_cubic(close));
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
+                .show(toast_ctx, |ui| {
+                    if phase_notification_panel(ui, &notification, self.logo.as_ref(), visibility) {
+                        if let Some(front) = self.notifications.front_mut() {
+                            front.closing_started.get_or_insert_with(Instant::now);
+                        }
+                    }
+                });
+            toast_ctx.request_repaint();
+        });
+    }
+
     fn show_diagnostics_viewport(&mut self, ctx: &Context) {
         if !self.diagnostics_open {
             return;
@@ -3260,7 +3527,7 @@ impl PhaseInstallerApp {
     fn diagnostics_panel(&mut self, ui: &mut Ui) {
         ui.add_space(14.0);
         ui.vertical_centered(|ui| {
-            let panel_width = (ui.available_width() - 28.0).clamp(360.0, 560.0);
+            let panel_width = (ui.available_width() - 28.0).clamp(280.0, 560.0);
             ui.set_min_width(panel_width);
             ui.set_max_width(panel_width);
             ui.horizontal(|ui| {
@@ -3338,81 +3605,60 @@ impl PhaseInstallerApp {
                 }
             };
 
-            egui::Frame::none()
-                .fill(phase::surface())
-                .stroke(Stroke::new(1.0, phase::line()))
-                .rounding(Rounding::same(10.0))
-                .inner_margin(Margin::symmetric(14.0, 12.0))
-                .show(ui, |ui| {
-                    let width = (ui.available_width() - 28.0).max(260.0);
-                    ui.set_min_width(width);
-                    ui.set_max_width(width);
-                    ui.horizontal(|ui| {
-                        status_pill(ui, status_label, summary_color);
-                        ui.add_space(8.0);
-                        ui.add_sized(
-                            Vec2::new((width - 92.0).max(120.0), 18.0),
-                            egui::Label::new(
-                                RichText::new(&summary)
-                                    .font(FontId::proportional(13.0))
-                                    .color(phase::text_secondary()),
-                            )
-                            .wrap(false),
-                        );
-                    });
-                });
+            card_header(
+                ui,
+                MiniIcon::Search,
+                summary_color,
+                "Connection status",
+                &summary,
+                Some((status_label, summary_color)),
+            );
 
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let width = (ui.available_width() - 27.0) / 4.0;
-                ui.add_enabled_ui(!busy, |ui| {
-                    let label = if running { "Checking" } else { "Run Check" };
-                    if primary_button(ui, MiniIcon::Search, label, Vec2::new(width, 34.0)).clicked()
-                    {
-                        self.start_connection_diagnostics(ui.ctx());
-                    }
-                });
-                ui.add_enabled_ui(!busy, |ui| {
-                    if secondary_button(ui, MiniIcon::Gear, "Fix Assist", Vec2::new(width, 34.0))
-                        .clicked()
-                    {
-                        self.start_connection_fix(ui.ctx());
-                    }
-                });
-                ui.add_enabled_ui(!busy, |ui| {
-                    if secondary_button(ui, MiniIcon::Refresh, "Retry", Vec2::new(width, 34.0))
-                        .clicked()
-                    {
-                        self.start_connection_diagnostics(ui.ctx());
-                    }
-                });
-                ui.add_enabled_ui(
-                    self.diagnostics_report.is_some() || self.diagnostics_fix_report.is_some(),
-                    |ui| {
-                        let copy_label =
-                            if matches!(status, Some(diagnostics::DiagnosticStatus::Problem)) {
-                                "Copy Log"
-                            } else {
-                                "Copy"
-                            };
-                        if secondary_button(
-                            ui,
-                            MiniIcon::External,
-                            copy_label,
-                            Vec2::new(width, 34.0),
-                        )
-                        .clicked()
-                        {
-                            if let Some(report) = &self.diagnostics_fix_report {
-                                ui.output_mut(|output| output.copied_text = report.to_plain_text());
-                                self.log(phase::blue(), "Copied fix assistant log.");
-                            } else if let Some(report) = &self.diagnostics_report {
-                                ui.output_mut(|output| output.copied_text = report.to_plain_text());
-                                self.log(phase::blue(), "Copied diagnostic report.");
-                            }
+            action_grid(ui, 4, |ui, index, size| match index {
+                0 => {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        let label = if running { "Checking" } else { "Run Check" };
+                        if primary_button(ui, MiniIcon::Search, label, size).clicked() {
+                            self.start_connection_diagnostics(ui.ctx());
                         }
-                    },
-                );
+                    });
+                }
+                1 => {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if secondary_button(ui, MiniIcon::Gear, "Fix Assist", size).clicked() {
+                            self.start_connection_fix(ui.ctx());
+                        }
+                    });
+                }
+                2 => {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if secondary_button(ui, MiniIcon::Refresh, "Retry", size).clicked() {
+                            self.start_connection_diagnostics(ui.ctx());
+                        }
+                    });
+                }
+                _ => {
+                    ui.add_enabled_ui(
+                        self.diagnostics_report.is_some() || self.diagnostics_fix_report.is_some(),
+                        |ui| {
+                            if secondary_button(ui, MiniIcon::External, "Copy Log", size).clicked()
+                            {
+                                if let Some(report) = &self.diagnostics_fix_report {
+                                    ui.output_mut(|output| {
+                                        output.copied_text = report.to_plain_text()
+                                    });
+                                    self.log(phase::blue(), "Copied fix assistant log.");
+                                } else if let Some(report) = &self.diagnostics_report {
+                                    ui.output_mut(|output| {
+                                        output.copied_text = report.to_plain_text()
+                                    });
+                                    self.log(phase::blue(), "Copied diagnostic report.");
+                                }
+                            }
+                        },
+                    );
+                }
             });
 
             ui.add_space(12.0);
@@ -3467,8 +3713,8 @@ impl PhaseInstallerApp {
             .with_title("Phase Animator Controls")
             .with_position(self.tray_panel_pos)
             .with_inner_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT))
-            .with_min_inner_size(Vec2::new(TRAY_PANEL_WIDTH, 180.0))
-            .with_transparent(false)
+            .with_min_inner_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT))
+            .with_transparent(true)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
@@ -3478,6 +3724,7 @@ impl PhaseInstallerApp {
 
         ctx.show_viewport_immediate(tray_viewport_id(), builder, |tray_ctx, _class| {
             if tray_ctx.input(|input| input.viewport().close_requested()) {
+                tray_ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.close_tray_popup(tray_ctx);
                 return;
             }
@@ -3487,8 +3734,23 @@ impl PhaseInstallerApp {
                 return;
             }
 
+            if !self.tray_panel_closing {
+                match tray_ctx.input(|input| input.viewport().focused) {
+                    Some(true) => self.tray_panel_had_focus = true,
+                    Some(false)
+                        if self.tray_panel_had_focus
+                            && self.tray_panel_opened_at.is_some_and(|opened| {
+                                opened.elapsed() > Duration::from_millis(250)
+                            }) =>
+                    {
+                        self.close_tray_popup(tray_ctx);
+                    }
+                    _ => {}
+                }
+            }
+
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(phase::background()))
+                .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
                 .show(tray_ctx, |ui| {
                     self.tray_panel(ui);
                 });
@@ -3500,27 +3762,27 @@ impl PhaseInstallerApp {
 
         let raw_t = ui.ctx().animate_bool_with_time(
             egui::Id::new(("phase-tray-pop", self.tray_anim_nonce)),
-            true,
-            0.16,
+            !self.tray_panel_closing,
+            TRAY_CLOSE_DURATION.as_secs_f32(),
         );
         let fade_t = ease_out_cubic(raw_t).clamp(0.0, 1.0);
-        let panel_width = TRAY_PANEL_WIDTH;
-        let panel_height = TRAY_PANEL_HEIGHT;
+        if self.tray_panel_closing || fade_t < 0.999 {
+            ui.ctx().request_repaint();
+        }
+        ui.add_space((1.0 - fade_t) * 8.0);
 
-        ui.horizontal_centered(|ui| {
+        ui.scope(|ui| {
+            ui.set_opacity(fade_t);
             egui::Frame::none()
-                .fill(color_with_alpha(phase::background(), fade_t))
-                .stroke(Stroke::new(1.0, color_with_alpha(phase::line(), fade_t)))
-                .rounding(Rounding::same(14.0))
-                .inner_margin(Margin::same(10.0))
+                .fill(phase::background())
+                .stroke(Stroke::new(1.0, phase::line()))
+                .rounding(Rounding::same(10.0))
+                .outer_margin(Margin::same(1.0))
+                .inner_margin(Margin::same(12.0))
                 .show(ui, |ui| {
-                    let content_width = (panel_width - 20.0).max(180.0);
+                    let content_width = TRAY_PANEL_WIDTH - 26.0;
                     ui.set_width(content_width);
-                    egui::ScrollArea::vertical()
-                        .id_source("phase-tray-panel-scroll")
-                        .max_height(panel_height - 20.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| self.tray_panel_contents(ui, content_width));
+                    self.tray_panel_contents(ui, content_width);
                 });
         });
     }
@@ -3548,29 +3810,18 @@ impl PhaseInstallerApp {
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if secondary_button(ui, MiniIcon::Download, "Hide", Vec2::new(78.0, 30.0))
-                        .clicked()
-                    {
+                    if tray_close_button(ui).clicked() {
                         self.close_tray_popup(ui.ctx());
                     }
                 });
             });
 
             ui.add_space(12.0);
-            egui::Frame::none()
-                .fill(phase::surface())
-                .stroke(Stroke::new(1.0, phase::line()))
-                .rounding(Rounding::same(8.0))
-                .inner_margin(Margin::same(10.0))
-                .show(ui, |ui| {
-                    let info_width = (content_width - 10.0).max(160.0);
-                    ui.set_width(info_width);
-                    compact_info_row(ui, "Status", phase_text(self.phase), info_width);
-                    compact_info_row(ui, "Account", &self.account_summary(), info_width);
-                    compact_info_row(ui, "Latest", &self.release_summary(), info_width);
-                });
+            compact_info_row(ui, "Status", phase_text(self.phase), content_width);
+            compact_info_row(ui, "Account", &self.account_summary(), content_width);
+            compact_info_row(ui, "Latest", &self.release_summary(), content_width);
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             let action_width = content_width;
             if primary_button(
                 ui,
@@ -3583,58 +3834,37 @@ impl PhaseInstallerApp {
                 self.show_main_window(ui.ctx());
             }
 
-            if secondary_button(
-                ui,
-                MiniIcon::Refresh,
-                "Check Updates",
-                Vec2::new(action_width, 34.0),
-            )
-            .clicked()
-                && !self.is_busy()
-            {
-                self.select_tab(ViewTab::Install);
-                self.start_check();
-            }
-
-            ui.add_enabled_ui(self.phase == InstallPhase::Ready && !self.is_busy(), |ui| {
-                let label = if self.has_local_phase_install() {
-                    "Install Update"
-                } else {
-                    "Install Plugin"
-                };
-                if secondary_button(ui, MiniIcon::Bolt, label, Vec2::new(action_width, 34.0))
-                    .clicked()
-                {
-                    self.select_tab(ViewTab::Install);
-                    self.start_install();
-                }
-            });
-
-            ui.add_enabled_ui(self.selected_folder.is_some(), |ui| {
-                if secondary_button(
-                    ui,
-                    MiniIcon::Folder,
-                    "Open Plugin Folder",
-                    Vec2::new(action_width, 34.0),
-                )
-                .clicked()
-                {
-                    self.open_selected_folder();
-                }
-            });
-
-            if secondary_button(
-                ui,
-                MiniIcon::External,
-                "Quit",
-                Vec2::new(action_width, 34.0),
-            )
-            .clicked()
-            {
-                self.request_quit(ui.ctx());
-            }
-
             ui.add_space(8.0);
+            action_grid(ui, 4, |ui, index, size| match index {
+                0 => {
+                    ui.add_enabled_ui(!self.is_busy(), |ui| {
+                        if secondary_button(ui, MiniIcon::Refresh, "Check", size).clicked() {
+                            self.select_tab(ViewTab::Install);
+                            self.start_check();
+                        }
+                    });
+                }
+                1 => {
+                    ui.add_enabled_ui(self.phase == InstallPhase::Ready && !self.is_busy(), |ui| {
+                        if secondary_button(ui, MiniIcon::Bolt, "Install", size).clicked() {
+                            self.select_tab(ViewTab::Install);
+                            self.start_install();
+                        }
+                    });
+                }
+                2 => {
+                    ui.add_enabled_ui(self.selected_folder.is_some(), |ui| {
+                        if secondary_button(ui, MiniIcon::Folder, "Folder", size).clicked() {
+                            self.open_selected_folder();
+                        }
+                    });
+                }
+                _ => {
+                    if secondary_button(ui, MiniIcon::External, "Quit", size).clicked() {
+                        self.request_quit(ui.ctx());
+                    }
+                }
+            });
         });
     }
 
@@ -3747,18 +3977,33 @@ impl PhaseInstallerApp {
         let bottom = lerp_color(phase::background(), Color32::BLACK, 0.12);
         vertical_gradient(painter, rect, top, bottom);
 
-        // Optional theme image, kept as a faint texture behind a soft scrim so it
-        // reads as atmosphere rather than a photo competing with the content.
+        // Keep the outgoing image alive until the incoming texture is loaded,
+        // then crossfade them rather than flashing through an empty canvas.
+        let image_blend = self
+            .theme_background_fade_started
+            .map(|started| {
+                let t = (started.elapsed().as_secs_f32() / THEME_BACKGROUND_TRANSITION_SECS)
+                    .clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            })
+            .unwrap_or(if self.theme_background.is_some() {
+                1.0
+            } else {
+                0.0
+            });
+        if let Some(texture) = &self.theme_outgoing_background {
+            paint_theme_texture(painter, rect, texture, self.theme_background_mode, 1.0);
+        }
         if let Some(texture) = &self.theme_background {
-            let texture_size = texture.size_vec2();
-            let (image_rect, uv_rect) =
-                theme_background_layout(rect, texture_size, self.theme_background_mode);
-            painter.image(
-                texture.id(),
-                image_rect,
-                uv_rect,
-                Color32::from_rgba_premultiplied(255, 255, 255, 30),
+            paint_theme_texture(
+                painter,
+                rect,
+                texture,
+                self.theme_background_mode,
+                image_blend,
             );
+        }
+        if self.theme_background.is_some() || self.theme_outgoing_background.is_some() {
             painter.rect_filled(
                 rect,
                 Rounding::ZERO,
@@ -3766,7 +4011,7 @@ impl PhaseInstallerApp {
                     phase::background().r(),
                     phase::background().g(),
                     phase::background().b(),
-                    150,
+                    242,
                 ),
             );
         }
@@ -4070,6 +4315,7 @@ impl PhaseInstallerApp {
         let row_layout =
             egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Center);
         ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
             if let Some(name) = phase_name {
                 identity_card(
                     ui,
@@ -4129,12 +4375,13 @@ impl PhaseInstallerApp {
 
         ui.add_space(SP_3);
         let phase_lbl = phase_text(self.phase);
-        let pills_w =
-            status_pill_width(ui, phase_lbl) + SP_2 + status_pill_width(ui, "Default channel");
-        centered_row(ui, pills_w, 26.0, |ui| {
-            status_pill(ui, phase_lbl, phase_color(self.phase));
-            ui.add_space(SP_2);
-            status_pill(ui, "Default channel", phase::accent());
+        let indicators_w = status_indicator_width(ui, phase_lbl)
+            + SP_3
+            + status_indicator_width(ui, "Default channel");
+        centered_row(ui, indicators_w, 22.0, |ui| {
+            status_indicator(ui, phase_lbl, phase_color(self.phase));
+            ui.add_space(SP_3);
+            status_indicator(ui, "Default channel", phase::accent());
         });
 
         // Hairline that closes the hero and sets the tabs on their own rail.
@@ -4288,13 +4535,15 @@ impl PhaseInstallerApp {
                 "Creates a backup before replacing local files.",
                 "Use after closing Roblox Studio for best results.",
             ] {
-                ui.horizontal(|ui| {
+                ui.horizontal_top(|ui| {
                     draw_icon(ui, MiniIcon::Check, Vec2::splat(16.0), phase::green());
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(note)
-                            .font(FontId::proportional(13.0))
-                            .color(phase::text_secondary()),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(note)
+                                .font(FontId::proportional(13.0))
+                                .color(phase::text_secondary()),
+                        )
+                        .wrap(true),
                     );
                 });
                 ui.add_space(4.0);
@@ -4325,59 +4574,81 @@ impl PhaseInstallerApp {
                 } else {
                     "Sign in to approve this install"
                 };
-                card_header(ui, MiniIcon::User, phase::accent(), &title, detail, None);
+                let phase_status = if phase_linked {
+                    ("Connected", phase::green())
+                } else if busy {
+                    ("Waiting", phase::blue())
+                } else {
+                    ("Not linked", phase::warning())
+                };
+                card_header(
+                    ui,
+                    MiniIcon::User,
+                    phase::accent(),
+                    &title,
+                    detail,
+                    Some(phase_status),
+                );
 
                 ui.add_space(SP_4);
-                action_grid(ui, 3, |ui, index, size| match index {
-                    0 => {
-                        if phase_linked {
-                            status_action(ui, MiniIcon::Check, "Connected", size);
-                        } else {
-                            let connect_label = if busy { "Waiting" } else { "Connect" };
-                            ui.add_enabled_ui(!busy, |ui| {
-                                if secondary_button(ui, MiniIcon::Link, connect_label, size)
-                                    .clicked()
+                let action_count = if phase_linked { 2 } else { 3 };
+                action_grid(ui, action_count, |ui, index, size| {
+                    if phase_linked {
+                        match index {
+                            0 => {
+                                if secondary_button(ui, MiniIcon::Refresh, "Check", size).clicked()
                                 {
-                                    self.start_phase_account_link(ui.ctx());
+                                    self.begin_phase_account_refresh(ui.ctx());
                                 }
-                            });
-                        }
-                    }
-                    1 => {
-                        if secondary_button(ui, MiniIcon::Refresh, "Check", size).clicked() {
-                            if self.plugin_token.is_some() {
-                                self.begin_phase_account_refresh(ui.ctx());
-                            } else {
-                                self.begin_link_status_check(ui.ctx());
                             }
+                            1 => {
+                                ui.add_enabled_ui(!disconnecting, |ui| {
+                                    if secondary_button(ui, MiniIcon::Trash, "Disconnect", size)
+                                        .clicked()
+                                    {
+                                        self.start_phase_disconnect(ui.ctx());
+                                    }
+                                });
+                            }
+                            _ => {}
                         }
-                    }
-                    2 => {
-                        if phase_linked {
-                            ui.add_enabled_ui(!disconnecting, |ui| {
-                                if secondary_button(ui, MiniIcon::Trash, "Disconnect", size)
-                                    .clicked()
+                    } else {
+                        match index {
+                            0 => {
+                                let connect_label = if busy { "Waiting" } else { "Connect" };
+                                ui.add_enabled_ui(!busy, |ui| {
+                                    if secondary_button(ui, MiniIcon::Link, connect_label, size)
+                                        .clicked()
+                                    {
+                                        self.start_phase_account_link(ui.ctx());
+                                    }
+                                });
+                            }
+                            1 => {
+                                if secondary_button(ui, MiniIcon::Refresh, "Check", size).clicked()
                                 {
-                                    self.start_phase_disconnect(ui.ctx());
+                                    self.begin_link_status_check(ui.ctx());
                                 }
-                            });
-                        } else {
-                            ui.add_enabled_ui(link_url.is_some(), |ui| {
-                                if secondary_button(ui, MiniIcon::External, "Open", size).clicked()
-                                {
-                                    if let Some(url) = link_url.clone() {
-                                        if let Err(error) = open::that(url) {
-                                            self.log(
-                                                phase::warning(),
-                                                format!("Open browser failed: {error}"),
-                                            );
+                            }
+                            2 => {
+                                ui.add_enabled_ui(link_url.is_some(), |ui| {
+                                    if secondary_button(ui, MiniIcon::External, "Open", size)
+                                        .clicked()
+                                    {
+                                        if let Some(url) = link_url.clone() {
+                                            if let Err(error) = open::that(url) {
+                                                self.log(
+                                                    phase::warning(),
+                                                    format!("Open browser failed: {error}"),
+                                                );
+                                            }
                                         }
                                     }
-                                }
-                            });
+                                });
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
                 });
             }
         });
@@ -4407,7 +4678,13 @@ impl PhaseInstallerApp {
                 phase::accent(),
                 "Roblox OAuth",
                 identity,
-                None,
+                Some(if verified_roblox {
+                    ("Verified", phase::green())
+                } else if oauth_busy {
+                    ("Waiting", phase::blue())
+                } else {
+                    ("Not verified", phase::warning())
+                }),
             );
 
             ui.add_space(SP_4);
@@ -4425,49 +4702,53 @@ impl PhaseInstallerApp {
             );
 
             ui.add_space(12.0);
-            action_grid(ui, 3, |ui, index, size| match index {
-                0 => {
-                    if verified_roblox {
-                        status_action(ui, MiniIcon::Check, "Verified", size);
-                    } else {
-                        let label = if oauth_busy { "Waiting" } else { "Roblox" };
-                        ui.add_enabled_ui(!oauth_busy, |ui| {
-                            if secondary_button(ui, MiniIcon::ShieldCheck, label, size).clicked() {
-                                self.start_roblox_oauth(ui.ctx());
+            action_grid(ui, 2, |ui, index, size| {
+                if verified_roblox {
+                    match index {
+                        0 => {
+                            ui.add_enabled_ui(!activation_busy, |ui| {
+                                if secondary_button(ui, MiniIcon::Key, "License", size).clicked() {
+                                    self.start_activation(ui.ctx());
+                                }
+                            });
+                        }
+                        1 => {
+                            if secondary_button(ui, MiniIcon::Trash, "Disconnect", size).clicked() {
+                                self.disconnect_roblox_account();
                             }
-                        });
+                        }
+                        _ => {}
                     }
-                }
-                1 => {
-                    if verified_roblox {
-                        ui.add_enabled_ui(!activation_busy, |ui| {
-                            if secondary_button(ui, MiniIcon::Key, "License", size).clicked() {
-                                self.start_activation(ui.ctx());
-                            }
-                        });
-                    } else {
-                        ui.add_enabled_ui(roblox_url.is_some(), |ui| {
-                            if secondary_button(ui, MiniIcon::External, "Open", size).clicked() {
-                                if let Some(url) = roblox_url.clone() {
-                                    if let Err(error) = open::that(url) {
-                                        self.log(
-                                            phase::warning(),
-                                            format!("Open browser failed: {error}"),
-                                        );
+                } else {
+                    match index {
+                        0 => {
+                            let label = if oauth_busy { "Waiting" } else { "Roblox" };
+                            ui.add_enabled_ui(!oauth_busy, |ui| {
+                                if secondary_button(ui, MiniIcon::ShieldCheck, label, size)
+                                    .clicked()
+                                {
+                                    self.start_roblox_oauth(ui.ctx());
+                                }
+                            });
+                        }
+                        1 => {
+                            ui.add_enabled_ui(roblox_url.is_some(), |ui| {
+                                if secondary_button(ui, MiniIcon::External, "Open", size).clicked()
+                                {
+                                    if let Some(url) = roblox_url.clone() {
+                                        if let Err(error) = open::that(url) {
+                                            self.log(
+                                                phase::warning(),
+                                                format!("Open browser failed: {error}"),
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            });
+                        }
+                        _ => {}
                     }
                 }
-                2 => {
-                    ui.add_enabled_ui(verified_roblox, |ui| {
-                        if secondary_button(ui, MiniIcon::Trash, "Disconnect", size).clicked() {
-                            self.disconnect_roblox_account();
-                        }
-                    });
-                }
-                _ => {}
             });
 
             if let Some(activation) = &self.activation {
@@ -4488,91 +4769,135 @@ impl PhaseInstallerApp {
     }
 
     fn folders_tab(&mut self, ui: &mut Ui) {
-        let _time = ui.input(|i| i.time);
         let selected_text = self
             .selected_folder
             .as_ref()
-            .map(|path| path.to_string_lossy().to_string())
+            .map(|path| compact_path(path, 46))
             .unwrap_or_else(|| "No folder selected".to_owned());
 
         draw_panel(ui, |ui| {
-            section_label(ui, "Install location");
+            section_label(ui, "Plugin folder");
             ui.add_space(SP_3);
-            let path_indent = SP_1 + 17.0 + SP_2;
-            // Active path on one line; source as a quiet caption aligned beneath.
-            ui.horizontal(|ui| {
-                ui.add_space(SP_1);
-                draw_icon(ui, MiniIcon::Folder, Vec2::splat(17.0), phase::accent());
-                ui.add_space(SP_2);
-                scrolling_label(
-                    ui,
-                    &selected_text,
-                    card_inner() - path_indent,
-                    FontId::monospace(12.5),
-                    phase::text(),
-                );
-            });
-
-            if let Some(candidate) = self.selected_candidate() {
-                let file_count = candidate.plugin_files.len();
-                let size = candidate
-                    .plugin_files
-                    .first()
-                    .map(|plugin_file| human_size(plugin_file.size_bytes))
-                    .unwrap_or_else(|| "None".to_owned());
-                let backup = candidate
-                    .plugin_files
-                    .first()
-                    .and_then(|plugin_file| plugin_file.modified)
-                    .map(|_| "Recommended")
-                    .unwrap_or("Clean");
-                let source = candidate.source.clone();
-
-                ui.add_space(SP_1);
-                ui.horizontal(|ui| {
-                    ui.add_space(path_indent);
-                    scrolling_label(
-                        ui,
-                        &format!("Source · {source}"),
-                        card_inner() - path_indent,
-                        type_caption(),
-                        phase::text_muted(),
-                    );
-                });
-
-                ui.add_space(SP_4);
-                metric_strip(
-                    ui,
-                    &[
-                        (MiniIcon::Stack, "Files", file_count.to_string()),
-                        (MiniIcon::Folder, "Size", size),
-                        (MiniIcon::ShieldCheck, "Backup", backup.to_owned()),
-                    ],
-                );
+            let rows: Vec<_> = self.candidates.iter().cloned().collect();
+            let picker_response = folder_picker_trigger(
+                ui,
+                &selected_text,
+                self.folder_picker_open,
+                "phase-plugin-folder-picker",
+            );
+            if picker_response.clicked() {
+                self.folder_picker_open = !self.folder_picker_open;
             }
 
-            ui.add_space(SP_5);
-            section_label(ui, "Detected paths");
-            ui.add_space(SP_2);
-            self.folder_candidates(ui);
+            let open_t = ease_out_cubic(ui.ctx().animate_bool_with_time(
+                egui::Id::new("phase-plugin-folder-picker-reveal"),
+                self.folder_picker_open,
+                0.28,
+            ));
+            if open_t > 0.001 {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                let row_count = rows.len().max(1) as f32;
+                let popup_vertical_inset = SP_1 + 1.0;
+                let full_height = row_count * 42.0 + popup_vertical_inset * 2.0;
+                let visible_height = (full_height * open_t).max(1.0);
+                let width = ui.available_width();
+                let (clip_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(width, visible_height), Sense::hover());
+                let slide = (1.0 - open_t) * 8.0;
+                let shell_rect = clip_rect.shrink(0.5);
+                ui.painter()
+                    .rect_filled(shell_rect, Rounding::same(5.0), phase::surface());
+                ui.painter().rect_stroke(
+                    shell_rect,
+                    Rounding::same(5.0),
+                    Stroke::new(1.0, color_with_alpha(phase::accent(), 0.45)),
+                );
+                let content_rect = Rect::from_min_size(
+                    Pos2::new(
+                        clip_rect.left() + SP_2,
+                        clip_rect.top() + popup_vertical_inset - slide,
+                    ),
+                    Vec2::new((width - SP_2 * 2.0).max(40.0), row_count * 42.0),
+                );
+                let mut selected_path = None;
+                ui.allocate_ui_at_rect(content_rect, |ui| {
+                    ui.set_clip_rect(shell_rect.shrink(0.5));
+                    ui.set_opacity(0.35 + 0.65 * open_t);
+                    ui.set_width((width - SP_2 * 2.0).max(40.0));
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    if rows.is_empty() {
+                        ui.add_sized(
+                            Vec2::new(ui.available_width(), 42.0),
+                            egui::Label::new(
+                                RichText::new("No detected folders")
+                                    .font(type_body())
+                                    .color(phase::text_muted()),
+                            ),
+                        );
+                    }
+                    for candidate in &rows {
+                        let selected = self.selected_folder.as_ref().is_some_and(|path| {
+                            normalize_path(path) == normalize_path(&candidate.path)
+                        });
+                        if folder_picker_row(ui, candidate, selected).clicked() {
+                            selected_path = Some(candidate.path.clone());
+                        }
+                    }
+                });
+                if let Some(path) = selected_path {
+                    self.selected_folder = Some(path.clone());
+                    self.folder_picker_open = false;
+                    self.refresh_local_release_status();
+                    self.log(
+                        phase::blue(),
+                        format!("Selected {}", compact_path(&path, 30)),
+                    );
+                }
+            }
+
+            if let Some(candidate) = self.selected_candidate() {
+                ui.add_space(SP_2);
+                egui::CollapsingHeader::new("Folder details")
+                    .id_source("phase-folder-details")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let file_count = candidate.plugin_files.len();
+                        let size = candidate
+                            .plugin_files
+                            .first()
+                            .map(|plugin_file| human_size(plugin_file.size_bytes))
+                            .unwrap_or_else(|| "None".to_owned());
+                        let backup = candidate
+                            .plugin_files
+                            .first()
+                            .and_then(|plugin_file| plugin_file.modified)
+                            .map(|_| "Recommended")
+                            .unwrap_or("Clean");
+                        mini_stats(
+                            ui,
+                            &[
+                                ("Source", candidate.source.clone()),
+                                ("Files", file_count.to_string()),
+                                ("Size", size),
+                                ("Backup", backup.to_owned()),
+                            ],
+                            2,
+                        );
+                    });
+            }
 
             ui.add_space(SP_4);
-            ui.horizontal(|ui| {
-                let btn_width = (card_inner() - 16.0) / 3.0;
-                if secondary_button(ui, MiniIcon::Folder, "Browse", Vec2::new(btn_width, 36.0))
-                    .clicked()
-                {
+            action_grid(ui, 3, |ui, index, size| match index {
+                0 if secondary_button(ui, MiniIcon::Folder, "Browse", size).clicked() => {
                     self.choose_folder();
                 }
-                if secondary_button(ui, MiniIcon::Eye, "Open", Vec2::new(btn_width, 36.0)).clicked()
-                {
+                1 if secondary_button(ui, MiniIcon::Eye, "Open", size).clicked() => {
                     self.open_folder();
                 }
-                if secondary_button(ui, MiniIcon::Refresh, "Rescan", Vec2::new(btn_width, 36.0))
-                    .clicked()
-                {
+                2 if secondary_button(ui, MiniIcon::Refresh, "Rescan", size).clicked() => {
                     self.refresh_detection();
                 }
+                _ => {}
             });
         });
     }
@@ -4927,7 +5252,12 @@ impl PhaseInstallerApp {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        status_pill(ui, "Default", phase::accent());
+                        draw_icon(ui, MiniIcon::Check, Vec2::splat(16.0), phase::green());
+                        ui.label(
+                            RichText::new("Stable")
+                                .font(type_label())
+                                .color(phase::text_secondary()),
+                        );
                     });
                 });
 
@@ -4935,13 +5265,7 @@ impl PhaseInstallerApp {
 
                 section_label(ui, "Marketplace Themes");
                 ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(phase::input())
-                    .stroke(Stroke::new(1.0, phase::line()))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(THEME_ROW_MARGIN, 10.0))
-                    .show(ui, |ui| {
-                        ui.set_width(card_inner() - 24.0);
+                flat_group(ui, |ui| {
                         let current = self
                             .selected_theme
                             .as_ref()
@@ -4972,19 +5296,9 @@ impl PhaseInstallerApp {
                                     phase::text_muted(),
                                 );
                             });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    status_pill(
-                                        ui,
-                                        self.theme_background_mode.label(),
-                                        phase::accent(),
-                                    );
-                                },
-                            );
                         });
                         ui.add_space(8.0);
-                        stat_grid(
+                        stat_grid_flat(
                             ui,
                             &[
                                 (MiniIcon::Sparkle, "Active", current.to_owned()),
@@ -5001,7 +5315,7 @@ impl PhaseInstallerApp {
                             ],
                             3,
                         );
-                    });
+                });
 
                 ui.add_space(8.0);
                 ui.horizontal_centered(|ui| {
@@ -5125,14 +5439,7 @@ impl PhaseInstallerApp {
 
                 ui.add_space(16.0);
 
-                // Group checkmark preferences into a sleek card container
-                egui::Frame::none()
-                    .fill(phase::input())
-                    .stroke(Stroke::new(1.0, phase::line()))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(14.0, 12.0))
-                    .show(ui, |ui| {
-                        ui.set_width(card_inner() - 16.0);
+                flat_group(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.checkbox(
                                 &mut self.backup_before_install,
@@ -5148,19 +5455,13 @@ impl PhaseInstallerApp {
                                     .color(phase::text_secondary()),
                             );
                         });
-                    });
+                });
 
                 ui.add_space(16.0);
 
                 section_label(ui, "Plugin Recovery");
                 ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(phase::input())
-                    .stroke(Stroke::new(1.0, phase::line()))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(14.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.set_width(card_inner() - 16.0);
+                flat_group(ui, |ui| {
                         ui.label(
                             RichText::new("Reset Roblox plugin data")
                                 .font(FontId::proportional(14.0))
@@ -5171,13 +5472,13 @@ impl PhaseInstallerApp {
                         scrolling_label(
                             ui,
                             "Scans Roblox Studio plugin settings, backs up selected Phase data, then deletes only those keys. Close Studio first.",
-                            card_inner() - 16.0,
+                            card_inner(),
                             FontId::proportional(11.0),
                             phase::text_muted(),
                         );
                         ui.add_space(10.0);
 
-                        stat_grid(
+                        stat_grid_flat(
                             ui,
                             &[
                                 (
@@ -5221,7 +5522,7 @@ impl PhaseInstallerApp {
                             ui,
                             MiniIcon::Refresh,
                             "Scan Settings",
-                            Vec2::new(card_inner() - 16.0, 34.0),
+                            Vec2::new(card_inner(), 34.0),
                         )
                         .clicked()
                         {
@@ -5235,7 +5536,7 @@ impl PhaseInstallerApp {
                             scrolling_label(
                                 ui,
                                 "Are you sure? Selected settings will be backed up, then removed from Roblox Studio plugin storage.",
-                                card_inner() - 16.0,
+                                card_inner(),
                                 FontId::proportional(11.0),
                                 phase::warning(),
                             );
@@ -5267,7 +5568,7 @@ impl PhaseInstallerApp {
                             ui,
                             MiniIcon::Trash,
                             "Backup + Delete Selected",
-                            Vec2::new(card_inner() - 16.0, 36.0),
+                            Vec2::new(card_inner(), 36.0),
                         )
                         .clicked()
                         {
@@ -5279,24 +5580,18 @@ impl PhaseInstallerApp {
                             scrolling_label(
                                 ui,
                                 status,
-                                card_inner() - 16.0,
+                                card_inner(),
                                 FontId::proportional(11.0),
                                 phase::text_secondary(),
                             );
                         }
-                    });
+                });
 
                 ui.add_space(16.0);
 
                 section_label(ui, "App Updates");
                 ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(phase::input())
-                    .stroke(Stroke::new(1.0, phase::line()))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(14.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.set_width(card_inner() - 16.0);
+                flat_group(ui, |ui| {
                         let latest = self
                             .app_update
                             .as_ref()
@@ -5318,7 +5613,7 @@ impl PhaseInstallerApp {
                             ));
                         }
                         stat_grid_flat(ui, &update_items, update_items.len());
-                    });
+                });
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -5359,7 +5654,7 @@ impl PhaseInstallerApp {
                     scrolling_label(
                         ui,
                         error,
-                        card_inner() - 16.0,
+                        card_inner(),
                         FontId::proportional(11.0),
                         phase::warning(),
                     );
@@ -5369,13 +5664,7 @@ impl PhaseInstallerApp {
 
                 section_label(ui, "Connection Diagnostics");
                 ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(phase::input())
-                    .stroke(Stroke::new(1.0, phase::line()))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(14.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.set_width(card_inner() - 16.0);
+                flat_group(ui, |ui| {
                         let status = self
                             .diagnostics_fix_report
                             .as_ref()
@@ -5406,46 +5695,32 @@ impl PhaseInstallerApp {
                                 None => phase::blue(),
                             }
                         };
-                        ui.horizontal(|ui| {
-                            draw_icon(ui, MiniIcon::Search, Vec2::splat(16.0), status_color);
-                            ui.add_space(6.0);
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("Phase server and install checks")
-                                        .font(FontId::proportional(12.5))
-                                        .color(phase::text_secondary()),
-                                );
-                                scrolling_label(
-                                    ui,
-                                    self.diagnostics_fix_report
-                                        .as_ref()
-                                        .map(|report| report.summary.as_str())
-                                        .or_else(|| {
-                                            self.diagnostics_report
-                                                .as_ref()
-                                                .map(|report| report.summary.as_str())
-                                        })
-                                        .unwrap_or("Open a simple connection check window."),
-                                    card_inner() - 148.0,
-                                    FontId::proportional(11.0),
-                                    phase::text_muted(),
-                                );
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    status_pill(ui, status_text, status_color);
-                                },
-                            );
-                        });
-                    });
+                        let summary = self
+                            .diagnostics_fix_report
+                            .as_ref()
+                            .map(|report| report.summary.as_str())
+                            .or_else(|| {
+                                self.diagnostics_report
+                                    .as_ref()
+                                    .map(|report| report.summary.as_str())
+                            })
+                            .unwrap_or("Phase server and local install checks.");
+                        card_header(
+                            ui,
+                            MiniIcon::Search,
+                            status_color,
+                            "Connection diagnostics",
+                            summary,
+                            Some((status_text, status_color)),
+                        );
+                });
 
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let btn_width = (card_inner() - 16.0) / 3.0;
+                action_grid(ui, 3, |ui, index, size| {
                     let running = self.diagnostics_rx.is_some() || self.diagnostics_fix_rx.is_some();
-                    ui.add_enabled_ui(!running, |ui| {
-                        if secondary_button(
+                    match index {
+                        0 => { ui.add_enabled_ui(!running, |ui| {
+                            if secondary_button(
                             ui,
                             MiniIcon::Search,
                             if self.diagnostics_rx.is_some() {
@@ -5453,15 +5728,15 @@ impl PhaseInstallerApp {
                             } else {
                                 "Diagnose"
                             },
-                            Vec2::new(btn_width, 36.0),
+                            size,
                         )
                         .clicked()
                         {
                             self.start_connection_diagnostics(ui.ctx());
                         }
-                    });
-                    ui.add_enabled_ui(!running, |ui| {
-                        if secondary_button(
+                        }); }
+                        1 => { ui.add_enabled_ui(!running, |ui| {
+                            if secondary_button(
                             ui,
                             MiniIcon::Gear,
                             if self.diagnostics_fix_rx.is_some() {
@@ -5469,17 +5744,18 @@ impl PhaseInstallerApp {
                             } else {
                                 "Fix"
                             },
-                            Vec2::new(btn_width, 36.0),
+                            size,
                         )
                         .clicked()
                         {
                             self.start_connection_fix(ui.ctx());
                         }
-                    });
-                    if secondary_button(ui, MiniIcon::External, "Open", Vec2::new(btn_width, 36.0))
-                        .clicked()
-                    {
-                        self.diagnostics_open = true;
+                        }); }
+                        _ => {
+                            if secondary_button(ui, MiniIcon::External, "Open", size).clicked() {
+                                self.diagnostics_open = true;
+                            }
+                        }
                     }
                 });
 
@@ -5487,13 +5763,7 @@ impl PhaseInstallerApp {
 
                 section_label(ui, "About");
                 ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(phase::input())
-                    .stroke(Stroke::new(1.0, phase::line()))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(Margin::symmetric(14.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.set_width(card_inner() - 16.0);
+                flat_group(ui, |ui| {
                         ui.horizontal(|ui| {
                             draw_icon(ui, MiniIcon::Lock, Vec2::splat(13.0), phase::text_muted());
                             ui.add_space(6.0);
@@ -5503,7 +5773,7 @@ impl PhaseInstallerApp {
                                     .color(phase::text_muted()),
                             );
                         });
-                    });
+                });
             });
         });
     }
@@ -5515,6 +5785,8 @@ impl PhaseInstallerApp {
         let tint = accent.unwrap_or_else(phase::accent);
         let fallback_bg =
             phase::hex_color(asset.theme_preview.background.trim()).unwrap_or_else(phase::surface);
+        let applying_this = self.theme_applying_asset_id.as_deref() == Some(asset.id.as_str());
+        let theme_busy = self.theme_apply_rx.is_some() || self.theme_transition.is_some();
 
         let hover_id = egui::Id::new(("theme_row_hover", &asset.id));
 
@@ -5575,12 +5847,15 @@ impl PhaseInstallerApp {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let applying = self.theme_apply_rx.is_some();
-                        ui.add_enabled_ui(!applying, |ui| {
+                        ui.add_enabled_ui(!theme_busy, |ui| {
                             if secondary_button(
                                 ui,
                                 MiniIcon::Download,
-                                if applying { "Applying" } else { "Apply" },
+                                if applying_this {
+                                    "Transforming"
+                                } else {
+                                    "Apply"
+                                },
                                 Vec2::new(92.0, 34.0),
                             )
                             .clicked()
@@ -5625,6 +5900,21 @@ impl PhaseInstallerApp {
             Rounding::same(8.0),
             Stroke::new(1.0, border),
         ));
+        if applying_this {
+            let time = ui.input(|input| input.time) as f32;
+            let travel = ((time * 0.72).fract() * 1.35 - 0.2).clamp(0.0, 1.0);
+            let line_y = rect.bottom() - 1.5;
+            let segment = rect.width() * 0.28;
+            let center = rect.left() + rect.width() * travel;
+            shapes.push(egui::Shape::line_segment(
+                [
+                    Pos2::new((center - segment).max(rect.left() + 6.0), line_y),
+                    Pos2::new((center + segment).min(rect.right() - 6.0), line_y),
+                ],
+                Stroke::new(2.0, tint),
+            ));
+            ui.ctx().request_repaint();
+        }
         ui.painter().set(slot, egui::Shape::Vec(shapes));
     }
 
@@ -5709,167 +5999,39 @@ impl PhaseInstallerApp {
         }
     }
 
-    fn folder_candidates(&mut self, ui: &mut Ui) {
-        let rows: Vec<_> = self.candidates.iter().cloned().collect();
-        if rows.is_empty() {
-            ui.label(
-                RichText::new("No Roblox plugin folders detected yet — try Rescan or Browse.")
-                    .font(type_body())
-                    .color(phase::text_muted()),
-            );
-            return;
-        }
-
-        for candidate in rows.into_iter().take(3) {
-            let selected = self
-                .selected_folder
-                .as_ref()
-                .is_some_and(|path| normalize_path(path) == normalize_path(&candidate.path));
-
-            let width = ui.available_width();
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 48.0), Sense::click());
-            let hover_t = hover_t(ui, response.id, response.hovered());
-            let painter = ui.painter();
-
-            // Flat selectable list: no boxed border. Selected rows get a faint
-            // accent tint + a left marker bar; hover gets a soft wash. Removing
-            // the per-row frame kills the boxes-in-a-box clutter.
-            if selected {
-                painter.rect_filled(
-                    rect,
-                    Rounding::same(CONTROL_ROUNDING),
-                    color_with_alpha(phase::accent(), 0.1),
-                );
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        Pos2::new(rect.left(), rect.top() + 8.0),
-                        Pos2::new(rect.left() + 3.0, rect.bottom() - 8.0),
-                    ),
-                    Rounding::same(2.0),
-                    phase::accent(),
-                );
-            } else if hover_t > 0.0 {
-                painter.rect_filled(
-                    rect,
-                    Rounding::same(CONTROL_ROUNDING),
-                    color_with_alpha(phase::surface_hover(), 0.5 * hover_t),
-                );
-            }
-
-            let dot_color = match candidate.health {
-                FolderHealth::Ready => phase::green(),
-                FolderHealth::Empty => phase::warning(),
-                FolderHealth::Missing => phase::red(),
-            };
-            painter.circle_filled(
-                Pos2::new(rect.left() + 18.0, rect.center().y),
-                4.0,
-                dot_color,
-            );
-
-            // Right-aligned health label (colored) acts as the status badge.
-            let health_lbl = health_label(&candidate.health);
-            let health_w = text_width(ui, health_lbl, type_label()) + 4.0;
-            let painter = ui.painter();
-            painter.text(
-                Pos2::new(rect.right() - 12.0, rect.center().y),
-                Align2::RIGHT_CENTER,
-                health_lbl,
-                type_label(),
-                dot_color,
-            );
-
-            let path_text = candidate.path.to_string_lossy().to_string();
-            let text_color = if selected {
-                phase::text()
-            } else {
-                phase::text_secondary()
-            };
-            let text_left = rect.left() + 32.0;
-            let text_w = (rect.right() - text_left - 12.0 - health_w - SP_2).max(40.0);
-            // Paint text directly, left-aligned and clipped — allocate_ui_at_rect
-            // inherits the centered column layout and would re-center the text.
-            let clip = painter.with_clip_rect(Rect::from_min_size(
-                Pos2::new(text_left, rect.top()),
-                Vec2::new(text_w, rect.height()),
-            ));
-            clip.text(
-                Pos2::new(text_left, rect.top() + 16.0),
-                Align2::LEFT_CENTER,
-                &path_text,
-                FontId::monospace(12.0),
-                text_color,
-            );
-            clip.text(
-                Pos2::new(text_left, rect.bottom() - 13.0),
-                Align2::LEFT_CENTER,
-                &candidate.source,
-                type_caption(),
-                phase::text_muted(),
-            );
-
-            if response.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if response.clicked() {
-                self.selected_folder = Some(candidate.path.clone());
-                self.refresh_local_release_status();
-                self.log(
-                    phase::blue(),
-                    format!("Selected {}", compact_path(&candidate.path, 30)),
-                );
-            }
-            ui.add_space(SP_1);
-        }
-    }
-
     fn activity_block(&self, ui: &mut Ui) {
         section_label(ui, "System Console");
+        ui.add_space(SP_2);
 
         ui.scope(|ui| {
             ui.set_min_width(content_w());
             ui.set_max_width(content_w());
-
-            egui::Frame::none()
-                .fill(Color32::from_rgb(10, 8, 16))
-                .stroke(Stroke::new(1.0, phase::line()))
-                .rounding(Rounding::same(6.0))
-                .inner_margin(Margin::same(8.0))
-                .show(ui, |ui| {
-                    ui.set_min_width(card_inner());
-                    ui.set_max_width(card_inner());
-                    ui.set_min_height(122.0);
-                    ui.set_max_height(122.0);
-
-                    ui.vertical(|ui| {
-                        for (idx, line) in self.activity.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                let time_prefix = format!("[{:03.1}s] ", idx as f32 * 0.4);
-                                ui.label(
-                                    RichText::new(time_prefix)
-                                        .font(FontId::monospace(11.5))
-                                        .color(phase::text_muted()),
-                                );
-
-                                let text_color = if line.color == phase::red() {
-                                    phase::red()
-                                } else if line.color == phase::green() {
-                                    Color32::from_rgb(120, 230, 150)
-                                } else {
-                                    phase::text_secondary()
-                                };
-
-                                scrolling_label(
-                                    ui,
-                                    &line.text,
-                                    card_inner() - 76.0,
-                                    FontId::monospace(11.5),
-                                    text_color,
-                                );
-                            });
-                        }
+            ui.vertical(|ui| {
+                for (idx, line) in self.activity.iter().rev().take(5).rev().enumerate() {
+                    let text_color = if line.color == phase::red() {
+                        phase::red()
+                    } else if line.color == phase::green() {
+                        Color32::from_rgb(120, 230, 150)
+                    } else {
+                        phase::text_secondary()
+                    };
+                    ui.horizontal_top(|ui| {
+                        ui.label(
+                            RichText::new(format!("{:02}", idx + 1))
+                                .font(FontId::monospace(10.5))
+                                .color(phase::text_muted()),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&line.text)
+                                    .font(FontId::monospace(11.5))
+                                    .color(text_color),
+                            )
+                            .wrap(true),
+                        );
                     });
-                });
+                }
+            });
         });
     }
 }
@@ -6123,11 +6285,53 @@ fn diagnostics_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of(DIAGNOSTICS_VIEWPORT_KEY)
 }
 
+fn notification_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(NOTIFICATION_VIEWPORT_KEY)
+}
+
 #[cfg(target_os = "windows")]
-fn apply_windows_title_bar(frame: &eframe::Frame) {
+fn apply_notification_window_style() -> bool {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL,
+        DwmSetWindowAttribute,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let title: Vec<u16> = "Phase notification\0".encode_utf16().collect();
+    let corner_preference = DWMWCP_ROUNDSMALL;
+    let border_color = DWMWA_COLOR_NONE;
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return false;
+        }
+        let corner_result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &corner_preference as *const _ as *const _,
+            core::mem::size_of_val(&corner_preference) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            &border_color as *const _ as *const _,
+            core::mem::size_of_val(&border_color) as u32,
+        );
+        corner_result == 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_notification_window_style() -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_title_bar(frame: &eframe::Frame, tray_panel: bool) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::Graphics::Dwm::{
-        DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DwmSetWindowAttribute,
+        DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_DEFAULT, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
     };
 
     let Ok(handle) = frame.window_handle() else {
@@ -6142,6 +6346,11 @@ fn apply_windows_title_bar(frame: &eframe::Frame) {
     let caption = color_ref(phase::surface());
     let text = color_ref(phase::text());
     let border = color_ref(phase::accent_dim());
+    let corner_preference = if tray_panel {
+        DWMWCP_ROUNDSMALL
+    } else {
+        DWMWCP_DEFAULT
+    };
 
     unsafe {
         let _ = DwmSetWindowAttribute(
@@ -6162,11 +6371,17 @@ fn apply_windows_title_bar(frame: &eframe::Frame) {
             &border as *const _ as *const _,
             core::mem::size_of_val(&border) as u32,
         );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &corner_preference as *const _ as *const _,
+            core::mem::size_of_val(&corner_preference) as u32,
+        );
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn apply_windows_title_bar(_frame: &eframe::Frame) {}
+fn apply_windows_title_bar(_frame: &eframe::Frame, _tray_panel: bool) {}
 
 #[cfg(target_os = "windows")]
 fn reveal_window_for_tray_signal() {
@@ -6371,9 +6586,18 @@ fn identity_card(
         Pos2::new(text_x, rect.top() + 6.0),
         Vec2::new(text_width, 21.0),
     );
-    ui.allocate_ui_at_rect(name_rect, |ui| {
-        scrolling_label(ui, name, text_width, type_body(), phase::text());
-    });
+    let visible_name = compact_middle(name, (text_width / 7.2).floor().max(8.0) as usize);
+    let name_response = ui.allocate_rect(name_rect, Sense::hover());
+    ui.painter().text(
+        name_rect.left_center(),
+        Align2::LEFT_CENTER,
+        &visible_name,
+        type_body(),
+        phase::text(),
+    );
+    if name_response.hovered() && visible_name != name {
+        name_response.on_hover_text(name);
+    }
     let detail_rect = Rect::from_min_size(
         Pos2::new(text_x, rect.top() + 27.0),
         Vec2::new(text_width, 18.0),
@@ -6383,47 +6607,34 @@ fn identity_card(
     });
 }
 
-fn draw_card(ui: &mut Ui, height: Option<f32>, add_contents: impl FnOnce(&mut Ui)) {
+fn draw_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     ui.scope(|ui| {
         ui.set_min_width(content_w());
         ui.set_max_width(content_w());
 
-        let frame = egui::Frame::none()
-            .fill(phase::surface())
-            .stroke(Stroke::new(1.0, color_with_alpha(phase::line(), 0.6)))
-            .rounding(Rounding::same(CARD_ROUNDING))
-            .shadow(card_shadow())
-            .inner_margin(Margin::symmetric(CARD_H_MARGIN, SP_3 + 2.0));
-
-        let response = frame.show(ui, |ui| {
-            ui.set_min_width(card_inner());
-            ui.set_max_width(card_inner());
-            if let Some(h) = height {
-                ui.set_min_height(h);
-            }
-            // Tabs render inside a vertical_centered column, which would otherwise
-            // center every label/field inside the card. Force left alignment so
-            // content reads as a tidy left gutter instead of floating centered.
-            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                add_contents(ui);
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(CARD_H_MARGIN, SP_3 + 2.0))
+            .show(ui, |ui| {
+                ui.set_min_width(card_inner());
+                ui.set_max_width(card_inner());
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    add_contents(ui);
+                });
             });
-        });
-
-        // Lit top edge — the card catches light from above.
-        top_highlight(
-            ui.painter(),
-            response.response.rect,
-            CARD_ROUNDING,
-            color_with_alpha(Color32::WHITE, 0.05),
-        );
     });
 }
 
-fn draw_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    draw_card(ui, None, add_contents);
+fn flat_group(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    ui.scope(|ui| {
+        ui.set_min_width(card_inner());
+        ui.set_max_width(card_inner());
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            add_contents(ui);
+        });
+    });
 }
 
-/// Standard flat section header used inside cards: accent glyph, a title with a
+/// Standard flat section header: accent glyph, a title with a
 /// muted subtitle beneath, and an optional status chip pinned to the right.
 /// Replaces the per-section bordered sub-boxes that made tabs feel nested.
 fn card_header(
@@ -6432,14 +6643,14 @@ fn card_header(
     icon_color: Color32,
     title: &str,
     subtitle: &str,
-    pill: Option<(&str, Color32)>,
+    status: Option<(&str, Color32)>,
 ) {
     let width = ui.available_width();
-    let pill_w = pill
-        .map(|(t, _)| status_pill_width(ui, t) + SP_2)
+    let status_w = status
+        .map(|(t, _)| status_indicator_width(ui, t) + SP_2)
         .unwrap_or(0.0);
     let icon_sz = 22.0;
-    let text_w = (width - icon_sz - SP_3 - pill_w).max(60.0);
+    let text_w = (width - icon_sz - SP_3 - status_w).max(60.0);
     ui.horizontal(|ui| {
         draw_icon(ui, icon, Vec2::splat(icon_sz), icon_color);
         ui.add_space(SP_3);
@@ -6457,9 +6668,9 @@ fn card_header(
             ui.add_space(1.0);
             scrolling_label(ui, subtitle, text_w, type_label(), phase::text_muted());
         });
-        if let Some((t, c)) = pill {
+        if let Some((t, c)) = status {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                status_pill(ui, t, c);
+                status_indicator(ui, t, c);
             });
         }
     });
@@ -6491,15 +6702,11 @@ fn section_label(ui: &mut Ui, text: &str) {
 /// Equal-column stat grid. One container owns the geometry; every value is
 /// rendered inside a clipped/scrolling rect so long paths cannot spill across
 /// dividers or out of the card.
-fn stat_grid(ui: &mut Ui, items: &[(MiniIcon, &str, String)], columns: usize) {
-    stat_grid_impl(ui, items, columns, true);
-}
-
 fn stat_grid_flat(ui: &mut Ui, items: &[(MiniIcon, &str, String)], columns: usize) {
-    stat_grid_impl(ui, items, columns, false);
+    stat_grid_impl(ui, items, columns);
 }
 
-fn stat_grid_impl(ui: &mut Ui, items: &[(MiniIcon, &str, String)], columns: usize, framed: bool) {
+fn stat_grid_impl(ui: &mut Ui, items: &[(MiniIcon, &str, String)], columns: usize) {
     if items.is_empty() || columns == 0 {
         return;
     }
@@ -6512,21 +6719,6 @@ fn stat_grid_impl(ui: &mut Ui, items: &[(MiniIcon, &str, String)], columns: usiz
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
 
     let painter = ui.painter().clone();
-    if framed {
-        painter.rect_filled(rect, Rounding::same(CONTROL_ROUNDING), phase::input());
-        painter.rect_stroke(
-            rect,
-            Rounding::same(CONTROL_ROUNDING),
-            Stroke::new(1.0, color_with_alpha(phase::line(), 0.6)),
-        );
-        top_highlight(
-            &painter,
-            rect,
-            CONTROL_ROUNDING,
-            color_with_alpha(Color32::WHITE, 0.04),
-        );
-    }
-
     let cell_width = rect.width() / columns as f32;
     for col in 1..columns {
         let x = rect.left() + cell_width * col as f32;
@@ -6659,71 +6851,6 @@ fn mini_stats(ui: &mut Ui, items: &[(&str, String)], cols: usize) {
     }
 }
 
-/// Dense single-row metric band: an accent glyph + value + caption per cell,
-/// separated by hairline dividers, grouped on a faint rounded surface. Packs
-/// several facts into one compact strip instead of a sparse multi-row grid.
-fn metric_strip(ui: &mut Ui, items: &[(MiniIcon, &str, String)]) {
-    if items.is_empty() {
-        return;
-    }
-    let n = items.len();
-    let w = ui.available_width().max(1.0);
-    let h = 48.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
-    let painter = ui.painter().clone();
-    painter.rect_filled(
-        rect,
-        Rounding::same(CONTROL_ROUNDING),
-        color_with_alpha(phase::input(), 0.55),
-    );
-    top_highlight(
-        &painter,
-        rect,
-        CONTROL_ROUNDING,
-        color_with_alpha(Color32::WHITE, 0.03),
-    );
-    let cell_w = w / n as f32;
-    for i in 1..n {
-        let x = rect.left() + cell_w * i as f32;
-        painter.vline(
-            x,
-            rect.top() + 10.0..=rect.bottom() - 10.0,
-            Stroke::new(1.0, color_with_alpha(phase::line(), 0.45)),
-        );
-    }
-    for (i, (icon, label, value)) in items.iter().enumerate() {
-        let cell = Rect::from_min_size(
-            Pos2::new(rect.left() + cell_w * i as f32, rect.top()),
-            Vec2::new(cell_w, h),
-        )
-        .shrink2(Vec2::new(SP_3, 9.0));
-        let icon_rect = Rect::from_min_size(
-            Pos2::new(cell.left(), cell.center().y - 8.0),
-            Vec2::splat(16.0),
-        );
-        draw_icon_at(&painter, icon_rect, *icon, phase::accent());
-        let tx = cell.left() + 16.0 + SP_2;
-        let cp = painter.with_clip_rect(Rect::from_min_max(
-            Pos2::new(tx, cell.top()),
-            Pos2::new(cell.right(), cell.bottom()),
-        ));
-        cp.text(
-            Pos2::new(tx, cell.top()),
-            Align2::LEFT_TOP,
-            value,
-            type_body(),
-            phase::text(),
-        );
-        cp.text(
-            Pos2::new(tx, cell.bottom()),
-            Align2::LEFT_BOTTOM,
-            label.to_uppercase(),
-            type_caption(),
-            phase::text_muted(),
-        );
-    }
-}
-
 fn action_grid(ui: &mut Ui, count: usize, mut add_action: impl FnMut(&mut Ui, usize, Vec2)) {
     if count == 0 {
         return;
@@ -6763,6 +6890,156 @@ fn action_grid(ui: &mut Ui, count: usize, mut add_action: impl FnMut(&mut Ui, us
             ui.add_space(8.0);
         }
     }
+}
+
+fn folder_picker_trigger(
+    ui: &mut Ui,
+    selected_text: &str,
+    open: bool,
+    id_source: &'static str,
+) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::click());
+    let hover = hover_t(ui, response.id, response.hovered());
+    let open_t = ease_out_cubic(ui.ctx().animate_bool_with_time(
+        response.id.with(id_source),
+        open,
+        0.28,
+    ));
+    let painter = ui.painter().clone();
+    let fill = if open {
+        color_with_alpha(phase::accent(), 0.1)
+    } else if hover > 0.0 {
+        lerp_color(phase::surface(), phase::surface_hover(), hover)
+    } else {
+        phase::surface()
+    };
+    painter.rect_filled(rect, Rounding::same(CONTROL_ROUNDING), fill);
+    painter.rect_stroke(
+        rect,
+        Rounding::same(CONTROL_ROUNDING),
+        Stroke::new(
+            1.0,
+            color_with_alpha(
+                if open { phase::accent() } else { phase::line() },
+                0.62 + 0.28 * hover,
+            ),
+        ),
+    );
+    draw_icon_at(
+        &painter,
+        Rect::from_center_size(
+            Pos2::new(rect.left() + 18.0, rect.center().y),
+            Vec2::splat(16.0),
+        ),
+        MiniIcon::Folder,
+        if open {
+            phase::accent()
+        } else {
+            phase::text_muted()
+        },
+    );
+
+    let center = Pos2::new(rect.right() - 18.0, rect.center().y);
+    let tip_offset = 2.5 - 5.0 * open_t;
+    let left = Pos2::new(center.x - 4.0, center.y - tip_offset);
+    let right = Pos2::new(center.x + 4.0, center.y - tip_offset);
+    let stroke = Stroke::new(1.5, phase::text_secondary());
+    painter.line_segment([left, center], stroke);
+    painter.line_segment([center, right], stroke);
+
+    let text_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + 34.0, rect.top()),
+        Pos2::new(rect.right() - 34.0, rect.bottom()),
+    );
+    painter.with_clip_rect(text_rect).text(
+        text_rect.left_center(),
+        Align2::LEFT_CENTER,
+        selected_text,
+        FontId::monospace(12.0),
+        phase::text(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn folder_picker_row(
+    ui: &mut Ui,
+    candidate: &PluginFolderCandidate,
+    selected: bool,
+) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 42.0), Sense::click());
+    let hover = hover_t(ui, response.id, response.hovered());
+    let color = match candidate.health {
+        FolderHealth::Ready => phase::green(),
+        FolderHealth::Empty => phase::warning(),
+        FolderHealth::Missing => phase::red(),
+    };
+    if hover > 0.0 {
+        ui.painter().rect_filled(
+            rect,
+            Rounding::ZERO,
+            color_with_alpha(phase::surface_hover(), 0.72 * hover),
+        );
+    }
+    if selected {
+        ui.painter().rect_filled(
+            Rect::from_min_max(
+                Pos2::new(rect.left(), rect.top() + 8.0),
+                Pos2::new(rect.left() + 2.0, rect.bottom() - 8.0),
+            ),
+            Rounding::same(1.0),
+            phase::accent(),
+        );
+    }
+
+    let status = health_label(&candidate.health);
+    let status_width = text_width(ui, status, type_label());
+    let text_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + 12.0, rect.top()),
+        Pos2::new(rect.right() - status_width - 24.0, rect.bottom()),
+    );
+    let clipped = ui.painter().with_clip_rect(text_rect);
+    clipped.text(
+        Pos2::new(text_rect.left(), rect.center().y - 6.0),
+        Align2::LEFT_CENTER,
+        candidate.path.to_string_lossy(),
+        FontId::monospace(11.5),
+        if selected {
+            phase::text()
+        } else {
+            phase::text_secondary()
+        },
+    );
+    clipped.text(
+        Pos2::new(text_rect.left(), rect.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        &candidate.source,
+        type_caption(),
+        phase::text_muted(),
+    );
+    ui.painter().rect_filled(
+        Rect::from_center_size(
+            Pos2::new(rect.right() - status_width - 14.0, rect.center().y),
+            Vec2::new(2.0, 14.0),
+        ),
+        Rounding::same(1.0),
+        color,
+    );
+    ui.painter().text(
+        Pos2::new(rect.right() - 8.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        status,
+        type_label(),
+        phase::text_secondary(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 #[derive(Clone, Copy)]
@@ -7073,6 +7350,151 @@ fn draw_icon_at(painter: &egui::Painter, rect: Rect, icon: MiniIcon, color: Colo
     }
 }
 
+fn phase_notification_panel(
+    ui: &mut Ui,
+    notification: &PhaseNotification,
+    logo: Option<&TextureHandle>,
+    visibility: f32,
+) -> bool {
+    let visibility = visibility.clamp(0.0, 1.0);
+    let slide = (1.0 - visibility) * 24.0;
+    let shell = ui.max_rect().shrink(1.0).translate(Vec2::new(slide, 0.0));
+    let tone = match notification.tone {
+        NotificationTone::Info => phase::blue(),
+        NotificationTone::Success => phase::green(),
+    };
+    let painter = ui.painter().clone();
+    painter.rect_filled(
+        shell,
+        Rounding::same(9.0),
+        color_with_alpha(phase::surface(), visibility),
+    );
+    painter.rect_stroke(
+        shell,
+        Rounding::same(9.0),
+        Stroke::new(1.0, color_with_alpha(phase::line(), visibility)),
+    );
+    if let Some(texture) = logo {
+        let logo_rect = Rect::from_center_size(
+            Pos2::new(shell.left() + 30.0, shell.center().y - 2.0),
+            Vec2::splat(30.0),
+        );
+        painter.image(
+            texture.id(),
+            logo_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            color_with_alpha(Color32::WHITE, visibility),
+        );
+    }
+
+    let text_left = shell.left() + 54.0;
+    painter.text(
+        Pos2::new(text_left, shell.top() + 20.0),
+        Align2::LEFT_CENTER,
+        &notification.title,
+        type_heading(),
+        color_with_alpha(phase::text(), visibility),
+    );
+    let body_rect = Rect::from_min_max(
+        Pos2::new(text_left, shell.top() + 34.0),
+        Pos2::new(shell.right() - 38.0, shell.bottom() - 14.0),
+    );
+    ui.allocate_ui_at_rect(body_rect, |ui| {
+        ui.set_opacity(visibility);
+        ui.add(
+            egui::Label::new(
+                RichText::new(&notification.body)
+                    .font(type_body())
+                    .color(phase::text_secondary()),
+            )
+            .wrap(true),
+        );
+    });
+
+    let close_rect = Rect::from_center_size(
+        Pos2::new(shell.right() - 18.0, shell.top() + 18.0),
+        Vec2::splat(28.0),
+    );
+    let close = ui.interact(
+        close_rect,
+        ui.make_persistent_id("phase-notification-close"),
+        Sense::click(),
+    );
+    let close_color = if close.hovered() {
+        phase::text()
+    } else {
+        phase::text_muted()
+    };
+    let center = close_rect.center();
+    let extent = 3.5;
+    let stroke = Stroke::new(1.5, color_with_alpha(close_color, visibility));
+    painter.line_segment(
+        [
+            Pos2::new(center.x - extent, center.y - extent),
+            Pos2::new(center.x + extent, center.y + extent),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(center.x + extent, center.y - extent),
+            Pos2::new(center.x - extent, center.y + extent),
+        ],
+        stroke,
+    );
+    if close.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let remaining = (1.0
+        - notification.created_at.elapsed().as_secs_f32() / TOAST_LIFETIME.as_secs_f32())
+    .clamp(0.0, 1.0);
+    let progress = Rect::from_min_size(
+        Pos2::new(shell.left() + 10.0, shell.bottom() - 3.0),
+        Vec2::new((shell.width() - 20.0) * remaining, 2.0),
+    );
+    painter.rect_filled(
+        progress,
+        Rounding::same(1.0),
+        color_with_alpha(tone, 0.72 * visibility),
+    );
+    close.clicked()
+}
+
+fn tray_close_button(ui: &mut Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    let hover = hover_t(ui, response.id, response.hovered());
+    if hover > 0.0 {
+        ui.painter().rect_filled(
+            rect,
+            Rounding::same(CONTROL_ROUNDING),
+            color_with_alpha(phase::surface_hover(), hover),
+        );
+    }
+    let center = rect.center();
+    let extent = 4.0;
+    let color = lerp_color(phase::text_muted(), phase::text(), hover);
+    let stroke = Stroke::new(1.6, color);
+    ui.painter().line_segment(
+        [
+            Pos2::new(center.x - extent, center.y - extent),
+            Pos2::new(center.x + extent, center.y + extent),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(center.x + extent, center.y - extent),
+            Pos2::new(center.x - extent, center.y + extent),
+        ],
+        stroke,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text("Close tray controls")
+}
+
 fn compact_info_row(ui: &mut Ui, label: &str, value: &str, width: f32) {
     ui.horizontal(|ui| {
         ui.set_width(width);
@@ -7110,64 +7532,50 @@ fn scrolling_label(ui: &mut Ui, text: &str, width: f32, font: FontId, color: Col
         });
 }
 
-/// Layout width of a `status_pill` for the given label (margins + dot + gap).
-fn status_pill_width(ui: &Ui, text: &str) -> f32 {
-    33.0 + text_width(ui, text, type_label())
+/// Layout width of the borderless status rail and its label.
+fn status_indicator_width(ui: &Ui, text: &str) -> f32 {
+    2.0 + SP_2 + text_width(ui, text, type_label())
 }
 
-fn status_pill(ui: &mut Ui, text: &str, color: Color32) {
-    // A quiet neutral chip carrying a single colored status dot — the color
-    // lives in the dot, not the whole pill, so badges sit calmly in the layout.
-    egui::Frame::none()
-        .fill(color_with_alpha(phase::surface(), 0.6))
-        .stroke(Stroke::new(1.0, color_with_alpha(phase::line(), 0.5)))
-        .rounding(Rounding::same(999.0))
-        .inner_margin(Margin::symmetric(SP_2 + 2.0, SP_1 + 1.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = SP_1 + 2.0;
-                let (dot, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.5, color);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(text)
-                            .font(type_label())
-                            .color(phase::text_secondary()),
-                    )
-                    .wrap(false),
-                );
-            });
-        });
+fn status_indicator(ui: &mut Ui, text: &str, color: Color32) {
+    let animated = matches!(
+        text,
+        "Waiting" | "Checking" | "Fixing" | "Loading" | "Starting"
+    );
+    let rail_color = if animated {
+        let time = ui.input(|input| input.time) as f32;
+        let pulse = 0.55 + 0.45 * ((time * 5.0).sin() * 0.5 + 0.5);
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        color_with_alpha(color, pulse)
+    } else {
+        color
+    };
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = SP_2;
+        let (rail, _) = ui.allocate_exact_size(Vec2::new(2.0, 14.0), Sense::hover());
+        ui.painter()
+            .rect_filled(rail, Rounding::same(1.0), rail_color);
+        ui.add(
+            egui::Label::new(
+                RichText::new(text)
+                    .font(type_label())
+                    .color(phase::text_secondary()),
+            )
+            .wrap(false),
+        );
+    });
 }
 
 fn diagnostics_waiting_card(ui: &mut Ui) {
-    egui::Frame::none()
-        .fill(phase::surface())
-        .stroke(Stroke::new(1.0, phase::line()))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::symmetric(14.0, 12.0))
-        .show(ui, |ui| {
-            let width = (ui.available_width() - 28.0).max(260.0);
-            ui.set_min_width(width);
-            ui.set_max_width(width);
-            ui.horizontal(|ui| {
-                draw_icon(ui, MiniIcon::Refresh, Vec2::splat(18.0), phase::blue());
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Checking connection")
-                            .font(FontId::proportional(13.5))
-                            .strong()
-                            .color(phase::text()),
-                    );
-                    ui.label(
-                        RichText::new("This should only take a few seconds.")
-                            .font(FontId::proportional(11.0))
-                            .color(phase::text_muted()),
-                    );
-                });
-            });
-        });
+    card_header(
+        ui,
+        MiniIcon::Refresh,
+        phase::blue(),
+        "Checking connection",
+        "This should only take a few seconds.",
+        Some(("Running", phase::blue())),
+    );
 }
 
 fn diagnostics_fix_waiting_card(ui: &mut Ui) {
@@ -7175,40 +7583,16 @@ fn diagnostics_fix_waiting_card(ui: &mut Ui) {
     let pulse = 0.55 + 0.45 * ((time * 4.0).sin() * 0.5 + 0.5);
     ui.ctx().request_repaint_after(Duration::from_millis(33));
 
-    egui::Frame::none()
-        .fill(phase::surface())
-        .stroke(Stroke::new(1.0, phase::line()))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::symmetric(14.0, 12.0))
-        .show(ui, |ui| {
-            let width = (ui.available_width() - 28.0).max(260.0);
-            ui.set_min_width(width);
-            ui.set_max_width(width);
-            ui.horizontal(|ui| {
-                draw_icon(
-                    ui,
-                    MiniIcon::Gear,
-                    Vec2::splat(18.0),
-                    color_with_alpha(phase::accent(), pulse),
-                );
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Preparing fix assistant")
-                            .font(FontId::proportional(13.5))
-                            .strong()
-                            .color(phase::text()),
-                    );
-                    ui.label(
-                        RichText::new("Safe network checks will appear here as they finish.")
-                            .font(FontId::proportional(11.0))
-                            .color(phase::text_muted()),
-                    );
-                    ui.add_space(8.0);
-                    animated_diagnostics_bar(ui, width - 48.0, pulse);
-                });
-            });
-        });
+    card_header(
+        ui,
+        MiniIcon::Gear,
+        color_with_alpha(phase::accent(), pulse),
+        "Preparing fix assistant",
+        "Safe network checks will appear here as they finish.",
+        Some(("Running", phase::accent())),
+    );
+    ui.add_space(SP_2);
+    animated_diagnostics_bar(ui, ui.available_width(), pulse);
 }
 
 fn diagnostics_check_card(ui: &mut Ui, check: &diagnostics::DiagnosticCheck) {
@@ -7224,64 +7608,50 @@ fn diagnostics_check_card(ui: &mut Ui, check: &diagnostics::DiagnosticCheck) {
         }
     };
 
-    egui::Frame::none()
-        .fill(phase::surface())
-        .stroke(Stroke::new(1.0, phase::line()))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::symmetric(14.0, 12.0))
-        .show(ui, |ui| {
-            let width = (ui.available_width() - 28.0).max(260.0);
-            ui.set_min_width(width);
-            ui.set_max_width(width);
-            ui.horizontal(|ui| {
-                draw_icon(ui, icon, Vec2::splat(20.0), color);
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        status_pill(ui, check.status.label(), color);
-                        ui.add_space(6.0);
-                        let elapsed = check
-                            .elapsed_ms
-                            .map(|value| format!("{value} ms"))
-                            .unwrap_or_default();
-                        ui.add_sized(
-                            Vec2::new(80.0, 15.0),
-                            egui::Label::new(
-                                RichText::new(&elapsed)
-                                    .font(FontId::proportional(10.5))
-                                    .color(phase::text_muted()),
-                            )
-                            .wrap(false),
-                        );
-                    });
-                    ui.add_space(3.0);
-                    ui.add_sized(
-                        Vec2::new((width - 42.0).max(140.0), 19.0),
-                        egui::Label::new(
-                            RichText::new(&check.title)
-                                .font(FontId::proportional(14.0))
-                                .color(phase::text()),
-                        )
-                        .wrap(false),
-                    );
-                    ui.add_space(3.0);
+    ui.horizontal_top(|ui| {
+        draw_icon(ui, icon, Vec2::splat(18.0), color);
+        ui.add_space(SP_2);
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(&check.title)
+                        .font(type_heading())
+                        .strong()
+                        .color(phase::text()),
+                );
+                status_indicator(ui, check.status.label(), color);
+                if let Some(elapsed) = check.elapsed_ms {
                     ui.label(
-                        RichText::new(&check.detail)
-                            .font(FontId::proportional(11.5))
-                            .color(phase::text_secondary()),
+                        RichText::new(format!("{elapsed} ms"))
+                            .font(type_caption())
+                            .color(phase::text_muted()),
                     );
-                    if !check.next_step.trim().is_empty() && check.next_step != "No action needed."
-                    {
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(format!("Try: {}", check.next_step))
-                                .font(FontId::proportional(11.0))
-                                .color(color),
-                        );
-                    }
-                });
+                }
             });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&check.detail)
+                        .font(type_body())
+                        .color(phase::text_secondary()),
+                )
+                .wrap(true),
+            );
+            if !check.next_step.trim().is_empty() && check.next_step != "No action needed." {
+                ui.add_space(SP_1);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Try: {}", check.next_step))
+                            .font(type_label())
+                            .color(color),
+                    )
+                    .wrap(true),
+                );
+            }
         });
+    });
+    ui.add_space(SP_2);
+    ui.separator();
 }
 
 fn diagnostics_repair_card(ui: &mut Ui, step: &diagnostics::RepairStep, animate: bool) {
@@ -7305,59 +7675,42 @@ fn diagnostics_repair_card(ui: &mut Ui, step: &diagnostics::RepairStep, animate:
     ui.add_space((1.0 - t) * 7.0);
     ui.scope(|ui| {
         ui.set_opacity(0.28 + 0.72 * t);
-        egui::Frame::none()
-            .fill(phase::surface())
-            .stroke(Stroke::new(1.0, color_with_alpha(phase::line(), 0.82)))
-            .rounding(Rounding::same(8.0))
-            .inner_margin(Margin::symmetric(14.0, 12.0))
-            .show(ui, |ui| {
-                let width = (ui.available_width() - 28.0).max(260.0);
-                ui.set_min_width(width);
-                ui.set_max_width(width);
-                ui.horizontal(|ui| {
-                    draw_icon(ui, icon, Vec2::splat(16.0), color);
-                    ui.add_space(6.0);
-                    status_pill(ui, step.status.label(), color);
-                    ui.add_space(6.0);
-                    let elapsed = step
-                        .elapsed_ms
-                        .map(|value| format!("{value} ms"))
-                        .unwrap_or_else(|| "logged".to_owned());
-                    ui.add_sized(
-                        Vec2::new(76.0, 15.0),
-                        egui::Label::new(
-                            RichText::new(&elapsed)
-                                .font(FontId::proportional(10.5))
-                                .color(phase::text_muted()),
-                        )
-                        .wrap(false),
-                    );
-                });
-                ui.add_space(5.0);
-                ui.add_sized(
-                    Vec2::new((width - 4.0).max(140.0), 19.0),
-                    egui::Label::new(
+        ui.horizontal_top(|ui| {
+            draw_icon(ui, icon, Vec2::splat(18.0), color);
+            ui.add_space(SP_2);
+            ui.vertical(|ui| {
+                let width = ui.available_width();
+                ui.set_width(width);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
                         RichText::new(&step.title)
-                            .font(FontId::proportional(14.0))
+                            .font(type_heading())
+                            .strong()
                             .color(phase::text()),
-                    )
-                    .wrap(false),
-                );
-                ui.add_space(3.0);
+                    );
+                    status_indicator(ui, step.status.label(), color);
+                    if let Some(elapsed) = step.elapsed_ms {
+                        ui.label(
+                            RichText::new(format!("{elapsed} ms"))
+                                .font(type_caption())
+                                .color(phase::text_muted()),
+                        );
+                    }
+                });
                 ui.add(
                     egui::Label::new(
                         RichText::new(&step.detail)
-                            .font(FontId::proportional(11.5))
+                            .font(type_body())
                             .color(phase::text_secondary()),
                     )
                     .wrap(true),
                 );
                 if !step.action.trim().is_empty() {
-                    ui.add_space(6.0);
+                    ui.add_space(SP_1);
                     ui.add(
                         egui::Label::new(
                             RichText::new(format!("Action: {}", step.action))
-                                .font(FontId::proportional(10.8))
+                                .font(type_label())
                                 .color(phase::text_muted()),
                         )
                         .wrap(true),
@@ -7368,10 +7721,13 @@ fn diagnostics_repair_card(ui: &mut Ui, step: &diagnostics::RepairStep, animate:
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
                 {
-                    ui.add_space(7.0);
+                    ui.add_space(SP_2);
                     diagnostics_output_panel(ui, output, width);
                 }
             });
+        });
+        ui.add_space(SP_2);
+        ui.separator();
     });
 }
 
@@ -8051,7 +8407,7 @@ fn diagnostics_snapshot_row(ui: &mut Ui, check: &DiagnosticSnapshotCheck, width:
                     color,
                 );
                 ui.add_space(5.0);
-                output_tag(ui, &check.status, color);
+                status_indicator(ui, &check.status, color);
                 ui.add_space(5.0);
                 ui.label(
                     RichText::new(&check.title)
@@ -8120,22 +8476,6 @@ fn snapshot_color(snapshot: &DiagnosticSnapshot) -> Color32 {
     }
 }
 
-fn output_tag(ui: &mut Ui, text: &str, color: Color32) {
-    egui::Frame::none()
-        .fill(color_with_alpha(color, 0.12))
-        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.45)))
-        .rounding(Rounding::same(999.0))
-        .inner_margin(Margin::symmetric(7.0, 2.0))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .font(FontId::proportional(9.8))
-                    .strong()
-                    .color(color),
-            );
-        });
-}
-
 fn status_label_color(label: &str) -> Color32 {
     match label {
         "Good" => phase::green(),
@@ -8155,34 +8495,16 @@ fn diagnostics_likely_cause_card(ui: &mut Ui, report: &diagnostics::RepairReport
         diagnostics::DiagnosticStatus::Problem => phase::red(),
     };
 
-    egui::Frame::none()
-        .fill(phase::input())
-        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.65)))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::symmetric(14.0, 12.0))
-        .show(ui, |ui| {
-            let width = (ui.available_width() - 28.0).max(260.0);
-            ui.set_min_width(width);
-            ui.set_max_width(width);
-            ui.horizontal(|ui| {
-                draw_icon(ui, MiniIcon::Info, Vec2::splat(18.0), color);
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Most likely cause")
-                            .font(FontId::proportional(13.5))
-                            .strong()
-                            .color(phase::text()),
-                    );
-                    ui.add_space(3.0);
-                    ui.label(
-                        RichText::new(&report.likely_cause)
-                            .font(FontId::proportional(11.5))
-                            .color(phase::text_secondary()),
-                    );
-                });
-            });
-        });
+    ui.separator();
+    ui.add_space(SP_2);
+    card_header(
+        ui,
+        MiniIcon::Info,
+        color,
+        "Most likely cause",
+        &report.likely_cause,
+        None,
+    );
 }
 
 fn animated_diagnostics_bar(ui: &mut Ui, width: f32, pulse: f32) {
@@ -8621,20 +8943,6 @@ fn sha256_file(path: &std::path::Path) -> Result<String, String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn show_update_notification(version: &str) {
-    let title = "Phase Animator";
-    let body = format!("Update available: {version}");
-    show_system_notification(title, &body);
-}
-
-fn show_system_notification(title: &str, body: &str) {
-    let _ = notify_rust::Notification::new()
-        .appname("Phase Animator")
-        .summary(title)
-        .body(body)
-        .show();
-}
-
 fn display_linked_user(user: &verification::LinkedUser) -> String {
     user.display_name
         .as_deref()
@@ -8662,6 +8970,27 @@ fn compact_path(path: &std::path::Path, max_chars: usize) -> String {
         .rev()
         .collect();
     format!("...{tail}")
+}
+
+fn compact_middle(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars || max_chars < 5 {
+        return text.to_owned();
+    }
+
+    let visible = max_chars - 3;
+    let head_count = (visible + 1) / 2;
+    let tail_count = visible / 2;
+    let head: String = text.chars().take(head_count).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(tail_count)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
 }
 
 fn initials(text: &str) -> String {
@@ -8746,6 +9075,25 @@ fn theme_matches_search(asset: &verification::PhaseThemeAsset, search: &str) -> 
     let haystack =
         format!("{} {} {} {}", asset.title, asset.description, owner, tags).to_ascii_lowercase();
     haystack.contains(&search)
+}
+
+fn paint_theme_texture(
+    painter: &egui::Painter,
+    rect: Rect,
+    texture: &TextureHandle,
+    mode: ThemeBackgroundMode,
+    opacity: f32,
+) {
+    if opacity <= 0.001 {
+        return;
+    }
+    let (image_rect, uv_rect) = theme_background_layout(rect, texture.size_vec2(), mode);
+    painter.image(
+        texture.id(),
+        image_rect,
+        uv_rect,
+        Color32::from_white_alpha((255.0 * opacity.clamp(0.0, 1.0)).round() as u8),
+    );
 }
 
 fn theme_background_layout(
@@ -8952,45 +9300,24 @@ fn secondary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui
             )
         })
         .inner;
+    let hv = hover_t(ui, response.id, response.hovered() && ui.is_enabled());
+    if hv > 0.0 {
+        ui.painter().rect_stroke(
+            response.rect.expand(1.0 + hv),
+            Rounding::same(CONTROL_ROUNDING + 1.0),
+            Stroke::new(1.0, color_with_alpha(phase::accent(), 0.3 * hv)),
+        );
+    }
     top_highlight(
         ui.painter(),
         response.rect,
         CONTROL_ROUNDING,
-        color_with_alpha(Color32::WHITE, 0.04),
+        color_with_alpha(Color32::WHITE, 0.04 + 0.07 * hv),
     );
+    if response.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     response
-}
-
-fn status_action(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) {
-    let visuals = PhaseButtonVisuals {
-        fill: phase::surface_active(),
-        hover_fill: phase::surface_active(),
-        active_fill: phase::surface_active(),
-        stroke: Stroke::new(1.0, phase::line()),
-        hover_stroke: Stroke::new(1.0, phase::line()),
-        active_stroke: Stroke::new(1.0, phase::line()),
-        text_color: phase::text_secondary(),
-    };
-
-    ui.scope(|ui| {
-        apply_button_visuals(ui, visuals);
-        let _ = ui.add_sized(
-            size,
-            Button::new(icon_button_text(
-                icon,
-                text,
-                Some(phase::green()),
-                14.0,
-                15.0,
-                8.0,
-            ))
-            .frame(true)
-            .min_size(size)
-            .rounding(Rounding::same(CONTROL_ROUNDING))
-            .sense(Sense::hover())
-            .wrap(false),
-        );
-    });
 }
 
 mod phase {
@@ -9028,6 +9355,45 @@ mod phase {
         let lock = PALETTE.get_or_init(|| RwLock::new(default_palette()));
         if let Ok(mut current) = lock.write() {
             *current = palette;
+        }
+    }
+
+    pub fn snapshot() -> Palette {
+        current()
+    }
+
+    pub fn blend(from: Palette, to: Palette, t: f32) -> Palette {
+        let mix = |a: Color32, b: Color32| {
+            let t = t.clamp(0.0, 1.0);
+            let channel = |left: u8, right: u8| {
+                (left as f32 + (right as f32 - left as f32) * t).round() as u8
+            };
+            Color32::from_rgba_unmultiplied(
+                channel(a.r(), b.r()),
+                channel(a.g(), b.g()),
+                channel(a.b(), b.b()),
+                channel(a.a(), b.a()),
+            )
+        };
+
+        Palette {
+            background: mix(from.background, to.background),
+            surface: mix(from.surface, to.surface),
+            surface_hover: mix(from.surface_hover, to.surface_hover),
+            surface_active: mix(from.surface_active, to.surface_active),
+            input: mix(from.input, to.input),
+            line: mix(from.line, to.line),
+            accent: mix(from.accent, to.accent),
+            accent_hover: mix(from.accent_hover, to.accent_hover),
+            accent_dim: mix(from.accent_dim, to.accent_dim),
+            blue: mix(from.blue, to.blue),
+            green: mix(from.green, to.green),
+            red: mix(from.red, to.red),
+            warning: mix(from.warning, to.warning),
+            text: mix(from.text, to.text),
+            text_secondary: mix(from.text_secondary, to.text_secondary),
+            text_muted: mix(from.text_muted, to.text_muted),
+            text_on_accent: mix(from.text_on_accent, to.text_on_accent),
         }
     }
 
@@ -9229,5 +9595,15 @@ mod tests {
             parse_theme_background_image_id("PA1|Theme|000000.111111|i96046223266953").as_deref(),
             Some("96046223266953")
         );
+    }
+
+    #[test]
+    fn content_width_reserves_page_insets_and_scrollbar() {
+        assert_eq!(
+            responsive_content_width(APP_WIDTH - PAGE_H_INSET * 2.0),
+            390.0
+        );
+        assert_eq!(responsive_content_width(320.0 - PAGE_H_INSET * 2.0), 260.0);
+        assert_eq!(responsive_content_width(800.0), MAX_CONTENT_WIDTH);
     }
 }
