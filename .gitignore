@@ -20,3 +20,7 @@ desktop.ini
 
 # random local logs
 *.log
+
+# visual test harness artifacts
+ui-test/
+reference-ui.png

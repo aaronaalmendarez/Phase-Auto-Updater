@@ -8,11 +8,7 @@ Native companion app for the Phase Animator Roblox Studio plugin.
 
 This is the public client app. It is written in Rust with egui so it can feel close to the plugin without needing a browser wrapper.
 
-The companion connects to Phase, checks for the latest release, installs the plugin into the local Roblox Studio plugins folder, runs local video-reference sync, and exposes a local acceleration bridge for future high-pressure plugin workloads.
-
-<p align="center">
-  <img src="assets/ScreenshotPhase.png" alt="Phase Auto Updater app screenshot" width="456">
-</p>
+The companion connects to Phase, checks for the latest release, installs the plugin into the local Roblox Studio plugins folder, and runs local video-reference sync.
 
 ## what it does
 
@@ -24,9 +20,6 @@ The companion connects to Phase, checks for the latest release, installs the plu
 - can apply public Phase marketplace themes to the installer UI
 - opens a Video Reference tab for syncing Phase Animator to YouTube or local video files
 - runs a local `ws://127.0.0.1:27731/phase-video-reference` bridge for Studio timeline/playback sync
-- runs a local `ws://127.0.0.1:27730/phase-companion` bridge for Studio companion detection and future native acceleration
-- shows a Boost Doctor snapshot in the Video tab so Studio can surface which bottlenecks deserve companion acceleration first
-- advertises planned native boost capabilities such as IK playback prebake, timeline indexing, local cache, and compact payload batching
 - renders local MP4/MOV/M4V/WebM files in a native popup with custom controls, volume, scrubbing, rate, loop, fullscreen, swap video, and show-folder actions
 - embeds YouTube with the native YouTube player while still listening for play, pause, seek, and rate sync events
 - watches for new updater events and sends a desktop notification
@@ -35,7 +28,7 @@ The companion connects to Phase, checks for the latest release, installs the plu
 - makes a backup of the existing plugin file first
 - checks GitHub Releases for newer installer builds
 
-The UI is compact and shaped like a small installer. Long account names, file paths, and video references use horizontal scrolling so they do not break the layout.
+The UI is a responsive companion workspace: release and install work stays on the left, live account and Roblox identity context stays on the right, and the identity rail collapses cleanly on narrower windows. Long account names, file paths, and video references still scroll safely without breaking the layout.
 
 ## building it
 

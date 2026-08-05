@@ -377,16 +377,13 @@ pub fn fetch_phase_avatar_image(url: &str) -> Result<Vec<u8>, String> {
     fetch_image_bytes(&site_url(url))
 }
 
-pub fn fetch_roblox_avatar_image(user_id: &str) -> Result<Vec<u8>, String> {
+pub fn fetch_roblox_avatar_full_body_image(user_id: &str) -> Result<Vec<u8>, String> {
     let user_id = user_id.trim();
     if user_id.is_empty() {
         return Err("Missing Roblox user ID.".to_owned());
     }
 
-    let url = format!(
-        "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={}&size=150x150&format=Png&isCircular=true",
-        url_escape(user_id)
-    );
+    let url = roblox_avatar_thumbnail_url(user_id);
     let response = http_agent()?
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
@@ -402,6 +399,42 @@ pub fn fetch_roblox_avatar_image(user_id: &str) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "Roblox did not return an avatar image.".to_owned())?;
 
     fetch_image_bytes(&image_url)
+}
+
+pub fn fetch_roblox_username(user_id: &str) -> Result<String, String> {
+    let user_id = user_id.trim();
+    if user_id.is_empty() {
+        return Err("Missing Roblox user ID.".to_owned());
+    }
+
+    let profile = http_agent()?
+        .get(&roblox_user_profile_url(user_id))
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+        .map_err(|error| format!("Could not fetch Roblox account name: {error}"))?
+        .into_json::<RobloxUserProfile>()
+        .map_err(|error| format!("Invalid Roblox account response: {error}"))?;
+
+    let username = profile.name.trim();
+    if username.is_empty() {
+        Err("Roblox returned an empty account name.".to_owned())
+    } else {
+        Ok(username.to_owned())
+    }
+}
+
+fn roblox_avatar_thumbnail_url(user_id: &str) -> String {
+    format!(
+        "https://thumbnails.roblox.com/v1/users/avatar?userIds={}&size=420x420&format=Png&isCircular=false",
+        url_escape(user_id.trim())
+    )
+}
+
+fn roblox_user_profile_url(user_id: &str) -> String {
+    format!(
+        "https://users.roblox.com/v1/users/{}",
+        url_escape(user_id.trim())
+    )
 }
 
 pub fn fetch_roblox_asset_thumbnail_image(asset_id: &str) -> Result<Vec<u8>, String> {
@@ -760,6 +793,11 @@ struct RobloxThumbnail {
     image_url: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct RobloxUserProfile {
+    name: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSessionRequest {
@@ -833,4 +871,27 @@ fn url_escape(value: &str) -> String {
             _ => format!("%{byte:02X}").chars().collect(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roblox_avatar_url_requests_full_body_transparent_thumbnail() {
+        let url = roblox_avatar_thumbnail_url("12345");
+        assert!(url.contains("/v1/users/avatar?"));
+        assert!(url.contains("userIds=12345"));
+        assert!(url.contains("size=420x420"));
+        assert!(url.contains("isCircular=false"));
+        assert!(!url.contains("avatar-headshot"));
+    }
+
+    #[test]
+    fn roblox_profile_url_requests_user_by_id() {
+        assert_eq!(
+            roblox_user_profile_url(" 299264228 "),
+            "https://users.roblox.com/v1/users/299264228"
+        );
+    }
 }

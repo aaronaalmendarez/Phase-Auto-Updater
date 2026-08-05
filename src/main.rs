@@ -1,10 +1,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-mod companion;
 mod detector;
 mod diagnostics;
-mod discord_presence;
 mod motion;
+mod ui_v2;
 mod verification;
 mod video_reference;
 
@@ -36,16 +35,13 @@ use tray_icon::{
 const APP_NAME: &str = "Phase Companion";
 const CURRENT_BUILD_ID: &str = "phase-2026-06-05-rustls-v0-19-8";
 const PHOSPHOR_FONT: &str = "phosphor-icons";
-const APP_WIDTH: f32 = 450.0;
-// Responsive content column. The UI lays everything out in a single centered
-// column whose width tracks the window but is clamped to this range, so wide
-// windows get balanced margins instead of stretched rows and narrow windows
-// shrink to fit instead of clipping.
-const MAX_CONTENT_WIDTH: f32 = 560.0;
-const MIN_CONTENT_WIDTH: f32 = 296.0;
-const PAGE_H_INSET: f32 = 20.0;
+const UI_FONT_REGULAR: &str = "phase-ui-regular";
+const UI_FONT_SEMIBOLD: &str = "phase-ui-semibold";
+const APP_WIDTH: f32 = 680.0;
+const APP_HEIGHT: f32 = 382.5;
+const MIN_APP_WIDTH: f32 = 680.0;
+const MIN_APP_HEIGHT: f32 = 382.5;
 const PAGE_BOTTOM_INSET: f32 = 16.0;
-const SCROLLBAR_GUTTER: f32 = 12.0;
 const BODY_RIGHT_INSET: f32 = 8.0;
 const CARD_H_MARGIN: f32 = 14.0;
 const THEME_ROW_MARGIN: f32 = 12.0;
@@ -88,11 +84,6 @@ fn card_inner() -> f32 {
     (content_w() - CARD_H_MARGIN * 2.0).max(1.0)
 }
 
-fn responsive_content_width(available_width: f32) -> f32 {
-    let usable_width = (available_width - SCROLLBAR_GUTTER - BODY_RIGHT_INSET).max(1.0);
-    usable_width.clamp(MIN_CONTENT_WIDTH.min(usable_width), MAX_CONTENT_WIDTH)
-}
-
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|arg| arg == "--smoke-test") {
         if run_smoke_test().is_err() {
@@ -111,8 +102,8 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([APP_WIDTH, 620.0])
-            .with_min_inner_size([320.0, 520.0])
+            .with_inner_size([APP_WIDTH, APP_HEIGHT])
+            .with_min_inner_size([MIN_APP_WIDTH, MIN_APP_HEIGHT])
             .with_transparent(true)
             .with_title(APP_NAME)
             .with_icon(load_window_icon()),
@@ -141,6 +132,12 @@ fn popup_arg_path() -> Option<PathBuf> {
 fn run_smoke_test() -> Result<(), String> {
     if include_bytes!("../assets/PhaseAnimator.png").is_empty() {
         return Err("Missing PhaseAnimator.png".to_owned());
+    }
+    if include_bytes!("../assets/PhaseLogo.png").is_empty() {
+        return Err("Missing PhaseLogo.png".to_owned());
+    }
+    if include_bytes!("../assets/RobloxTiltWhite.png").is_empty() {
+        return Err("Missing RobloxTiltWhite.png".to_owned());
     }
     if include_bytes!("../assets/Phosphor.ttf").is_empty() {
         return Err("Missing Phosphor.ttf".to_owned());
@@ -182,10 +179,10 @@ impl ViewTab {
     fn index(self) -> usize {
         match self {
             ViewTab::Install => 0,
-            ViewTab::Account => 1,
+            ViewTab::Video => 1,
             ViewTab::Folders => 2,
-            ViewTab::Video => 3,
-            ViewTab::Options => 4,
+            ViewTab::Options => 3,
+            ViewTab::Account => 4,
         }
     }
 }
@@ -205,6 +202,7 @@ struct AvatarFetchResult {
     kind: AvatarKind,
     key: String,
     image: Result<ColorImage, String>,
+    roblox_username: Option<String>,
 }
 
 struct ThemeBackgroundFetchResult {
@@ -312,6 +310,8 @@ struct AccountCache {
 
 struct PhaseInstallerApp {
     logo: Option<TextureHandle>,
+    phase_brand_logo: Option<TextureHandle>,
+    roblox_brand_logo: Option<TextureHandle>,
     phase_avatar: Option<TextureHandle>,
     phase_avatar_key: Option<String>,
     roblox_avatar: Option<TextureHandle>,
@@ -394,10 +394,6 @@ struct PhaseInstallerApp {
     video_bridge_listening: bool,
     video_bridge_connected: bool,
     video_bridge_status: String,
-    companion_bridge: companion::CompanionBridge,
-    companion_bridge_listening: bool,
-    companion_bridge_connected: bool,
-    companion_bridge_status: String,
     video_source: String,
     video_title: String,
     video_duration_seconds: String,
@@ -416,6 +412,7 @@ struct PhaseInstallerApp {
     video_last_plugin_state: String,
     video_last_reference_status: String,
     phase: InstallPhase,
+    ui_started_at: Instant,
     active_tab: ViewTab,
     reset_body_scroll: bool,
     progress: f32,
@@ -425,6 +422,12 @@ struct PhaseInstallerApp {
     tab_indicator: motion::SpringValue,
     tab_page_motion: motion::PagerMotion<ViewTab>,
     milestone: u32,
+    news_page: usize,
+    news_changed_at: Instant,
+    workspace_body_height: f32,
+    gradient_cache: HashMap<GradientKey, TextureHandle>,
+    screenshot_path: Option<PathBuf>,
+    screenshot_frames: u32,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     tray: Option<TrayController>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -458,13 +461,21 @@ impl PhaseInstallerApp {
         let video_bridge_config = video_reference::BridgeConfig::default_local();
         let video_bridge =
             video_reference::VideoReferenceBridge::start(video_bridge_config.clone());
-        let companion_bridge_config = companion::CompanionConfig::default_local();
-        let companion_bridge = companion::CompanionBridge::start(companion_bridge_config.clone());
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let (tray_tx, tray_rx) = mpsc::channel();
 
         let mut app = Self {
             logo: load_logo(&cc.egui_ctx),
+            phase_brand_logo: load_embedded_texture(
+                &cc.egui_ctx,
+                "phase-brand-logo",
+                include_bytes!("../assets/PhaseLogo.png"),
+            ),
+            roblox_brand_logo: load_embedded_texture(
+                &cc.egui_ctx,
+                "roblox-tilt-white",
+                include_bytes!("../assets/RobloxTiltWhite.png"),
+            ),
             phase_avatar: None,
             phase_avatar_key: None,
             roblox_avatar: None,
@@ -546,10 +557,6 @@ impl PhaseInstallerApp {
             video_bridge_listening: false,
             video_bridge_connected: false,
             video_bridge_status: "Starting video bridge.".to_owned(),
-            companion_bridge,
-            companion_bridge_listening: false,
-            companion_bridge_connected: false,
-            companion_bridge_status: "Starting companion bridge.".to_owned(),
             video_source: String::new(),
             video_title: String::new(),
             video_duration_seconds: String::new(),
@@ -568,6 +575,7 @@ impl PhaseInstallerApp {
             video_last_plugin_state: "No Studio timeline state yet.".to_owned(),
             video_last_reference_status: "No reference sent.".to_owned(),
             phase: InstallPhase::Idle,
+            ui_started_at: Instant::now(),
             active_tab: ViewTab::Install,
             reset_body_scroll: false,
             progress: 0.0,
@@ -576,6 +584,14 @@ impl PhaseInstallerApp {
             tab_indicator: motion::SpringValue::new(0.0),
             tab_page_motion: motion::PagerMotion::new(ViewTab::Install),
             milestone: 0,
+            news_page: 0,
+            news_changed_at: Instant::now(),
+            workspace_body_height: 480.0,
+            gradient_cache: HashMap::new(),
+            screenshot_path: std::env::var_os("PHASE_UI_SCREENSHOT")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty()),
+            screenshot_frames: 0,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             tray: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -627,6 +643,37 @@ impl PhaseInstallerApp {
         app.begin_app_update_check(&cc.egui_ctx);
         app.begin_theme_fetch(&cc.egui_ctx);
 
+        // Hidden screenshot harness: jump straight to the requested tab so the
+        // visual test can photograph any surface without clicking through, and
+        // pin the default palette so theme captures stay comparable.
+        if app.screenshot_path.is_some() {
+            if let Some(selection) = app.selected_theme.take() {
+                drop(selection);
+                phase::reset_palette();
+                configure_style(&cc.egui_ctx);
+            } else {
+                phase::reset_palette();
+            }
+            app.theme_background_key = None;
+            app.theme_background = None;
+            app.theme_outgoing_background = None;
+            let tab = match std::env::var("PHASE_UI_TAB").ok().as_deref() {
+                Some("video") => ViewTab::Video,
+                Some("folders") => ViewTab::Folders,
+                Some("settings") | Some("options") => ViewTab::Options,
+                Some("account") => ViewTab::Account,
+                _ => ViewTab::Install,
+            };
+            app.active_tab = tab;
+            app.tab_page_motion = motion::PagerMotion::new(tab);
+            app.tab_indicator = motion::SpringValue::new(match tab {
+                ViewTab::Video => 1.0,
+                ViewTab::Folders => 2.0,
+                ViewTab::Options => 3.0,
+                ViewTab::Install | ViewTab::Account => 0.0,
+            });
+        }
+
         app
     }
 
@@ -670,7 +717,6 @@ impl PhaseInstallerApp {
         self.poll_theme_preview_fetches(ctx);
         self.poll_tray(ctx);
         self.poll_video_bridge(ctx);
-        self.poll_companion_bridge(ctx);
         self.tick_video_playback(ctx);
         self.finish_tray_close(ctx);
 
@@ -794,11 +840,11 @@ impl PhaseInstallerApp {
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
-            egui::ViewportCommand::MinInnerSize(Vec2::new(320.0, 520.0)),
+            egui::ViewportCommand::MinInnerSize(Vec2::new(MIN_APP_WIDTH, MIN_APP_HEIGHT)),
         );
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
-            egui::ViewportCommand::InnerSize(Vec2::new(APP_WIDTH, 620.0)),
+            egui::ViewportCommand::InnerSize(Vec2::new(APP_WIDTH, APP_HEIGHT)),
         );
         if let Some(pos) = self.main_window_pos {
             ctx.send_viewport_cmd_to(
@@ -2354,13 +2400,35 @@ impl PhaseInstallerApp {
                 AvatarKind::Roblox,
                 key.clone(),
                 ctx.clone(),
-                move || verification::fetch_roblox_avatar_image(&key),
+                move || verification::fetch_roblox_avatar_full_body_image(&key),
             );
         }
     }
 
     fn poll_avatar_fetches(&mut self, ctx: &Context) {
         while let Ok(result) = self.avatar_rx.try_recv() {
+            let result_is_current = match result.kind {
+                AvatarKind::Phase => self.phase_avatar_key.as_deref() == Some(result.key.as_str()),
+                AvatarKind::Roblox => {
+                    self.roblox_avatar_key.as_deref() == Some(result.key.as_str())
+                }
+            };
+            if !result_is_current {
+                continue;
+            }
+            if matches!(result.kind, AvatarKind::Roblox) {
+                if let Some(username) = result
+                    .roblox_username
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|username| !username.is_empty())
+                {
+                    if self.roblox_username.as_deref() != Some(username) {
+                        self.roblox_username = Some(username.to_owned());
+                        self.save_account_cache();
+                    }
+                }
+            }
             let Ok(image) = result.image else {
                 continue;
             };
@@ -2543,80 +2611,6 @@ impl PhaseInstallerApp {
                 }
             }
             ctx.request_repaint();
-        }
-    }
-
-    fn poll_companion_bridge(&mut self, ctx: &Context) {
-        for event in self.companion_bridge.poll() {
-            match event {
-                companion::CompanionEvent::Listening { url } => {
-                    self.companion_bridge_listening = true;
-                    self.companion_bridge_status = format!("Listening on {url}");
-                    self.log(phase::green(), "Phase Companion bridge is listening.");
-                }
-                companion::CompanionEvent::ClientConnected => {
-                    self.companion_bridge_connected = true;
-                    self.companion_bridge_status =
-                        "Studio connected to companion bridge.".to_owned();
-                    self.log(phase::green(), "Studio connected to companion bridge.");
-                }
-                companion::CompanionEvent::ClientDisconnected => {
-                    self.companion_bridge_connected = false;
-                    self.companion_bridge_status =
-                        "Studio disconnected from companion bridge.".to_owned();
-                    self.log(
-                        phase::warning(),
-                        "Studio disconnected from companion bridge.",
-                    );
-                }
-                companion::CompanionEvent::PacketReceived(packet) => {
-                    self.handle_companion_packet(packet);
-                }
-                companion::CompanionEvent::PacketSent { op } => {
-                    self.companion_bridge_status = format!("Sent {op} to Studio.");
-                }
-                companion::CompanionEvent::SendFailed { op, message } => {
-                    self.companion_bridge_status = format!("{op} failed: {message}");
-                    self.log(phase::warning(), self.companion_bridge_status.clone());
-                }
-                companion::CompanionEvent::Error(error) => {
-                    self.companion_bridge_status = error.clone();
-                    self.log(phase::red(), error);
-                }
-                companion::CompanionEvent::Stopped => {
-                    self.companion_bridge_listening = false;
-                    self.companion_bridge_connected = false;
-                    self.companion_bridge_status = "Companion bridge stopped.".to_owned();
-                }
-            }
-            ctx.request_repaint();
-        }
-    }
-
-    fn handle_companion_packet(&mut self, packet: companion::CompanionPacket) {
-        let payload = packet.payload;
-        match packet.op.as_str() {
-            "hello" => {
-                self.companion_bridge_status = "Studio hello received.".to_owned();
-            }
-            "ping" => {
-                self.companion_bridge_status = "Ping received from Studio.".to_owned();
-            }
-            "discord_presence.update" => {
-                self.companion_bridge_status = "Discord Presence update received.".to_owned();
-            }
-            "discord_presence.clear" => {
-                self.companion_bridge_status = "Discord Presence cleared.".to_owned();
-            }
-            "error" => {
-                let message = payload
-                    .get("message")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("Studio reported a companion bridge error.");
-                self.companion_bridge_status = message.to_owned();
-                self.log(phase::red(), message);
-            }
-            _ => {}
         }
     }
 
@@ -3292,6 +3286,7 @@ impl eframe::App for PhaseInstallerApp {
         apply_windows_title_bar(frame, self.hidden_to_tray && self.tray_panel_open);
         self.remember_main_window_position(ctx);
         self.handle_close_request(ctx);
+        self.tick_screenshot_harness(ctx);
         self.tick(ctx);
 
         egui::CentralPanel::default()
@@ -3310,57 +3305,7 @@ impl eframe::App for PhaseInstallerApp {
                     return;
                 }
 
-                self.paint_theme_background(ui);
-                egui::Frame::none()
-                    .inner_margin(Margin::symmetric(PAGE_H_INSET, 0.0))
-                    .show(ui, |ui| {
-                        // The frame is the hard page boundary. Child panels and
-                        // scroll content cannot paint into either outer inset.
-                        let column = responsive_content_width(ui.available_width());
-                        set_content_width(column);
-                        ui.vertical_centered(|ui| {
-                            ui.set_width(content_w() + SCROLLBAR_GUTTER + BODY_RIGHT_INSET);
-                            ui.add_space(SP_6);
-                            ui.scope(|ui| {
-                                ui.set_width(content_w());
-                                self.identity_strip(ui);
-                                self.title_block(ui);
-                                ui.add_space(SP_5);
-
-                                // Underline tab selector
-                                self.draw_custom_tabs(ui);
-                                ui.add_space(SP_5);
-                            });
-
-                            egui::Frame::none()
-                                .inner_margin(Margin {
-                                    left: 0.0,
-                                    right: BODY_RIGHT_INSET,
-                                    top: 0.0,
-                                    bottom: 0.0,
-                                })
-                                .show(ui, |ui| {
-                                    let mut body_scroll = egui::ScrollArea::vertical()
-                                        .id_source("phase-installer-body")
-                                        .auto_shrink([false, false]);
-                                    if self.reset_body_scroll {
-                                        body_scroll = body_scroll.vertical_scroll_offset(0.0);
-                                    }
-                                    body_scroll.show(ui, |ui| {
-                                        ui.vertical_centered(|ui| {
-                                            ui.set_width(content_w());
-                                            self.current_tab(ui);
-                                            if self.active_tab == ViewTab::Install {
-                                                ui.add_space(8.0);
-                                                self.activity_block(ui);
-                                            }
-                                            ui.add_space(PAGE_BOTTOM_INSET);
-                                        });
-                                    });
-                                    self.reset_body_scroll = false;
-                                });
-                        });
-                    });
+                self.render_companion_root(ui);
             });
         self.show_notification_viewport(ctx);
         if !self.hidden_to_tray {
@@ -3382,7 +3327,6 @@ impl eframe::App for PhaseInstallerApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.video_bridge.stop();
-        self.companion_bridge.stop();
         self.cleanup_tray();
     }
 
@@ -3967,15 +3911,88 @@ impl PhaseInstallerApp {
             });
     }
 
+    /// Hidden visual-test harness. When `PHASE_UI_SCREENSHOT` points at a PNG
+    /// path, force the reference window size, let entrance animations finish,
+    /// capture the viewport, save it, and close. Production runs never set the
+    /// env var, so none of this can trigger in the wild.
+    fn tick_screenshot_harness(&mut self, ctx: &Context) {
+        let Some(path) = self.screenshot_path.clone() else {
+            return;
+        };
+        self.screenshot_frames += 1;
+        match self.screenshot_frames {
+            2 => ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                APP_WIDTH, APP_HEIGHT,
+            ))),
+            170 => ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot),
+            _ => {}
+        }
+
+        let captured = ctx.input(|input| {
+            input.raw.events.iter().find_map(|event| match event {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = captured {
+            save_screenshot_image(&path, &image);
+            self.allow_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        // Keep frames flowing so the frame budget elapses quickly even when the
+        // app would otherwise idle.
+        ctx.request_repaint();
+    }
+
     fn paint_theme_background(&self, ui: &mut Ui) {
         let rect = ui.max_rect();
         let painter = ui.painter();
 
-        // Base wash: a barely-there vertical gradient (a touch brighter up top)
-        // gives the flat canvas quiet depth even with no theme image set.
-        let top = lerp_color(phase::background(), phase::surface(), 0.22);
-        let bottom = lerp_color(phase::background(), Color32::BLACK, 0.12);
+        // Midnight Companion canvas: a near-black base with a wide plum glow
+        // anchored upper-left, a magenta kiss on the right behind the identity
+        // rail, and corners that fall off to black. The colors still come from
+        // the active Phase theme, so marketplace palettes retain their
+        // personality inside the redesigned shell.
+        let top = lerp_color(phase::background(), phase::surface(), 0.34);
+        let bottom = lerp_color(phase::background(), Color32::BLACK, 0.52);
         vertical_gradient(painter, rect, top, bottom);
+
+        radial_gradient(
+            painter,
+            Pos2::new(
+                rect.left() + rect.width() * 0.16,
+                rect.top() + rect.height() * 0.3,
+            ),
+            rect.width().max(rect.height()) * 0.62,
+            color_with_alpha(lerp_color(phase::surface(), phase::accent_dim(), 0.6), 0.5),
+        );
+        radial_gradient(
+            painter,
+            Pos2::new(
+                rect.right() - rect.width() * 0.08,
+                rect.top() + rect.height() * 0.5,
+            ),
+            rect.width().max(rect.height()) * 0.4,
+            color_with_alpha(lerp_color(phase::accent_dim(), phase::accent(), 0.5), 0.16),
+        );
+        // Smooth falloff to black on the right edge and the bottom, so the
+        // corners melt away without any visible mesh seams.
+        horizontal_gradient(
+            painter,
+            rect,
+            Color32::TRANSPARENT,
+            Color32::from_black_alpha(86),
+        );
+        vertical_gradient(
+            painter,
+            Rect::from_min_max(
+                Pos2::new(rect.left(), rect.top() + rect.height() * 0.55),
+                rect.right_bottom(),
+            ),
+            Color32::TRANSPARENT,
+            Color32::from_black_alpha(120),
+        );
 
         // Keep the outgoing image alive until the incoming texture is loaded,
         // then crossfade them rather than flashing through an empty canvas.
@@ -4011,12 +4028,12 @@ impl PhaseInstallerApp {
                     phase::background().r(),
                     phase::background().g(),
                     phase::background().b(),
-                    242,
+                    224,
                 ),
             );
         }
 
-        // Faint top accent bloom — anchors the hero without shouting.
+        // A quiet top wash visually joins the brand row to the workspace.
         let bloom = Rect::from_center_size(
             Pos2::new(rect.center().x, rect.top() - 40.0),
             Vec2::new(rect.width() * 1.4, 220.0),
@@ -4024,7 +4041,7 @@ impl PhaseInstallerApp {
         vertical_gradient(
             painter,
             bloom,
-            color_with_alpha(phase::accent(), 0.06),
+            color_with_alpha(phase::accent(), 0.08),
             color_with_alpha(phase::accent(), 0.0),
         );
     }
@@ -4056,499 +4073,6 @@ impl PhaseInstallerApp {
             InstallPhase::Downloading | InstallPhase::Installing => {}
             _ => {}
         }
-    }
-
-    fn draw_custom_tabs(&mut self, ui: &mut Ui) {
-        let target_x = self.active_tab.index() as f32;
-        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 1.0 / 30.0);
-        if self
-            .tab_indicator
-            .step(target_x, dt, motion::Spring::expressive())
-        {
-            ui.ctx().request_repaint();
-        }
-        let indicator_x = self.tab_indicator.value();
-
-        let width = content_w();
-        let height = 42.0;
-
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
-        let tab_width = width / 5.0;
-        let hovered_idx = response
-            .hover_pos()
-            .map(|pos| (((pos.x - rect.left()) / tab_width).floor() as i32).clamp(0, 4));
-        let painter = ui.painter();
-
-        // Underline tabs: no boxed track. A faint full-width rail anchors the
-        // strip, and a glowing accent underline slides to the active tab.
-        gradient_hline(
-            painter,
-            rect.left()..=rect.right(),
-            rect.bottom() - 0.5,
-            color_with_alpha(phase::line(), 0.7),
-        );
-
-        let ind_center = rect.left() + (indicator_x + 0.5) * tab_width;
-        let half = (tab_width * 0.44).clamp(24.0, 68.0);
-        let uy = rect.bottom();
-        // Soft glow rising off the rail.
-        vertical_gradient(
-            painter,
-            Rect::from_min_max(
-                Pos2::new(ind_center - half, uy - 18.0),
-                Pos2::new(ind_center + half, uy),
-            ),
-            color_with_alpha(phase::accent(), 0.0),
-            color_with_alpha(phase::accent(), 0.2),
-        );
-        // The bar itself: a wide central plateau that fades out toward both ends
-        // so the tips "round down" instead of stopping hard.
-        let (top, bot) = (uy - 3.0, uy);
-        let edge = color_with_alpha(phase::accent(), 0.0);
-        let full = phase::accent();
-        let plateau = half * 0.55;
-        let mut bar = egui::Mesh::default();
-        for (x, c) in [
-            (ind_center - half, edge),
-            (ind_center - plateau, full),
-            (ind_center + plateau, full),
-            (ind_center + half, edge),
-        ] {
-            bar.colored_vertex(Pos2::new(x, top), c);
-            bar.colored_vertex(Pos2::new(x, bot), c);
-        }
-        for s in 0..3u32 {
-            let b = s * 2;
-            bar.add_triangle(b, b + 1, b + 2);
-            bar.add_triangle(b + 1, b + 3, b + 2);
-        }
-        painter.add(egui::Shape::mesh(bar));
-
-        if response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let rel_x = pos.x - rect.left();
-                let tab_idx = (rel_x / tab_width).floor() as i32;
-                if let Some(tab) = match tab_idx {
-                    0 => Some(ViewTab::Install),
-                    1 => Some(ViewTab::Account),
-                    2 => Some(ViewTab::Folders),
-                    3 => Some(ViewTab::Video),
-                    4 => Some(ViewTab::Options),
-                    _ => None,
-                } {
-                    self.select_tab(tab);
-                }
-            }
-        }
-
-        let labels = ["Install", "Account", "Folders", "Video", "Options"];
-        let icons = [
-            MiniIcon::Bolt,
-            MiniIcon::User,
-            MiniIcon::Folder,
-            MiniIcon::External,
-            MiniIcon::Gear,
-        ];
-        for i in 0..5 {
-            let x_center = rect.left() + (i as f32 + 0.5) * tab_width;
-            let y_center = rect.center().y;
-
-            let is_active = match (self.active_tab, i) {
-                (ViewTab::Install, 0) => true,
-                (ViewTab::Account, 1) => true,
-                (ViewTab::Folders, 2) => true,
-                (ViewTab::Video, 3) => true,
-                (ViewTab::Options, 4) => true,
-                _ => false,
-            };
-
-            // Soft hover wash on inactive tabs so the bar feels responsive
-            // before a click commits. The active tab already owns the slider.
-            let is_hovered = !is_active && hovered_idx == Some(i as i32);
-            let hover_t = ui.ctx().animate_bool_with_time(
-                response.id.with(("tab_hover", i)),
-                is_hovered,
-                0.12,
-            );
-            if hover_t > 0.0 {
-                let cell = Rect::from_min_max(
-                    Pos2::new(rect.left() + i as f32 * tab_width + 2.0, rect.top() + 2.0),
-                    Pos2::new(
-                        rect.left() + (i as f32 + 1.0) * tab_width - 2.0,
-                        rect.bottom() - 2.0,
-                    ),
-                );
-                painter.rect_filled(
-                    cell,
-                    Rounding::same(CONTROL_ROUNDING),
-                    color_with_alpha(phase::surface(), 0.4 * hover_t),
-                );
-            }
-
-            let base_color = if is_active {
-                phase::text()
-            } else {
-                phase::text_muted()
-            };
-            // Inactive labels brighten toward the primary text color on hover.
-            let color = lerp_color(base_color, phase::text(), hover_t);
-            // The active tab's icon carries the accent; inactive icons track the
-            // label color so they brighten together on hover.
-            let icon_color = if is_active { phase::accent() } else { color };
-
-            // Center the icon+label as a group, and collapse to an icon when the
-            // cell is too narrow for the label — so the bar stays legible from the
-            // 296px floor up to the capped width instead of overlapping.
-            let icon_size = 15.0;
-            let gap = 7.0;
-            let galley = painter.layout_no_wrap(labels[i].to_string(), type_body(), color);
-            let label_w = galley.size().x;
-            let group_w = icon_size + gap + label_w;
-            if tab_width >= group_w + 16.0 {
-                let left = x_center - group_w / 2.0;
-                let icon_rect = Rect::from_center_size(
-                    Pos2::new(left + icon_size / 2.0, y_center),
-                    Vec2::splat(icon_size),
-                );
-                draw_icon_at(painter, icon_rect, icons[i], icon_color);
-                let text_pos = Pos2::new(left + icon_size + gap, y_center - galley.size().y / 2.0);
-                painter.galley(text_pos, galley, color);
-            } else {
-                let icon_rect = Rect::from_center_size(
-                    Pos2::new(x_center, y_center),
-                    Vec2::splat(icon_size + 3.0),
-                );
-                draw_icon_at(painter, icon_rect, icons[i], icon_color);
-            }
-        }
-
-        // Pointer affordance: the whole strip is clickable.
-        if hovered_idx.is_some() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-    }
-
-    fn draw_progress(&self, ui: &mut Ui) {
-        let width = card_inner();
-        let height = 22.0;
-
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-        let painter = ui.painter();
-
-        painter.rect_filled(rect, Rounding::same(CONTROL_ROUNDING), phase::input());
-        painter.rect_stroke(
-            rect,
-            Rounding::same(CONTROL_ROUNDING),
-            Stroke::new(1.0, color_with_alpha(phase::line(), 0.6)),
-        );
-
-        // Glide toward the real value so streamed install ticks ramp instead of
-        // snapping. egui handles the dt internally, so this stays smooth at any
-        // refresh rate and repaints itself while in motion.
-        let progress = ui.ctx().animate_value_with_time(
-            response.id.with("progress"),
-            self.progress.clamp(0.0, 1.0),
-            0.25,
-        );
-        if progress > 0.001 {
-            // Left corners stay rounded from the first pixel; the right corners
-            // stay square mid-fill and only round once the bar is nearly full,
-            // so the leading edge reads as a crisp wipe rather than a pill.
-            let fill_width = (width * progress).clamp(14.0, width);
-            let fill_rect =
-                Rect::from_min_max(rect.min, Pos2::new(rect.min.x + fill_width, rect.max.y));
-            let right = ((progress - 0.9) / 0.1).clamp(0.0, 1.0) * CONTROL_ROUNDING;
-            let rounding = Rounding {
-                nw: CONTROL_ROUNDING,
-                sw: CONTROL_ROUNDING,
-                ne: right,
-                se: right,
-            };
-            let base = phase_color(self.phase);
-            painter.rect_filled(fill_rect, rounding, base);
-            // Top-lit sheen across the fill for a glossy, polished bar.
-            vertical_gradient(
-                painter,
-                fill_rect.shrink2(Vec2::new(0.0, 1.0)),
-                color_with_alpha(Color32::WHITE, 0.16),
-                color_with_alpha(Color32::WHITE, 0.0),
-            );
-        }
-
-        let pct_text = format!("{}%", (progress * 100.0).round() as i32);
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            pct_text,
-            type_body(),
-            if progress > 0.4 {
-                phase::text_on_accent()
-            } else {
-                phase::text()
-            },
-        );
-    }
-
-    fn identity_strip(&self, ui: &mut Ui) {
-        let phase_name = self.linked_user.as_ref().map(display_linked_user);
-        let roblox_name = self
-            .roblox_username
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            .map(str::to_owned)
-            .or_else(|| {
-                (!self.roblox_user_id.trim().is_empty()).then(|| self.roblox_user_id.clone())
-            });
-
-        let count = phase_name.is_some() as usize + roblox_name.is_some() as usize;
-        if count == 0 {
-            return;
-        }
-
-        let gap = 18.0;
-        let width = if count == 1 {
-            264.0
-        } else {
-            (content_w() - gap) / 2.0
-        };
-        let row_size = Vec2::new(content_w(), 60.0);
-        let row_layout =
-            egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Center);
-        ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            if let Some(name) = phase_name {
-                identity_card(
-                    ui,
-                    self.phase_avatar.as_ref(),
-                    &name,
-                    "Phase account",
-                    width,
-                    phase::accent(),
-                );
-            }
-            if count == 2 {
-                ui.add_space(gap);
-            }
-            if let Some(name) = roblox_name {
-                identity_card(
-                    ui,
-                    self.roblox_avatar.as_ref(),
-                    &name,
-                    "Roblox verified",
-                    width,
-                    phase::blue(),
-                );
-            }
-        });
-        ui.add_space(8.0);
-    }
-
-    fn title_block(&self, ui: &mut Ui) {
-        // Compact hero: logo + wordmark on one truly-centered line, tagline and
-        // badges centered beneath. Uses centered_row because a bare horizontal
-        // would left-align inside the centered column.
-        let title = "Phase Animator";
-        let title_w = text_width(ui, title, type_title());
-        let logo_w = if self.logo.is_some() {
-            40.0 + SP_2
-        } else {
-            0.0
-        };
-        centered_row(ui, logo_w + title_w, 42.0, |ui| {
-            if let Some(logo) = &self.logo {
-                ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(40.0)));
-                ui.add_space(SP_2);
-            }
-            ui.label(
-                RichText::new(title)
-                    .font(type_title())
-                    .strong()
-                    .color(phase::text()),
-            );
-        });
-        ui.add_space(SP_1);
-        ui.label(
-            RichText::new("ROBLOX STUDIO PLUGIN INSTALLER")
-                .font(type_label())
-                .color(phase::text_muted()),
-        );
-
-        ui.add_space(SP_3);
-        let phase_lbl = phase_text(self.phase);
-        let indicators_w = status_indicator_width(ui, phase_lbl)
-            + SP_3
-            + status_indicator_width(ui, "Default channel");
-        centered_row(ui, indicators_w, 22.0, |ui| {
-            status_indicator(ui, phase_lbl, phase_color(self.phase));
-            ui.add_space(SP_3);
-            status_indicator(ui, "Default channel", phase::accent());
-        });
-
-        // Hairline that closes the hero and sets the tabs on their own rail.
-        ui.add_space(SP_3);
-        let (line_rect, _) = ui.allocate_exact_size(Vec2::new(content_w(), 1.0), Sense::hover());
-        gradient_hline(
-            ui.painter(),
-            line_rect.left()..=line_rect.right(),
-            line_rect.center().y,
-            color_with_alpha(phase::line(), 0.9),
-        );
-    }
-
-    fn current_tab(&mut self, ui: &mut Ui) {
-        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 1.0 / 30.0);
-        let frame = self.tab_page_motion.step(dt, 0.22);
-        if frame.running {
-            ui.ctx().request_repaint();
-        }
-
-        ui.scope(|ui| {
-            ui.add_space(frame.offset.abs() * 0.5);
-            ui.set_opacity(frame.opacity);
-            match self.active_tab {
-                ViewTab::Install => self.install_tab(ui),
-                ViewTab::Account => self.account_tab(ui),
-                ViewTab::Folders => self.folders_tab(ui),
-                ViewTab::Video => self.video_tab(ui),
-                ViewTab::Options => self.options_tab(ui),
-            }
-        });
-    }
-
-    fn install_tab(&mut self, ui: &mut Ui) {
-        let _time = ui.input(|i| i.time);
-        draw_panel(ui, |ui| {
-            section_label(ui, "Release");
-            ui.add_space(6.0);
-
-            // Single status hero replaces the old stacked metric cards + the
-            // redundant "Update status / Available version" frame (the version
-            // used to appear three times). One read: what state are we in, and
-            // which version is current.
-            let latest = self
-                .release
-                .as_ref()
-                .map(|release| release.latest_version.clone())
-                .unwrap_or_else(|| "—".to_owned());
-            let has_local = self.has_local_phase_install();
-            let checking = self.release.is_none() && self.release_error.is_none();
-            let available = self
-                .release
-                .as_ref()
-                .map(|release| {
-                    release.download_available && !release.blocked && !self.local_release_current
-                })
-                .unwrap_or(false);
-
-            let (hero_icon, hero_color, hero_state, status_short): (MiniIcon, Color32, &str, &str) =
-                if self.release_error.is_some() {
-                    (MiniIcon::Info, phase::red(), "Update check failed", "Error")
-                } else if checking {
-                    (
-                        MiniIcon::Clock,
-                        phase::blue(),
-                        "Checking for updates",
-                        "Checking",
-                    )
-                } else if available {
-                    (
-                        MiniIcon::Download,
-                        phase::accent(),
-                        "Update available",
-                        "Ready",
-                    )
-                } else {
-                    (
-                        MiniIcon::ShieldCheck,
-                        phase::green(),
-                        "Up to date",
-                        "Current",
-                    )
-                };
-            let hero_detail = if checking {
-                "Contacting Phase servers".to_owned()
-            } else if self.release_error.is_some() {
-                "Retry the check below".to_owned()
-            } else {
-                format!("Latest release v{}", latest.trim_start_matches('v'))
-            };
-
-            card_header(ui, hero_icon, hero_color, hero_state, &hero_detail, None);
-            ui.add_space(SP_4);
-            mini_stats(
-                ui,
-                &[
-                    (
-                        "Installed",
-                        if has_local { "Local build" } else { "Not yet" }.to_owned(),
-                    ),
-                    (
-                        "Latest",
-                        if latest == "—" {
-                            "Checking".to_owned()
-                        } else {
-                            latest.clone()
-                        },
-                    ),
-                    ("Status", status_short.to_owned()),
-                ],
-                3,
-            );
-
-            ui.add_space(SP_4);
-            let install_ready_text = if self.has_local_phase_install() {
-                "Install Update"
-            } else {
-                "Install Plugin"
-            };
-            let button_text = match self.phase {
-                InstallPhase::Ready => install_ready_text,
-                InstallPhase::Complete => "Check Again",
-                _ => "Check for Update",
-            };
-            let button_icon = match self.phase {
-                InstallPhase::Ready => MiniIcon::Bolt,
-                InstallPhase::Complete => MiniIcon::Refresh,
-                _ => MiniIcon::Download,
-            };
-            let busy = matches!(
-                self.phase,
-                InstallPhase::Checking | InstallPhase::Downloading | InstallPhase::Installing
-            );
-            ui.vertical_centered(|ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    if primary_button(ui, button_icon, button_text, Vec2::new(card_inner(), 48.0))
-                        .clicked()
-                    {
-                        self.primary_action();
-                    }
-                });
-                ui.add_space(8.0);
-                self.draw_progress(ui);
-            });
-
-            ui.add_space(12.0);
-            section_label(ui, "Install Notes");
-            ui.add_space(6.0);
-            for note in [
-                "Keeps your local plugin build current.",
-                "Creates a backup before replacing local files.",
-                "Use after closing Roblox Studio for best results.",
-            ] {
-                ui.horizontal_top(|ui| {
-                    draw_icon(ui, MiniIcon::Check, Vec2::splat(16.0), phase::green());
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(note)
-                                .font(FontId::proportional(13.0))
-                                .color(phase::text_secondary()),
-                        )
-                        .wrap(true),
-                    );
-                });
-                ui.add_space(4.0);
-            }
-        });
     }
 
     fn account_tab(&mut self, ui: &mut Ui) {
@@ -4698,7 +4222,11 @@ impl PhaseInstallerApp {
                 egui::TextEdit::singleline(&mut self.license_key)
                     .desired_width(width)
                     .password(true)
-                    .hint_text("Optional if Roblox ownership verifies"),
+                    .text_color(phase::text())
+                    .hint_text(
+                        RichText::new("Optional if Roblox ownership verifies")
+                            .color(phase::text_muted()),
+                    ),
             );
 
             ui.add_space(12.0);
@@ -4805,8 +4333,11 @@ impl PhaseInstallerApp {
                     ui.allocate_exact_size(Vec2::new(width, visible_height), Sense::hover());
                 let slide = (1.0 - open_t) * 8.0;
                 let shell_rect = clip_rect.shrink(0.5);
-                ui.painter()
-                    .rect_filled(shell_rect, Rounding::same(5.0), phase::surface());
+                ui.painter().rect_filled(
+                    shell_rect,
+                    Rounding::same(5.0),
+                    glass_fill(phase::surface(), GLASS_CONTROL_ALPHA),
+                );
                 ui.painter().rect_stroke(
                     shell_rect,
                     Rounding::same(5.0),
@@ -4935,7 +4466,11 @@ impl PhaseInstallerApp {
                 let source_response = ui.add(
                     egui::TextEdit::singleline(&mut self.video_source)
                         .desired_width((inner_w - browse_w - gap).max(80.0))
-                        .hint_text("YouTube URL or local MP4 path"),
+                        .text_color(phase::text())
+                        .hint_text(
+                            RichText::new("YouTube URL or local MP4 path")
+                                .color(phase::text_muted()),
+                        ),
                 );
                 if source_response.changed() && self.video_title.trim().is_empty() {
                     self.video_title = video_reference::default_title_for(&self.video_source);
@@ -4955,7 +4490,8 @@ impl PhaseInstallerApp {
             ui.add(
                 egui::TextEdit::singleline(&mut self.video_title)
                     .desired_width(inner_w)
-                    .hint_text("Optional display name"),
+                    .text_color(phase::text())
+                    .hint_text(RichText::new("Optional display name").color(phase::text_muted())),
             );
 
             ui.add_space(12.0);
@@ -5135,7 +4671,10 @@ impl PhaseInstallerApp {
                                     egui::TextEdit::singleline(&mut self.video_bridge_config.token)
                                         .desired_width((inner_w - 64.0).max(80.0))
                                         .password(true)
-                                        .hint_text("optional"),
+                                        .text_color(phase::text())
+                                        .hint_text(
+                                            RichText::new("optional").color(phase::text_muted()),
+                                        ),
                                 );
                             });
                             ui.add_space(10.0);
@@ -5182,7 +4721,8 @@ impl PhaseInstallerApp {
                                 );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.video_position_input)
-                                        .desired_width(94.0),
+                                        .desired_width(94.0)
+                                        .text_color(phase::text()),
                                 );
                             });
                             ui.add_space(8.0);
@@ -5934,8 +5474,11 @@ impl PhaseInstallerApp {
         } else {
             phase::line()
         };
-        ui.painter()
-            .rect_filled(rect, Rounding::same(8.0), phase::surface());
+        ui.painter().rect_filled(
+            rect,
+            Rounding::same(8.0),
+            glass_fill(phase::surface(), GLASS_CONTROL_ALPHA),
+        );
         ui.painter()
             .rect_stroke(rect, Rounding::same(8.0), Stroke::new(1.0, border));
 
@@ -5964,7 +5507,10 @@ impl PhaseInstallerApp {
             let response = ui.add_sized(
                 text_rect.size(),
                 egui::TextEdit::singleline(&mut self.theme_search)
-                    .hint_text("Search marketplace themes")
+                    .text_color(phase::text())
+                    .hint_text(
+                        RichText::new("Search marketplace themes").color(phase::text_muted()),
+                    )
                     .font(FontId::proportional(13.0))
                     .desired_width(text_rect.width())
                     .frame(false),
@@ -6047,28 +5593,192 @@ const SP_1: f32 = 4.0;
 const SP_2: f32 = 8.0;
 const SP_3: f32 = 12.0;
 const SP_4: f32 = 16.0;
-const SP_5: f32 = 20.0;
-const SP_6: f32 = 24.0;
 
 /// Corner radius for cards/panels.
-const CARD_ROUNDING: f32 = 12.0;
+const CARD_ROUNDING: f32 = 18.0;
 /// Corner radius for interactive controls (buttons, tabs, inputs).
-const CONTROL_ROUNDING: f32 = 9.0;
+const CONTROL_ROUNDING: f32 = 12.0;
+/// Shared translucent material tokens. The app cannot blur its own rendered
+/// backdrop in egui, so layered tint, highlight, rim and shadow create the
+/// same depth cue while preserving the live theme artwork beneath each plane.
+const GLASS_PANEL_ALPHA: f32 = 0.58;
+const GLASS_PANEL_STRONG_ALPHA: f32 = 0.66;
+const GLASS_CONTROL_ALPHA: f32 = 0.48;
+const GLASS_CONTROL_HOVER_ALPHA: f32 = 0.64;
+const GLASS_RIM_ALPHA: f32 = 0.34;
 
-fn type_title() -> FontId {
-    FontId::proportional(20.0)
-}
 fn type_heading() -> FontId {
-    FontId::proportional(15.0)
+    type_display(17.0)
 }
 fn type_body() -> FontId {
     FontId::proportional(13.0)
 }
 fn type_label() -> FontId {
-    FontId::proportional(11.0)
+    FontId::proportional(11.5)
 }
 fn type_caption() -> FontId {
     FontId::proportional(10.0)
+}
+fn type_display(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(UI_FONT_SEMIBOLD.into()))
+}
+
+fn glass_fill(color: Color32, alpha: f32) -> Color32 {
+    color_with_alpha(lerp_color(color, Color32::WHITE, 0.035), alpha)
+}
+
+/// Fill `rect` with a smooth left→right horizontal gradient.
+fn horizontal_gradient(painter: &egui::Painter, rect: Rect, left: Color32, right: Color32) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), left);
+    mesh.colored_vertex(rect.right_top(), right);
+    mesh.colored_vertex(rect.left_bottom(), left);
+    mesh.colored_vertex(rect.right_bottom(), right);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 3, 2);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Direction of a generated card gradient.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum GradientDirection {
+    Vertical,
+    Horizontal,
+    Diagonal,
+}
+
+/// Cache key for a generated rounded-gradient texture. All colors are packed
+/// sRGB so a marketplace palette swap naturally misses the cache and
+/// regenerates with the new theme colors.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GradientKey {
+    width: u32,
+    height: u32,
+    rounding: u32,
+    direction: u8,
+    from: u32,
+    to: u32,
+    glow_color: u32,
+    glow_cx: i32,
+    glow_cy: i32,
+    glow_radius: u32,
+    glow_strength: u32,
+}
+
+fn pack_color(color: Color32) -> u32 {
+    u32::from_le_bytes(color.to_array())
+}
+
+/// Generate (or fetch from cache) a texture filled with a smooth gradient plus
+/// an optional radial glow, alpha-masked to a rounded rect with analytic 1px
+/// edge anti-aliasing. egui 0.27 cannot clip meshes to rounded shapes, so
+/// cards that need a true gradient + rounded corners are rasterized once and
+/// reused while size and palette stay unchanged.
+#[allow(clippy::too_many_arguments)]
+fn rounded_gradient_texture(
+    cache: &mut HashMap<GradientKey, TextureHandle>,
+    ctx: &Context,
+    name: &str,
+    size: Vec2,
+    rounding: f32,
+    direction: GradientDirection,
+    from: Color32,
+    to: Color32,
+    glow: Option<(Pos2, f32, Color32, f32)>,
+) -> TextureHandle {
+    let width = size.x.max(1.0).round() as usize;
+    let height = size.y.max(1.0).round() as usize;
+    let (glow_c, glow_center, glow_radius, glow_strength) = glow
+        .map(|(center, radius, color, strength)| {
+            (color, center, radius.max(1.0), strength.clamp(0.0, 1.0))
+        })
+        .unwrap_or((Color32::TRANSPARENT, Pos2::ZERO, 0.0, 0.0));
+    let key = GradientKey {
+        width: width as u32,
+        height: height as u32,
+        rounding: rounding.round() as u32,
+        direction: direction as u8,
+        from: pack_color(from),
+        to: pack_color(to),
+        glow_color: pack_color(glow_c),
+        glow_cx: (glow_center.x * 4.0).round() as i32,
+        glow_cy: (glow_center.y * 4.0).round() as i32,
+        glow_radius: glow_radius.round() as u32,
+        glow_strength: glow_strength.to_bits(),
+    };
+    if let Some(texture) = cache.get(&key) {
+        return texture.clone();
+    }
+    if cache.len() > 32 {
+        cache.clear();
+    }
+
+    let w = width as f32;
+    let h = height as f32;
+    let radius = rounding.min(w * 0.5).min(h * 0.5);
+    let mut bytes = vec![0u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let t = match direction {
+                GradientDirection::Vertical => py / h,
+                GradientDirection::Horizontal => px / w,
+                GradientDirection::Diagonal => (px / w + py / h) * 0.5,
+            };
+            let mut color = lerp_color(from, to, t);
+            if glow_radius > 0.0 {
+                let d = (Pos2::new(px, py) - glow_center).length() / glow_radius;
+                if d < 1.0 {
+                    let falloff = (1.0 - d).powf(1.7) * glow_strength;
+                    color = lerp_color(color, glow_c, falloff.clamp(0.0, 1.0));
+                }
+            }
+            // Signed distance to the rounded rect for edge coverage.
+            let qx = (px - w * 0.5).abs() - (w * 0.5 - radius);
+            let qy = (py - h * 0.5).abs() - (h * 0.5 - radius);
+            let sd = Vec2::new(qx.max(0.0), qy.max(0.0)).length() + qx.max(qy).min(0.0) - radius;
+            let coverage = (0.5 - sd).clamp(0.0, 1.0);
+            let offset = (y * width + x) * 4;
+            bytes[offset] = color.r();
+            bytes[offset + 1] = color.g();
+            bytes[offset + 2] = color.b();
+            bytes[offset + 3] = (color.a() as f32 * coverage).round() as u8;
+        }
+    }
+
+    let image = ColorImage::from_rgba_unmultiplied([width, height], &bytes);
+    let texture = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+    cache.insert(key, texture.clone());
+    texture
+}
+
+/// Persist a viewport screenshot delivered by egui as a PNG for the visual
+/// test harness.
+fn save_screenshot_image(path: &std::path::Path, image: &ColorImage) {
+    let [width, height] = image.size;
+    let mut buffer = image::RgbaImage::new(width as u32, height as u32);
+    for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+        *pixel = image::Rgba(image[(x as usize, y as usize)].to_array());
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match buffer.save(path) {
+        Ok(()) => eprintln!("Phase UI screenshot saved to {}", path.display()),
+        Err(error) => eprintln!("Phase UI screenshot failed: {error}"),
+    }
+}
+
+/// Time-of-day greeting word for the topbar ("Good night, ..." etc.).
+fn daypart_greeting() -> &'static str {
+    use chrono::Timelike as _;
+    match chrono::Local::now().hour() {
+        5..=11 => "Good morning",
+        12..=16 => "Good afternoon",
+        17..=21 => "Good evening",
+        _ => "Good night",
+    }
 }
 
 /// Restrained drop shadow used to lift cards off the backdrop.
@@ -6123,6 +5833,25 @@ fn vertical_gradient(painter: &egui::Painter, rect: Rect, top: Color32, bottom: 
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// Circular center-to-edge gradient used for the companion canvas glow.
+fn radial_gradient(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32) {
+    const SEGMENTS: u32 = 40;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(center, color);
+    let edge = color_with_alpha(color, 0.0);
+    for index in 0..=SEGMENTS {
+        let angle = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+        mesh.colored_vertex(
+            center + Vec2::new(angle.cos() * radius, angle.sin() * radius),
+            edge,
+        );
+    }
+    for index in 0..SEGMENTS {
+        mesh.add_triangle(0, index + 1, index + 2);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 /// A faint lit hairline tucked just inside the top edge of an elevated surface,
 /// so cards/controls read as catching light from above.
 fn top_highlight(painter: &egui::Painter, rect: Rect, rounding: f32, color: Color32) {
@@ -6146,23 +5875,6 @@ fn hover_t(ui: &Ui, id: egui::Id, hovered: bool) -> f32 {
 /// width and left-aligns — so for icon+text or chip rows we allocate a
 /// full-width band (itself centered) and run the content inside a centered
 /// sub-rect of exactly `width`.
-fn centered_row(ui: &mut Ui, width: f32, height: f32, add: impl FnOnce(&mut Ui)) {
-    let (band, _) = ui.allocate_exact_size(Vec2::new(content_w(), height), Sense::hover());
-    let w = width.min(content_w());
-    let child = Rect::from_min_size(
-        Pos2::new(band.center().x - w * 0.5, band.top()),
-        Vec2::new(w, height),
-    );
-    ui.allocate_ui_at_rect(child, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.set_height(height);
-            add(ui);
-        });
-    });
-}
-
-/// Measured pixel width of a proportional string in `font`.
 fn text_width(ui: &Ui, text: &str, font: FontId) -> f32 {
     ui.fonts(|f| {
         f.layout_no_wrap(text.to_owned(), font, Color32::WHITE)
@@ -6173,6 +5885,53 @@ fn text_width(ui: &Ui, text: &str, font: FontId) -> f32 {
 
 fn configure_style(ctx: &Context) {
     let mut fonts = egui::FontDefinitions::default();
+    let fallback_proportional = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    let windows_fonts = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .map(|path| path.join("Fonts"));
+    let regular_loaded = windows_fonts
+        .as_ref()
+        .and_then(|path| std::fs::read(path.join("segoeui.ttf")).ok())
+        .map(|bytes| {
+            fonts
+                .font_data
+                .insert(UI_FONT_REGULAR.to_owned(), FontData::from_owned(bytes));
+        })
+        .is_some();
+    let semibold_loaded = windows_fonts
+        .as_ref()
+        .and_then(|path| std::fs::read(path.join("seguisb.ttf")).ok())
+        .map(|bytes| {
+            fonts
+                .font_data
+                .insert(UI_FONT_SEMIBOLD.to_owned(), FontData::from_owned(bytes));
+        })
+        .is_some();
+
+    if regular_loaded {
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, UI_FONT_REGULAR.to_owned());
+    }
+    let mut display_family = Vec::new();
+    if semibold_loaded {
+        display_family.push(UI_FONT_SEMIBOLD.to_owned());
+    }
+    if regular_loaded {
+        display_family.push(UI_FONT_REGULAR.to_owned());
+    }
+    display_family.extend(fallback_proportional.iter().cloned());
+    fonts
+        .families
+        .insert(FontFamily::Name(UI_FONT_SEMIBOLD.into()), display_family);
+
     fonts.font_data.insert(
         PHOSPHOR_FONT.to_owned(),
         FontData::from_static(include_bytes!("../assets/Phosphor.ttf")),
@@ -6188,14 +5947,25 @@ fn configure_style(ctx: &Context) {
 
     let mut style = (*ctx.style()).clone();
     style.visuals.dark_mode = true;
-    style.visuals.panel_fill = phase::background();
-    style.visuals.window_fill = phase::background();
-    style.visuals.widgets.noninteractive.bg_fill = phase::surface();
-    style.visuals.widgets.inactive.bg_fill = phase::input();
-    style.visuals.widgets.hovered.bg_fill = phase::surface_hover();
-    style.visuals.widgets.active.bg_fill = phase::surface_active();
-    style.visuals.selection.bg_fill = phase::accent_dim();
+    style.visuals.panel_fill = color_with_alpha(phase::background(), 0.18);
+    style.visuals.window_fill = glass_fill(phase::surface(), 0.74);
+    style.visuals.widgets.noninteractive.bg_fill =
+        glass_fill(phase::surface(), GLASS_CONTROL_ALPHA);
+    style.visuals.widgets.noninteractive.weak_bg_fill = glass_fill(phase::surface_hover(), 0.36);
+    style.visuals.widgets.inactive.bg_fill = glass_fill(phase::input(), GLASS_CONTROL_ALPHA);
+    style.visuals.widgets.hovered.bg_fill =
+        glass_fill(phase::surface_hover(), GLASS_CONTROL_HOVER_ALPHA);
+    style.visuals.widgets.active.bg_fill = glass_fill(phase::surface_active(), 0.72);
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, phase::text_secondary());
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, phase::text_secondary());
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, phase::text());
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, phase::text());
+    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, phase::text());
+    style.visuals.selection.bg_fill = glass_fill(phase::accent_dim(), 0.68);
     style.visuals.selection.stroke = Stroke::new(1.0, phase::accent());
+    style.visuals.extreme_bg_color = glass_fill(phase::input(), 0.54);
+    style.visuals.faint_bg_color = glass_fill(phase::surface_hover(), 0.3);
+    style.visuals.text_cursor = Stroke::new(1.5, phase::accent_hover());
 
     // Consistent control radius across every widget state so buttons, inputs
     // and combos all share the same softly-rounded silhouette.
@@ -6213,8 +5983,13 @@ fn configure_style(ctx: &Context) {
     style.visuals.window_shadow = card_shadow();
     style.visuals.popup_shadow = card_shadow();
     // Hairline borders read as quieter, more expensive than hard 1px lines.
-    style.visuals.widgets.noninteractive.bg_stroke =
-        Stroke::new(1.0, color_with_alpha(phase::line(), 0.6));
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(
+        1.0,
+        color_with_alpha(
+            lerp_color(phase::line(), Color32::WHITE, 0.18),
+            GLASS_RIM_ALPHA,
+        ),
+    );
 
     style.spacing.item_spacing = Vec2::new(SP_2, SP_2);
     style.spacing.button_padding = Vec2::new(SP_4, SP_2 + 2.0);
@@ -6223,12 +5998,19 @@ fn configure_style(ctx: &Context) {
 }
 
 fn load_logo(ctx: &Context) -> Option<TextureHandle> {
-    let bytes = include_bytes!("../assets/PhaseAnimator.png");
+    load_embedded_texture(
+        ctx,
+        "phase-animator-logo",
+        include_bytes!("../assets/PhaseAnimator.png"),
+    )
+}
+
+fn load_embedded_texture(ctx: &Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
     let image = image::load_from_memory(bytes).ok()?.to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     let pixels = image.into_raw();
     let color_image = ColorImage::from_rgba_unmultiplied(size, &pixels);
-    Some(ctx.load_texture("phase-animator-logo", color_image, TextureOptions::LINEAR))
+    Some(ctx.load_texture(name, color_image, TextureOptions::LINEAR))
 }
 
 fn load_window_icon() -> IconData {
@@ -6440,8 +6222,20 @@ fn spawn_avatar_fetch(
     loader: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        let image = loader().and_then(decode_avatar_image);
-        let _ = tx.send(AvatarFetchResult { kind, key, image });
+        let roblox_username = match kind {
+            AvatarKind::Phase => None,
+            AvatarKind::Roblox => verification::fetch_roblox_username(&key).ok(),
+        };
+        let image = loader().and_then(|bytes| match kind {
+            AvatarKind::Phase => decode_circular_avatar_image(bytes),
+            AvatarKind::Roblox => decode_full_body_avatar_image(bytes),
+        });
+        let _ = tx.send(AvatarFetchResult {
+            kind,
+            key,
+            image,
+            roblox_username,
+        });
         ctx.request_repaint();
     });
 }
@@ -6486,7 +6280,7 @@ fn decode_texture_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
     Ok(ColorImage::from_rgba_unmultiplied(size, &pixels))
 }
 
-fn decode_avatar_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
+fn decode_circular_avatar_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
     let image = image::load_from_memory(&bytes)
         .map_err(|error| format!("Invalid avatar image: {error}"))?
         .to_rgba8();
@@ -6529,82 +6323,35 @@ fn decode_avatar_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
     Ok(ColorImage::from_rgba_unmultiplied(size, &pixels))
 }
 
-fn identity_card(
-    ui: &mut Ui,
-    avatar: Option<&TextureHandle>,
-    name: &str,
-    detail: &str,
-    width: f32,
-    accent: Color32,
-) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 54.0), Sense::hover());
-    {
-        let painter = ui.painter();
-        painter.rect_filled(rect, Rounding::same(CONTROL_ROUNDING), phase::input());
-        painter.rect_stroke(
-            rect,
-            Rounding::same(CONTROL_ROUNDING),
-            Stroke::new(1.0, color_with_alpha(phase::line(), 0.6)),
-        );
-        top_highlight(
-            painter,
-            rect,
-            CONTROL_ROUNDING,
-            color_with_alpha(Color32::WHITE, 0.04),
-        );
-
-        let avatar_rect = Rect::from_center_size(
-            Pos2::new(rect.left() + 29.0, rect.center().y),
-            Vec2::splat(34.0),
-        );
-        painter.circle_filled(avatar_rect.center(), 17.0, accent.linear_multiply(0.22));
-        if let Some(texture) = avatar {
-            painter.image(
-                texture.id(),
-                avatar_rect.shrink(1.0),
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        } else {
-            painter.text(
-                avatar_rect.center(),
-                Align2::CENTER_CENTER,
-                initials(name),
-                FontId::proportional(13.0),
-                phase::text(),
-            );
+fn decode_full_body_avatar_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
+    let image = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Invalid Roblox avatar image: {error}"))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel.0[3] > 8 {
+            bounds = Some(match bounds {
+                Some((min_x, min_y, max_x, max_y)) => {
+                    (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                }
+                None => (x, y, x, y),
+            });
         }
-        painter.circle_stroke(avatar_rect.center(), 17.0, Stroke::new(1.5, accent));
-        let dot = Pos2::new(avatar_rect.right() - 3.0, avatar_rect.bottom() - 4.0);
-        painter.circle_filled(dot, 5.0, phase::input());
-        painter.circle_filled(dot, 3.4, phase::green());
     }
-
-    let text_x = rect.left() + 60.0;
-    let text_width = rect.right() - text_x - 14.0;
-    let name_rect = Rect::from_min_size(
-        Pos2::new(text_x, rect.top() + 6.0),
-        Vec2::new(text_width, 21.0),
-    );
-    let visible_name = compact_middle(name, (text_width / 7.2).floor().max(8.0) as usize);
-    let name_response = ui.allocate_rect(name_rect, Sense::hover());
-    ui.painter().text(
-        name_rect.left_center(),
-        Align2::LEFT_CENTER,
-        &visible_name,
-        type_body(),
-        phase::text(),
-    );
-    if name_response.hovered() && visible_name != name {
-        name_response.on_hover_text(name);
-    }
-    let detail_rect = Rect::from_min_size(
-        Pos2::new(text_x, rect.top() + 27.0),
-        Vec2::new(text_width, 18.0),
-    );
-    ui.allocate_ui_at_rect(detail_rect, |ui| {
-        scrolling_label(ui, detail, text_width, type_caption(), phase::text_muted());
-    });
+    let image = if let Some((min_x, min_y, max_x, max_y)) = bounds {
+        let padding = 4;
+        let left = min_x.saturating_sub(padding);
+        let top = min_y.saturating_sub(padding);
+        let right = (max_x + padding).min(width.saturating_sub(1));
+        let bottom = (max_y + padding).min(height.saturating_sub(1));
+        image::imageops::crop_imm(&image, left, top, right - left + 1, bottom - top + 1).to_image()
+    } else {
+        image
+    };
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+    Ok(ColorImage::from_rgba_unmultiplied(size, &pixels))
 }
 
 fn draw_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
@@ -7751,7 +7498,7 @@ fn diagnostics_output_panel(ui: &mut Ui, output: &str, width: f32) {
     };
 
     egui::Frame::none()
-        .fill(phase::input())
+        .fill(glass_fill(phase::input(), GLASS_CONTROL_ALPHA))
         .stroke(Stroke::new(1.0, color_with_alpha(accent, 0.36)))
         .rounding(Rounding::same(6.0))
         .inner_margin(Margin::symmetric(10.0, 9.0))
@@ -8334,7 +8081,7 @@ fn split_title_elapsed(value: &str) -> (String, Option<String>) {
 fn diagnostics_snapshot_panel(ui: &mut Ui, snapshot: &DiagnosticSnapshot, width: f32) {
     let status_color = snapshot_color(snapshot);
     egui::Frame::none()
-        .fill(phase::input())
+        .fill(glass_fill(phase::input(), GLASS_CONTROL_ALPHA))
         .stroke(Stroke::new(1.0, color_with_alpha(status_color, 0.42)))
         .rounding(Rounding::same(6.0))
         .inner_margin(Margin::symmetric(10.0, 9.0))
@@ -8511,7 +8258,11 @@ fn animated_diagnostics_bar(ui: &mut Ui, width: f32, pulse: f32) {
     let width = width.max(96.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 5.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, Rounding::same(999.0), phase::input());
+    painter.rect_filled(
+        rect,
+        Rounding::same(999.0),
+        glass_fill(phase::input(), GLASS_CONTROL_ALPHA),
+    );
     let fill = Rect::from_min_max(
         rect.left_top(),
         Pos2::new(
@@ -8537,7 +8288,8 @@ fn small_number_field(ui: &mut Ui, label: &str, value: &mut String, hint: &str, 
         ui.add(
             egui::TextEdit::singleline(value)
                 .desired_width(width)
-                .hint_text(hint),
+                .text_color(phase::text())
+                .hint_text(RichText::new(hint).color(phase::text_muted())),
         );
     });
 }
@@ -9182,7 +8934,7 @@ fn icon_button_text(
         text,
         gap,
         TextFormat {
-            font_id: FontId::proportional(text_size),
+            font_id: type_display(text_size),
             color: Color32::PLACEHOLDER,
             valign: Align::Center,
             ..Default::default()
@@ -9529,23 +9281,23 @@ mod phase {
 
     fn default_palette() -> Palette {
         Palette {
-            background: Color32::from_rgb(21, 18, 37),
-            surface: Color32::from_rgb(38, 33, 63),
-            surface_hover: Color32::from_rgb(58, 52, 90),
-            surface_active: Color32::from_rgb(67, 59, 99),
-            input: Color32::from_rgb(42, 36, 66),
-            line: Color32::from_rgb(58, 52, 90),
-            accent: Color32::from_rgb(216, 184, 245),
-            accent_hover: Color32::from_rgb(234, 216, 255),
-            accent_dim: Color32::from_rgb(122, 98, 159),
-            blue: Color32::from_rgb(158, 219, 255),
-            green: Color32::from_rgb(75, 198, 122),
-            red: Color32::from_rgb(224, 78, 78),
-            warning: Color32::from_rgb(228, 169, 64),
-            text: Color32::from_rgb(243, 238, 255),
-            text_secondary: Color32::from_rgb(197, 190, 221),
-            text_muted: Color32::from_rgb(159, 151, 188),
-            text_on_accent: Color32::from_rgb(74, 64, 102),
+            background: Color32::from_rgb(18, 11, 22),
+            surface: Color32::from_rgb(43, 24, 50),
+            surface_hover: Color32::from_rgb(65, 34, 72),
+            surface_active: Color32::from_rgb(82, 39, 86),
+            input: Color32::from_rgb(32, 17, 38),
+            line: Color32::from_rgb(91, 57, 96),
+            accent: Color32::from_rgb(229, 72, 201),
+            accent_hover: Color32::from_rgb(244, 107, 216),
+            accent_dim: Color32::from_rgb(126, 47, 119),
+            blue: Color32::from_rgb(147, 197, 253),
+            green: Color32::from_rgb(99, 214, 154),
+            red: Color32::from_rgb(241, 111, 131),
+            warning: Color32::from_rgb(240, 184, 91),
+            text: Color32::from_rgb(255, 248, 254),
+            text_secondary: Color32::from_rgb(217, 199, 218),
+            text_muted: Color32::from_rgb(169, 142, 170),
+            text_on_accent: Color32::from_rgb(39, 16, 37),
         }
     }
 
@@ -9598,12 +9350,23 @@ mod tests {
     }
 
     #[test]
-    fn content_width_reserves_page_insets_and_scrollbar() {
-        assert_eq!(
-            responsive_content_width(APP_WIDTH - PAGE_H_INSET * 2.0),
-            390.0
-        );
-        assert_eq!(responsive_content_width(320.0 - PAGE_H_INSET * 2.0), 260.0);
-        assert_eq!(responsive_content_width(800.0), MAX_CONTENT_WIDTH);
+    fn full_body_avatar_decode_preserves_dimensions_and_alpha() {
+        use image::ImageEncoder;
+        use image::codecs::png::PngEncoder;
+
+        let pixels = [
+            255, 0, 0, 255, 0, 255, 0, 96, 0, 0, 255, 32, 255, 255, 255, 0,
+        ];
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&pixels, 2, 2, image::ColorType::Rgba8)
+            .expect("encode test PNG");
+
+        let decoded = decode_full_body_avatar_image(png).expect("decode full-body avatar");
+        assert_eq!(decoded.size, [2, 2]);
+        assert_eq!(decoded.pixels[0].a(), 255);
+        assert_eq!(decoded.pixels[1].a(), 96);
+        assert_eq!(decoded.pixels[2].a(), 32);
+        assert_eq!(decoded.pixels[3].a(), 0);
     }
 }
