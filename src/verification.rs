@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub const DEFAULT_BASE_URL: &str = "https://phase.motioncore.xyz";
+pub const DEFAULT_BASE_URL: &str = "https://api.phaseplugins.com";
+pub const LEGACY_BASE_URL: &str = "https://phase.motioncore.xyz";
 pub const VERSION_ENDPOINT: &str = "/plugin/version";
 pub const UPDATE_STREAM_ENDPOINT: &str = "/plugin/updates";
 pub const DOWNLOAD_SESSION_ENDPOINT: &str = "/plugin/download";
@@ -161,19 +162,86 @@ impl VerificationPlan {
     }
 }
 
+enum PhaseRequestError {
+    Transport(String),
+    Other(String),
+}
+
+impl PhaseRequestError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Transport(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+fn phase_http_error(context: &str, error: ureq::Error) -> PhaseRequestError {
+    let message = format!("{context}: {error}");
+    if matches!(error, ureq::Error::Transport(_)) {
+        PhaseRequestError::Transport(message)
+    } else {
+        PhaseRequestError::Other(message)
+    }
+}
+
+fn legacy_fallback_plan(plan: &VerificationPlan) -> Option<VerificationPlan> {
+    if plan.base_url.trim_end_matches('/') != DEFAULT_BASE_URL.trim_end_matches('/') {
+        return None;
+    }
+
+    Some(VerificationPlan {
+        base_url: LEGACY_BASE_URL.to_owned(),
+        current_build_id: plan.current_build_id.clone(),
+    })
+}
+
+fn phase_request_with_fallback<T>(
+    plan: &VerificationPlan,
+    mut request: impl FnMut(&VerificationPlan) -> Result<T, PhaseRequestError>,
+) -> Result<T, String> {
+    match request(plan) {
+        Ok(value) => Ok(value),
+        Err(PhaseRequestError::Transport(primary_error)) => {
+            let Some(fallback_plan) = legacy_fallback_plan(plan) else {
+                return Err(primary_error);
+            };
+            request(&fallback_plan).map_err(|fallback_error| {
+                format!(
+                    "{primary_error}\nLegacy Phase endpoint also failed: {}",
+                    fallback_error.into_message()
+                )
+            })
+        }
+        Err(error) => Err(error.into_message()),
+    }
+}
+
 pub fn fetch_version(plan: &VerificationPlan) -> Result<VersionResponse, String> {
-    http_agent()?
-        .get(&plan.version_url())
-        .timeout(std::time::Duration::from_secs(10))
-        .call()
-        .map_err(|error| format!("Version check failed: {error}"))?
-        .into_json::<VersionResponse>()
-        .map_err(|error| format!("Invalid version response: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .get(&active_plan.version_url())
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+            .map_err(|error| phase_http_error("Version check failed", error))?
+            .into_json::<VersionResponse>()
+            .map_err(|error| PhaseRequestError::Other(format!("Invalid version response: {error}")))
+    })
 }
 
 pub fn listen_for_updates(plan: VerificationPlan) -> Result<UpdateStreamEvent, String> {
-    let (mut socket, _) = tungstenite::connect(plan.update_stream_url())
-        .map_err(|error| format!("Could not watch for updates: {error}"))?;
+    let (mut socket, _) = match tungstenite::connect(plan.update_stream_url()) {
+        Ok(connection) => connection,
+        Err(primary_error) => {
+            let Some(fallback_plan) = legacy_fallback_plan(&plan) else {
+                return Err(format!("Could not watch for updates: {primary_error}"));
+            };
+            tungstenite::connect(fallback_plan.update_stream_url()).map_err(|fallback_error| {
+                format!(
+                    "Could not watch for updates: {primary_error}\nLegacy Phase endpoint also failed: {fallback_error}"
+                )
+            })?
+        }
+    };
     loop {
         // The first frame is usually just the current state. The app only needs
         // to wake up users when the server says a real update was published.
@@ -199,76 +267,92 @@ pub fn start_plugin_link(
     plan: &VerificationPlan,
     request: &PluginLinkStartRequest,
 ) -> Result<PluginLinkStartResponse, String> {
-    http_agent()?
-        .post(&plan.plugin_link_start_url())
-        .timeout(std::time::Duration::from_secs(10))
-        .send_json(ureq::json!(request))
-        .map_err(|error| format!("Could not start Phase account link: {error}"))?
-        .into_json::<PluginLinkStartResponse>()
-        .map_err(|error| format!("Invalid link response: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .post(&active_plan.plugin_link_start_url())
+            .timeout(std::time::Duration::from_secs(10))
+            .send_json(ureq::json!(request))
+            .map_err(|error| phase_http_error("Could not start Phase account link", error))?
+            .into_json::<PluginLinkStartResponse>()
+            .map_err(|error| PhaseRequestError::Other(format!("Invalid link response: {error}")))
+    })
 }
 
 pub fn fetch_plugin_link_status(
     plan: &VerificationPlan,
     code: &str,
 ) -> Result<PluginLinkStatusResponse, String> {
-    http_agent()?
-        .get(&plan.plugin_link_status_url(code))
-        .timeout(std::time::Duration::from_secs(10))
-        .call()
-        .map_err(|error| format!("Could not check Phase account link: {error}"))?
-        .into_json::<PluginLinkStatusResponse>()
-        .map_err(|error| format!("Invalid link status: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .get(&active_plan.plugin_link_status_url(code))
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+            .map_err(|error| phase_http_error("Could not check Phase account link", error))?
+            .into_json::<PluginLinkStatusResponse>()
+            .map_err(|error| PhaseRequestError::Other(format!("Invalid link status: {error}")))
+    })
 }
 
 pub fn fetch_plugin_me(
     plan: &VerificationPlan,
     plugin_token: &str,
 ) -> Result<PluginMeResponse, String> {
-    http_agent()?
-        .get(&plan.plugin_link_me_url())
-        .set("authorization", &format!("Bearer {plugin_token}"))
-        .timeout(std::time::Duration::from_secs(10))
-        .call()
-        .map_err(|error| format!("Could not refresh Phase account: {error}"))?
-        .into_json::<PluginMeResponse>()
-        .map_err(|error| format!("Invalid Phase account response: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .get(&active_plan.plugin_link_me_url())
+            .set("authorization", &format!("Bearer {plugin_token}"))
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+            .map_err(|error| phase_http_error("Could not refresh Phase account", error))?
+            .into_json::<PluginMeResponse>()
+            .map_err(|error| {
+                PhaseRequestError::Other(format!("Invalid Phase account response: {error}"))
+            })
+    })
 }
 
 pub fn disconnect_plugin_me(plan: &VerificationPlan, plugin_token: &str) -> Result<(), String> {
-    http_agent()?
-        .delete(&plan.plugin_link_me_url())
-        .set("authorization", &format!("Bearer {plugin_token}"))
-        .timeout(std::time::Duration::from_secs(10))
-        .call()
-        .map(|_| ())
-        .map_err(|error| format!("Could not disconnect Phase account: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .delete(&active_plan.plugin_link_me_url())
+            .set("authorization", &format!("Bearer {plugin_token}"))
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+            .map(|_| ())
+            .map_err(|error| phase_http_error("Could not disconnect Phase account", error))
+    })
 }
 
 pub fn activate_install(
     plan: &VerificationPlan,
     request: &ActivationRequest,
 ) -> Result<ActivationResponse, String> {
-    http_agent()?
-        .post(&plan.activate_url())
-        .timeout(std::time::Duration::from_secs(20))
-        .send_json(ureq::json!(request))
-        .map_err(|error| format!("Activation failed: {error}"))?
-        .into_json::<ActivationResponse>()
-        .map_err(|error| format!("Invalid activation response: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .post(&active_plan.activate_url())
+            .timeout(std::time::Duration::from_secs(20))
+            .send_json(ureq::json!(request))
+            .map_err(|error| phase_http_error("Activation failed", error))?
+            .into_json::<ActivationResponse>()
+            .map_err(|error| {
+                PhaseRequestError::Other(format!("Invalid activation response: {error}"))
+            })
+    })
 }
 
 pub fn create_download_session(
     plan: &VerificationPlan,
     request: &DownloadSessionRequest,
 ) -> Result<DownloadSessionResponse, String> {
-    http_agent()?
-        .post(&plan.download_session_url())
-        .timeout(std::time::Duration::from_secs(20))
-        .send_json(ureq::json!(request))
-        .map_err(|error| format!("Install authorization failed: {error}"))?
-        .into_json::<DownloadSessionResponse>()
-        .map_err(|error| format!("Invalid install response: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .post(&active_plan.download_session_url())
+            .timeout(std::time::Duration::from_secs(20))
+            .send_json(ureq::json!(request))
+            .map_err(|error| phase_http_error("Install authorization failed", error))?
+            .into_json::<DownloadSessionResponse>()
+            .map_err(|error| PhaseRequestError::Other(format!("Invalid install response: {error}")))
+    })
 }
 
 pub fn download_plugin_to_file(url: &str, path: &Path) -> Result<(), String> {
@@ -278,7 +362,7 @@ pub fn download_plugin_to_file(url: &str, path: &Path) -> Result<(), String> {
 pub fn download_url_to_file(url: &str, path: &Path) -> Result<(), String> {
     // Write straight to disk so we don't keep a full .rbxm in memory. These
     // files are not huge today, but that assumption ages badly.
-    let mut response = http_agent()?
+    let mut response = http_agent()
         .get(url)
         .timeout(std::time::Duration::from_secs(120))
         .call()
@@ -293,7 +377,7 @@ pub fn download_url_to_file(url: &str, path: &Path) -> Result<(), String> {
 }
 
 pub fn fetch_latest_app_update(current_version: &str) -> Result<Option<AppUpdateInfo>, String> {
-    let response = match http_agent()?
+    let response = match http_agent()
         .get(GITHUB_LATEST_RELEASE_URL)
         .set("user-agent", "phase-auto-updater")
         .timeout(std::time::Duration::from_secs(10))
@@ -350,13 +434,17 @@ pub fn start_roblox_oauth(
     plan: &VerificationPlan,
     request: &RobloxOAuthStartRequest,
 ) -> Result<RobloxOAuthStartResponse, String> {
-    http_agent()?
-        .post(&plan.roblox_oauth_start_url())
-        .timeout(std::time::Duration::from_secs(10))
-        .send_json(ureq::json!(request))
-        .map_err(|error| format!("Could not start Roblox OAuth: {error}"))?
-        .into_json::<RobloxOAuthStartResponse>()
-        .map_err(|error| format!("Invalid Roblox OAuth response: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .post(&active_plan.roblox_oauth_start_url())
+            .timeout(std::time::Duration::from_secs(10))
+            .send_json(ureq::json!(request))
+            .map_err(|error| phase_http_error("Could not start Roblox OAuth", error))?
+            .into_json::<RobloxOAuthStartResponse>()
+            .map_err(|error| {
+                PhaseRequestError::Other(format!("Invalid Roblox OAuth response: {error}"))
+            })
+    })
 }
 
 pub fn fetch_roblox_oauth_status(
@@ -364,13 +452,17 @@ pub fn fetch_roblox_oauth_status(
     state: &str,
     install_id: &str,
 ) -> Result<RobloxOAuthStatusResponse, String> {
-    http_agent()?
-        .get(&plan.roblox_oauth_status_url(state, install_id))
-        .timeout(std::time::Duration::from_secs(10))
-        .call()
-        .map_err(|error| format!("Could not check Roblox OAuth: {error}"))?
-        .into_json::<RobloxOAuthStatusResponse>()
-        .map_err(|error| format!("Invalid Roblox OAuth status: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .get(&active_plan.roblox_oauth_status_url(state, install_id))
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+            .map_err(|error| phase_http_error("Could not check Roblox OAuth", error))?
+            .into_json::<RobloxOAuthStatusResponse>()
+            .map_err(|error| {
+                PhaseRequestError::Other(format!("Invalid Roblox OAuth status: {error}"))
+            })
+    })
 }
 
 pub fn fetch_phase_avatar_image(url: &str) -> Result<Vec<u8>, String> {
@@ -384,7 +476,7 @@ pub fn fetch_roblox_avatar_full_body_image(user_id: &str) -> Result<Vec<u8>, Str
     }
 
     let url = roblox_avatar_thumbnail_url(user_id);
-    let response = http_agent()?
+    let response = http_agent()
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .call()
@@ -407,7 +499,7 @@ pub fn fetch_roblox_username(user_id: &str) -> Result<String, String> {
         return Err("Missing Roblox user ID.".to_owned());
     }
 
-    let profile = http_agent()?
+    let profile = http_agent()
         .get(&roblox_user_profile_url(user_id))
         .timeout(std::time::Duration::from_secs(10))
         .call()
@@ -447,7 +539,7 @@ pub fn fetch_roblox_asset_thumbnail_image(asset_id: &str) -> Result<Vec<u8>, Str
         "https://thumbnails.roblox.com/v1/assets?assetIds={}&size=768x432&format=Png&isCircular=false",
         url_escape(asset_id)
     );
-    let response = http_agent()?
+    let response = http_agent()
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .call()
@@ -469,13 +561,17 @@ pub fn fetch_phase_themes(plan: &VerificationPlan) -> Result<Vec<PhaseThemeAsset
     let mut themes = Vec::new();
 
     loop {
-        let response = http_agent()?
-            .get(&plan.phase_themes_url(page))
-            .timeout(std::time::Duration::from_secs(10))
-            .call()
-            .map_err(|error| format!("Could not load Phase themes: {error}"))?
-            .into_json::<PhaseThemeListResponse>()
-            .map_err(|error| format!("Invalid Phase themes response: {error}"))?;
+        let response = phase_request_with_fallback(plan, |active_plan| {
+            http_agent()
+                .get(&active_plan.phase_themes_url(page))
+                .timeout(std::time::Duration::from_secs(10))
+                .call()
+                .map_err(|error| phase_http_error("Could not load Phase themes", error))?
+                .into_json::<PhaseThemeListResponse>()
+                .map_err(|error| {
+                    PhaseRequestError::Other(format!("Invalid Phase themes response: {error}"))
+                })
+        })?;
 
         themes.extend(
             response
@@ -497,17 +593,21 @@ pub fn install_phase_theme(
     plan: &VerificationPlan,
     asset_id: &str,
 ) -> Result<PhaseThemeInstallResponse, String> {
-    http_agent()?
-        .post(&plan.phase_theme_install_url(asset_id))
-        .timeout(std::time::Duration::from_secs(12))
-        .call()
-        .map_err(|error| format!("Could not prepare Phase theme: {error}"))?
-        .into_json::<PhaseThemeInstallResponse>()
-        .map_err(|error| format!("Invalid Phase theme response: {error}"))
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .post(&active_plan.phase_theme_install_url(asset_id))
+            .timeout(std::time::Duration::from_secs(12))
+            .call()
+            .map_err(|error| phase_http_error("Could not prepare Phase theme", error))?
+            .into_json::<PhaseThemeInstallResponse>()
+            .map_err(|error| {
+                PhaseRequestError::Other(format!("Invalid Phase theme response: {error}"))
+            })
+    })
 }
 
 fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let mut response = http_agent()?
+    let mut response = http_agent()
         .get(url)
         .timeout(std::time::Duration::from_secs(10))
         .call()
@@ -531,10 +631,10 @@ fn site_url(url: &str) -> String {
     }
 }
 
-fn http_agent() -> Result<ureq::Agent, String> {
+fn http_agent() -> ureq::Agent {
     // rustls avoids Windows SChannel-specific failures such as
     // SEC_E_INVALID_TOKEN while keeping certificate validation enabled.
-    Ok(ureq::AgentBuilder::new().build())
+    ureq::AgentBuilder::new().build()
 }
 
 fn current_windows_arch() -> &'static str {
@@ -876,6 +976,61 @@ fn url_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_plan_uses_branded_primary_domain() {
+        let plan = VerificationPlan::new("test-build");
+        assert_eq!(plan.base_url, DEFAULT_BASE_URL);
+        assert_eq!(plan.base_url, "https://api.phaseplugins.com");
+        assert_eq!(
+            legacy_fallback_plan(&plan).unwrap().base_url,
+            LEGACY_BASE_URL
+        );
+    }
+
+    #[test]
+    fn transport_failure_retries_legacy_domain_once() {
+        let plan = VerificationPlan::new("test-build");
+        let mut attempts = Vec::new();
+        let result = phase_request_with_fallback(&plan, |active_plan| {
+            attempts.push(active_plan.base_url.clone());
+            if attempts.len() == 1 {
+                Err(PhaseRequestError::Transport("primary failed".to_owned()))
+            } else {
+                Ok("fallback worked")
+            }
+        });
+
+        assert_eq!(result.unwrap(), "fallback worked");
+        assert_eq!(attempts, vec![DEFAULT_BASE_URL, LEGACY_BASE_URL]);
+    }
+
+    #[test]
+    fn application_failure_does_not_retry_legacy_domain() {
+        let plan = VerificationPlan::new("test-build");
+        let mut attempts = 0;
+        let result = phase_request_with_fallback::<()>(&plan, |_| {
+            attempts += 1;
+            Err(PhaseRequestError::Other("request rejected".to_owned()))
+        });
+
+        assert_eq!(result.unwrap_err(), "request rejected");
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn custom_domain_does_not_fall_back() {
+        let mut plan = VerificationPlan::new("test-build");
+        plan.base_url = "http://127.0.0.1:9876".to_owned();
+        let mut attempts = 0;
+        let result = phase_request_with_fallback::<()>(&plan, |_| {
+            attempts += 1;
+            Err(PhaseRequestError::Transport("custom failed".to_owned()))
+        });
+
+        assert_eq!(result.unwrap_err(), "custom failed");
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn roblox_avatar_url_requests_full_body_transparent_thumbnail() {

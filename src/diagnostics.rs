@@ -11,6 +11,8 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+const PRIMARY_PHASE_HOST: &str = "api.phaseplugins.com";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticStatus {
     Good,
@@ -653,13 +655,13 @@ fn likely_cause(
         return "Proxy environment variables are set for the app; remove or correct them, then restart Phase Companion.".to_owned();
     }
     if windows_user_proxy_found {
-        return "Windows user proxy or PAC settings are configured; if they are not intentional, turn them off in Windows Proxy settings or allowlist phase.motioncore.xyz.".to_owned();
+        return "Windows user proxy or PAC settings are configured; if they are not intentional, turn them off in Windows Proxy settings or allowlist api.phaseplugins.com.".to_owned();
     }
     if winhttp_proxy_found {
         return "A Windows proxy was configured; if the reset did not help, the network may require an allowlist instead of a direct connection.".to_owned();
     }
     if phase_https_failed && windows_https_failed {
-        return "VPN/proxy/firewall, antivirus HTTPS scanning, captive Wi-Fi, or network SSL inspection is returning an invalid TLS response for phase.motioncore.xyz:443.".to_owned();
+        return "VPN/proxy/firewall, antivirus HTTPS scanning, captive Wi-Fi, or network SSL inspection is returning an invalid TLS response for api.phaseplugins.com:443.".to_owned();
     }
     if phase_https_failed {
         return "Phase is reachable on port 443, but TLS still fails; this usually points to HTTPS interception, a VPN/proxy, antivirus web shield, or captive Wi-Fi.".to_owned();
@@ -778,7 +780,7 @@ fn truncate_output(mut value: String, limit: usize) -> String {
 
 fn check_dns() -> DiagnosticCheck {
     let started = Instant::now();
-    match ("phase.motioncore.xyz", 443).to_socket_addrs() {
+    match (PRIMARY_PHASE_HOST, 443).to_socket_addrs() {
         Ok(addresses) => {
             let addresses = addresses.collect::<Vec<_>>();
             if addresses.is_empty() {
@@ -809,7 +811,7 @@ fn check_dns() -> DiagnosticCheck {
         Err(error) => DiagnosticCheck {
             status: DiagnosticStatus::Problem,
             title: "Phase server address".to_owned(),
-            detail: format!("Could not find phase.motioncore.xyz: {error}"),
+            detail: format!("Could not find {PRIMARY_PHASE_HOST}: {error}"),
             next_step: "Check DNS, VPN, proxy, or try a different network.".to_owned(),
             raw_error: Some(error.to_string()),
             elapsed_ms: Some(started.elapsed().as_millis()),
@@ -819,7 +821,7 @@ fn check_dns() -> DiagnosticCheck {
 
 fn check_phase_tcp() -> DiagnosticCheck {
     let started = Instant::now();
-    match ("phase.motioncore.xyz", 443).to_socket_addrs() {
+    match (PRIMARY_PHASE_HOST, 443).to_socket_addrs() {
         Ok(addresses) => {
             let mut last_error = None;
             for address in addresses {
@@ -842,9 +844,9 @@ fn check_phase_tcp() -> DiagnosticCheck {
                 status: DiagnosticStatus::Problem,
                 title: "Network path to Phase".to_owned(),
                 detail: "The computer could not open a secure network path to Phase.".to_owned(),
-                next_step:
-                    "Check firewall, VPN, proxy, or whether phase.motioncore.xyz is blocked."
-                        .to_owned(),
+                next_step: format!(
+                    "Check firewall, VPN, proxy, or whether {PRIMARY_PHASE_HOST} is blocked."
+                ),
                 raw_error: last_error,
                 elapsed_ms: Some(started.elapsed().as_millis()),
             }
@@ -987,7 +989,7 @@ fn explain_network_error(error: &str) -> (String, String) {
     {
         return (
             format!("The secure Phase connection was blocked or interrupted: {error}"),
-            "Check firewall, VPN, proxy, and whether phase.motioncore.xyz is allowed.".to_owned(),
+            format!("Check firewall, VPN, proxy, and whether {PRIMARY_PHASE_HOST} is allowed."),
         );
     }
     (
