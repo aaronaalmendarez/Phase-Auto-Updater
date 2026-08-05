@@ -685,7 +685,7 @@ impl PhaseInstallerApp {
         match self.news_page {
             1 => (
                 "Video reference sync".to_owned(),
-                "Keep YouTube or local video references locked to the Studio timeline — play, pause, seek, and rate stay in sync."
+                "Keep YouTube or local video references locked to the Studio timeline. Play, pause, seek, and rate stay in sync."
                     .to_owned(),
             ),
             _ => {
