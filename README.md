@@ -68,6 +68,10 @@ macOS:
 bash ./scripts/build-macos.sh
 ```
 
+This creates `dist/macos/Phase Companion.app` and a drag-to-Applications
+`dist/macos/Phase Companion.dmg`. Free, ad-hoc-signed builds require a one-time
+Gatekeeper approval; see [Installing Phase Companion on macOS](docs/MACOS_INSTALL.md).
+
 For just running locally:
 
 ```bash
@@ -85,13 +89,20 @@ cargo run --bin phase-tool -- --video-popup <path-to-rendered-player-html>
 There are GitHub Actions in `.github/workflows`:
 
 - `build.yml` builds Windows x64, x86, arm64, and macOS on pushes / PRs and uploads artifacts.
-- `release.yml` builds `PhaseAnimatorSetup-x64.exe`, `PhaseAnimatorSetup-x86.exe`, `PhaseAnimatorSetup-arm64.exe`, matching Windows MSIs, and the macOS zip when a tag like `v0.20.0` is pushed.
+- `release.yml` builds `PhaseAnimatorSetup-x64.exe`, `PhaseAnimatorSetup-x86.exe`, `PhaseAnimatorSetup-arm64.exe`, matching Windows MSIs, and the Phase Companion macOS zip and DMG when a tag like `v0.20.14` is pushed.
 
 When a GitHub Release has a newer `PhaseAutoUpdater-*-<arch>.msi` asset, the app shows it in the Options tab and launches the installer update matching the current Windows architecture.
 
-macOS still needs signing and notarization before a public customer release. The app bundle script is here, but the Apple packaging pass still needs to happen on macOS or CI.
+The macOS workflow produces an ad-hoc-signed build by default. It can optionally
+use a Developer ID identity through `MACOS_SIGN_IDENTITY`; without one, users
+must approve Phase Companion once in Privacy & Security.
 
 ## latest update
+
+`0.20.14` fixes macOS title-bar spacing and theme integration, packages the app
+as Phase Companion with an app icon and drag-to-Applications DMG, preserves
+valid Roblox purchase authorization during installs, and surfaces real install
+errors in the Updates page.
 
 `0.20.2` adds a guarded Roblox plugin settings recovery tool with selectable backup/delete for Phase themes and keybinds.
 

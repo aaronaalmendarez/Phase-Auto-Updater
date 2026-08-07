@@ -7,11 +7,20 @@ const HEADER_HEIGHT: f32 = 66.0;
 const INSTALL_FOOTER_HEIGHT: f32 = 66.0;
 const WORKSPACE_GUTTER_X: f32 = 18.0;
 const WORKSPACE_GUTTER_Y: f32 = 12.0;
+#[cfg(target_os = "macos")]
+const MACOS_TITLEBAR_SAFE_INSET: f32 = 30.0;
 
 impl PhaseInstallerApp {
     pub(super) fn render_companion_root(&mut self, ui: &mut Ui) {
         self.paint_theme_background(ui);
-        let canvas = ui.available_rect_before_wrap();
+        let mut canvas = ui.available_rect_before_wrap();
+        #[cfg(target_os = "macos")]
+        {
+            // Full-size macOS content paints beneath the transparent titlebar.
+            // Leave a deliberate breathing lane below the native title and
+            // traffic lights before the app's own header begins.
+            canvas.min.y += MACOS_TITLEBAR_SAFE_INSET;
+        }
         ui.allocate_rect(canvas, Sense::hover());
 
         let entrance =
@@ -306,6 +315,7 @@ impl PhaseInstallerApp {
             InstallPhase::Downloading => "Downloading update…",
             InstallPhase::Installing => "Installing update…",
             InstallPhase::Complete => "You’re up to date",
+            InstallPhase::Error if self.release.is_some() => "Couldn’t install update",
             InstallPhase::Error => "Couldn’t check for updates",
             InstallPhase::Idle => "Check for the latest version",
         };

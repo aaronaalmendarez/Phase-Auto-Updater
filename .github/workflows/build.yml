@@ -51,5 +51,5 @@ jobs:
       - name: upload macos build
         uses: actions/upload-artifact@v4
         with:
-          name: PhaseAnimatorInstaller-macos
+          name: PhaseCompanion-macos
           path: dist/macos/
