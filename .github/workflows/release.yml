@@ -52,13 +52,14 @@ jobs:
       - name: build
         run: bash ./scripts/build-macos.sh
       - name: zip
-        shell: pwsh
-        run: Compress-Archive -Path "dist/macos/*" -DestinationPath "PhaseAnimatorInstaller-macos.zip" -Force
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/macos/Phase Companion.app" "PhaseCompanion-macos.zip"
       - name: upload macos artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: PhaseAnimatorInstaller-macos.zip
+          path: |
+            PhaseCompanion-macos.zip
+            dist/macos/Phase Companion.dmg
 
   release:
     name: github release

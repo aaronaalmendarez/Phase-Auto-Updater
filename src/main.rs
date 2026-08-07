@@ -107,13 +107,25 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([APP_WIDTH, APP_HEIGHT])
+        .with_min_inner_size([MIN_APP_WIDTH, MIN_APP_HEIGHT])
+        .with_transparent(true)
+        .with_title(APP_NAME)
+        .with_icon(load_window_icon());
+
+    #[cfg(target_os = "macos")]
+    {
+        // Extend the themed content behind a transparent native title bar so
+        // the caption never lands on an opaque white strip. The native title
+        // and traffic-light controls stay available in this configuration.
+        viewport = viewport
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([APP_WIDTH, APP_HEIGHT])
-            .with_min_inner_size([MIN_APP_WIDTH, MIN_APP_HEIGHT])
-            .with_transparent(true)
-            .with_title(APP_NAME)
-            .with_icon(load_window_icon()),
+        viewport,
         persist_window: false,
         vsync: true,
         ..Default::default()
@@ -451,6 +463,10 @@ struct PhaseInstallerApp {
 
 impl PhaseInstallerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(target_os = "macos")]
+        cc.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+
         configure_style(&cc.egui_ctx);
 
         let candidates = detect_plugin_folders();
@@ -1049,9 +1065,13 @@ impl PhaseInstallerApp {
     }
 
     fn start_install(&mut self) {
+        self.release_error = None;
+
         let Some(folder) = self.selected_folder.clone() else {
             self.phase = InstallPhase::Error;
-            self.log(phase::red(), "Select an install location first.");
+            let error = "Select an install location first.".to_owned();
+            self.release_error = Some(error.clone());
+            self.log(phase::red(), error);
             return;
         };
 
@@ -1943,6 +1963,7 @@ impl PhaseInstallerApp {
                         Err(error) => {
                             self.phase = InstallPhase::Error;
                             self.progress = 0.0;
+                            self.release_error = Some(error.clone());
                             self.log(phase::red(), error);
                         }
                     }
@@ -3127,6 +3148,18 @@ fn refresh_activation_for_download(
     request
         .as_ref()
         .and_then(|request| verification::activate_install(plan, request).ok())
+        // The activation endpoint can resolve an eligible Roblox owner to a
+        // different access mode (for example, earlyAccess). A download token
+        // is scoped to its activation mode, so replacing a valid cached
+        // robloxPurchase activation with that response makes /plugin/download
+        // reject the otherwise authorized install.
+        .filter(|refreshed| {
+            refreshed.ok
+                && refreshed.active
+                && refreshed.activation_mode == activation.activation_mode
+                && refreshed.user_id == activation.user_id
+                && !refreshed.token.trim().is_empty()
+        })
         .unwrap_or_else(|| activation.clone())
 }
 
@@ -3222,7 +3255,7 @@ impl TrayController {
     fn new(tx: Sender<TraySignal>, ctx: Context) -> Result<Self, String> {
         let icon = load_tray_icon().ok_or_else(|| "Could not load tray icon.".to_owned())?;
         let icon = TrayIconBuilder::new()
-            .with_tooltip("Phase Animator Installer")
+            .with_tooltip("Phase Companion")
             .with_menu_on_left_click(false)
             .with_menu_on_right_click(false)
             .with_icon(icon)
