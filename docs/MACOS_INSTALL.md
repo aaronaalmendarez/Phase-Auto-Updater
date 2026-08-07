@@ -7,10 +7,19 @@ program, so macOS requires a one-time manual approval.
 ## Install
 
 1. Download `Phase Companion.dmg` from the official GitHub release.
+
+![The Phase Companion macOS downloads, with the DMG selected](images/macos-release-downloads.png)
+
 2. Open the disk image.
 3. Drag **Phase Companion** into the **Applications** folder.
+
+![The Phase Companion disk image with the app and Applications shortcut](images/macos-drag-to-applications.png)
+
 4. Open Phase Companion from Applications once. macOS may block the first
    launch because the developer cannot be verified.
+
+![The macOS warning shown when Phase Companion cannot be verified](images/macos-unverified-app-warning.png)
+
 5. Open **System Settings**, select **Privacy & Security**, and scroll to the
    **Security** section.
 6. Click **Open Anyway** for Phase Companion, authenticate with your Mac
