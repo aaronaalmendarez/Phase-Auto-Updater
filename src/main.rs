@@ -37,12 +37,19 @@ const CURRENT_BUILD_ID: &str = "phase-2026-06-05-rustls-v0-19-8";
 const PHOSPHOR_FONT: &str = "phosphor-icons";
 const UI_FONT_REGULAR: &str = "phase-ui-regular";
 const UI_FONT_SEMIBOLD: &str = "phase-ui-semibold";
-const APP_WIDTH: f32 = 680.0;
-const APP_HEIGHT: f32 = 382.5;
+const APP_WIDTH: f32 = 720.0;
+const APP_HEIGHT: f32 = 460.0;
 const MIN_APP_WIDTH: f32 = 680.0;
-const MIN_APP_HEIGHT: f32 = 382.5;
+const MIN_APP_HEIGHT: f32 = 440.0;
 const PAGE_BOTTOM_INSET: f32 = 16.0;
-const BODY_RIGHT_INSET: f32 = 8.0;
+const PHASE_GRID_GAP: f32 = 8.0;
+const PHASE_ACTION_HEIGHT: f32 = 36.0;
+const PHASE_COMPACT_ACTION_HEIGHT: f32 = 32.0;
+const PHASE_PROMINENT_ACTION_HEIGHT: f32 = 40.0;
+const PHASE_MIN_ACTION_WIDTH: f32 = 128.0;
+const PHASE_ACTION_ICON_SLOT: f32 = 16.0;
+const PHASE_ACTION_TEXT_GAP: f32 = 8.0;
+const PHASE_ACTION_PADDING_X: f32 = 24.0;
 const CARD_H_MARGIN: f32 = 14.0;
 const THEME_ROW_MARGIN: f32 = 12.0;
 const TRAY_PANEL_WIDTH: f32 = 302.0;
@@ -310,8 +317,6 @@ struct AccountCache {
 
 struct PhaseInstallerApp {
     logo: Option<TextureHandle>,
-    phase_brand_logo: Option<TextureHandle>,
-    roblox_brand_logo: Option<TextureHandle>,
     phase_avatar: Option<TextureHandle>,
     phase_avatar_key: Option<String>,
     roblox_avatar: Option<TextureHandle>,
@@ -419,13 +424,8 @@ struct PhaseInstallerApp {
     phase_started_at: Option<Instant>,
     activity: Vec<ActivityLine>,
 
-    tab_indicator: motion::SpringValue,
     tab_page_motion: motion::PagerMotion<ViewTab>,
     milestone: u32,
-    news_page: usize,
-    news_changed_at: Instant,
-    workspace_body_height: f32,
-    gradient_cache: HashMap<GradientKey, TextureHandle>,
     screenshot_path: Option<PathBuf>,
     screenshot_frames: u32,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -466,16 +466,6 @@ impl PhaseInstallerApp {
 
         let mut app = Self {
             logo: load_logo(&cc.egui_ctx),
-            phase_brand_logo: load_embedded_texture(
-                &cc.egui_ctx,
-                "phase-brand-logo",
-                include_bytes!("../assets/PhaseLogo.png"),
-            ),
-            roblox_brand_logo: load_embedded_texture(
-                &cc.egui_ctx,
-                "roblox-tilt-white",
-                include_bytes!("../assets/RobloxTiltWhite.png"),
-            ),
             phase_avatar: None,
             phase_avatar_key: None,
             roblox_avatar: None,
@@ -581,13 +571,8 @@ impl PhaseInstallerApp {
             progress: 0.0,
             phase_started_at: None,
             activity: Vec::new(),
-            tab_indicator: motion::SpringValue::new(0.0),
             tab_page_motion: motion::PagerMotion::new(ViewTab::Install),
             milestone: 0,
-            news_page: 0,
-            news_changed_at: Instant::now(),
-            workspace_body_height: 480.0,
-            gradient_cache: HashMap::new(),
             screenshot_path: std::env::var_os("PHASE_UI_SCREENSHOT")
                 .map(PathBuf::from)
                 .filter(|path| !path.as_os_str().is_empty()),
@@ -647,16 +632,32 @@ impl PhaseInstallerApp {
         // visual test can photograph any surface without clicking through, and
         // pin the default palette so theme captures stay comparable.
         if app.screenshot_path.is_some() {
-            if let Some(selection) = app.selected_theme.take() {
-                drop(selection);
-                phase::reset_palette();
-                configure_style(&cc.egui_ctx);
-            } else {
-                phase::reset_palette();
+            let keep_theme = std::env::var("PHASE_UI_KEEP_THEME")
+                .ok()
+                .is_some_and(|value| value == "1");
+            if !keep_theme {
+                if let Some(selection) = app.selected_theme.take() {
+                    drop(selection);
+                    phase::reset_palette();
+                    configure_style(&cc.egui_ctx);
+                } else {
+                    phase::reset_palette();
+                }
+                app.theme_background_key = None;
+                app.theme_background = None;
+                app.theme_outgoing_background = None;
             }
-            app.theme_background_key = None;
-            app.theme_background = None;
-            app.theme_outgoing_background = None;
+            if std::env::var("PHASE_UI_EMPTY_ACCOUNT")
+                .ok()
+                .is_some_and(|value| value == "1")
+            {
+                app.plugin_token = None;
+                app.linked_user = None;
+                app.activation = None;
+                app.roblox_user_id.clear();
+                app.roblox_username = None;
+                app.account_refresh_rx = None;
+            }
             let tab = match std::env::var("PHASE_UI_TAB").ok().as_deref() {
                 Some("video") => ViewTab::Video,
                 Some("folders") => ViewTab::Folders,
@@ -666,12 +667,6 @@ impl PhaseInstallerApp {
             };
             app.active_tab = tab;
             app.tab_page_motion = motion::PagerMotion::new(tab);
-            app.tab_indicator = motion::SpringValue::new(match tab {
-                ViewTab::Video => 1.0,
-                ViewTab::Folders => 2.0,
-                ViewTab::Options => 3.0,
-                ViewTab::Install | ViewTab::Account => 0.0,
-            });
         }
 
         app
@@ -2479,8 +2474,18 @@ impl PhaseInstallerApp {
 
     fn poll_theme_background_fetches(&mut self, ctx: &Context) {
         while let Ok(result) = self.theme_background_rx.try_recv() {
-            let Ok(image) = result.image else {
+            // A fetch from a previously selected theme can finish after the
+            // user has switched or restored the default. Never let that stale
+            // texture replace the active theme's background.
+            if self.theme_background_key.as_deref() != Some(result.key.as_str()) {
                 continue;
+            }
+            let image = match result.image {
+                Ok(image) => image,
+                Err(error) => {
+                    self.log(phase::warning(), error);
+                    continue;
+                }
             };
             self.theme_background = Some(ctx.load_texture(
                 format!("theme-background-{}", result.key),
@@ -3474,28 +3479,6 @@ impl PhaseInstallerApp {
             let panel_width = (ui.available_width() - 28.0).clamp(280.0, 560.0);
             ui.set_min_width(panel_width);
             ui.set_max_width(panel_width);
-            ui.horizontal(|ui| {
-                if let Some(logo) = &self.logo {
-                    let image = egui::Image::new(logo).fit_to_exact_size(Vec2::splat(38.0));
-                    ui.add(image);
-                }
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Connection Diagnostics")
-                            .font(FontId::proportional(18.0))
-                            .strong()
-                            .color(phase::text()),
-                    );
-                    ui.label(
-                        RichText::new("Checks Phase servers and local install access.")
-                            .font(FontId::proportional(11.5))
-                            .color(phase::text_secondary()),
-                    );
-                });
-            });
-
-            ui.add_space(14.0);
             let running = self.diagnostics_rx.is_some();
             let fix_running = self.diagnostics_fix_rx.is_some();
             let busy = running || fix_running;
@@ -3654,7 +3637,7 @@ impl PhaseInstallerApp {
         }
 
         let builder = egui::ViewportBuilder::default()
-            .with_title("Phase Animator Controls")
+            .with_title("Phase Companion Controls")
             .with_position(self.tray_panel_pos)
             .with_inner_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT))
             .with_min_inner_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT))
@@ -3742,13 +3725,13 @@ impl PhaseInstallerApp {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.label(
-                        RichText::new("Phase Animator")
+                        RichText::new("Phase Companion")
                             .font(type_heading())
                             .strong()
                             .color(phase::text()),
                     );
                     ui.label(
-                        RichText::new("Tray controls")
+                        RichText::new("Background update controls")
                             .font(FontId::proportional(11.5))
                             .color(phase::text_secondary()),
                     );
@@ -3849,7 +3832,7 @@ impl PhaseInstallerApp {
         let title_color = color_with_alpha(phase::text(), fade_t);
         let body_color = color_with_alpha(phase::text_secondary(), fade_t);
 
-        egui::Window::new("Keep Phase Animator running?")
+        egui::Window::new("Keep Phase Companion running?")
             .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - pop_t) * 12.0))
             .collapsible(false)
             .resizable(false)
@@ -3864,7 +3847,7 @@ impl PhaseInstallerApp {
             .show(ctx, |ui| {
                 ui.set_width(width);
                 ui.label(
-                    RichText::new("Keep Phase Animator running?")
+                    RichText::new("Keep Phase Companion running?")
                         .font(FontId::proportional(18.0))
                         .strong()
                         .color(title_color),
@@ -3885,7 +3868,7 @@ impl PhaseInstallerApp {
                 }
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    if secondary_button(ui, MiniIcon::External, "Quit", Vec2::new(104.0, 36.0))
+                    if danger_button(ui, MiniIcon::External, "Quit", Vec2::new(104.0, 36.0))
                         .clicked()
                     {
                         self.request_quit(ctx);
@@ -3921,9 +3904,17 @@ impl PhaseInstallerApp {
         };
         self.screenshot_frames += 1;
         match self.screenshot_frames {
-            2 => ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
-                APP_WIDTH, APP_HEIGHT,
-            ))),
+            2 => {
+                let width = std::env::var("PHASE_UI_WIDTH")
+                    .ok()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(APP_WIDTH);
+                let height = std::env::var("PHASE_UI_HEIGHT")
+                    .ok()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(APP_HEIGHT);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(width, height)));
+            }
             170 => ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot),
             _ => {}
         }
@@ -4028,7 +4019,7 @@ impl PhaseInstallerApp {
                     phase::background().r(),
                     phase::background().g(),
                     phase::background().b(),
-                    224,
+                    96,
                 ),
             );
         }
@@ -4044,6 +4035,10 @@ impl PhaseInstallerApp {
             color_with_alpha(phase::accent(), 0.08),
             color_with_alpha(phase::accent(), 0.0),
         );
+    }
+
+    fn has_theme_background_art(&self) -> bool {
+        self.theme_background.is_some() || self.theme_outgoing_background.is_some()
     }
 
     fn check_milestones(&mut self) {
@@ -4127,7 +4122,7 @@ impl PhaseInstallerApp {
                             }
                             1 => {
                                 ui.add_enabled_ui(!disconnecting, |ui| {
-                                    if secondary_button(ui, MiniIcon::Trash, "Disconnect", size)
+                                    if danger_button(ui, MiniIcon::Trash, "Disconnect", size)
                                         .clicked()
                                     {
                                         self.start_phase_disconnect(ui.ctx());
@@ -4139,9 +4134,9 @@ impl PhaseInstallerApp {
                     } else {
                         match index {
                             0 => {
-                                let connect_label = if busy { "Waiting" } else { "Connect" };
+                                let connect_label = if busy { "Waiting" } else { "Connect Phase" };
                                 ui.add_enabled_ui(!busy, |ui| {
-                                    if secondary_button(ui, MiniIcon::Link, connect_label, size)
+                                    if primary_button(ui, MiniIcon::Link, connect_label, size)
                                         .clicked()
                                     {
                                         self.start_phase_account_link(ui.ctx());
@@ -4156,8 +4151,13 @@ impl PhaseInstallerApp {
                             }
                             2 => {
                                 ui.add_enabled_ui(link_url.is_some(), |ui| {
-                                    if secondary_button(ui, MiniIcon::External, "Open", size)
-                                        .clicked()
+                                    if secondary_button(
+                                        ui,
+                                        MiniIcon::External,
+                                        "Open verification",
+                                        size,
+                                    )
+                                    .clicked()
                                     {
                                         if let Some(url) = link_url.clone() {
                                             if let Err(error) = open::that(url) {
@@ -4235,13 +4235,15 @@ impl PhaseInstallerApp {
                     match index {
                         0 => {
                             ui.add_enabled_ui(!activation_busy, |ui| {
-                                if secondary_button(ui, MiniIcon::Key, "License", size).clicked() {
+                                if primary_button(ui, MiniIcon::Key, "Activate license", size)
+                                    .clicked()
+                                {
                                     self.start_activation(ui.ctx());
                                 }
                             });
                         }
                         1 => {
-                            if secondary_button(ui, MiniIcon::Trash, "Disconnect", size).clicked() {
+                            if danger_button(ui, MiniIcon::Trash, "Disconnect", size).clicked() {
                                 self.disconnect_roblox_account();
                             }
                         }
@@ -4250,10 +4252,13 @@ impl PhaseInstallerApp {
                 } else {
                     match index {
                         0 => {
-                            let label = if oauth_busy { "Waiting" } else { "Roblox" };
+                            let label = if oauth_busy {
+                                "Waiting"
+                            } else {
+                                "Verify Roblox"
+                            };
                             ui.add_enabled_ui(!oauth_busy, |ui| {
-                                if secondary_button(ui, MiniIcon::ShieldCheck, label, size)
-                                    .clicked()
+                                if primary_button(ui, MiniIcon::ShieldCheck, label, size).clicked()
                                 {
                                     self.start_roblox_oauth(ui.ctx());
                                 }
@@ -4261,7 +4266,13 @@ impl PhaseInstallerApp {
                         }
                         1 => {
                             ui.add_enabled_ui(roblox_url.is_some(), |ui| {
-                                if secondary_button(ui, MiniIcon::External, "Open", size).clicked()
+                                if secondary_button(
+                                    ui,
+                                    MiniIcon::External,
+                                    "Open verification",
+                                    size,
+                                )
+                                .clicked()
                                 {
                                     if let Some(url) = roblox_url.clone() {
                                         if let Err(error) = open::that(url) {
@@ -4419,10 +4430,10 @@ impl PhaseInstallerApp {
 
             ui.add_space(SP_4);
             action_grid(ui, 3, |ui, index, size| match index {
-                0 if secondary_button(ui, MiniIcon::Folder, "Browse", size).clicked() => {
+                0 if primary_button(ui, MiniIcon::Folder, "Choose folder", size).clicked() => {
                     self.choose_folder();
                 }
-                1 if secondary_button(ui, MiniIcon::Eye, "Open", size).clicked() => {
+                1 if secondary_button(ui, MiniIcon::Eye, "Open folder", size).clicked() => {
                     self.open_folder();
                 }
                 2 if secondary_button(ui, MiniIcon::Refresh, "Rescan", size).clicked() => {
@@ -4497,22 +4508,27 @@ impl PhaseInstallerApp {
             ui.add_space(12.0);
             if primary_button(
                 ui,
-                MiniIcon::External,
-                "Open Video",
+                MiniIcon::Link,
+                "Send reference to Studio",
                 Vec2::new(inner_w, 38.0),
             )
             .clicked()
             {
-                self.open_video_popup();
+                self.send_video_reference();
             }
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let btn_width = (inner_w - ui.spacing().item_spacing.x * 2.0) / 3.0;
-                if secondary_button(ui, MiniIcon::Link, "Send Link", Vec2::new(btn_width, 32.0))
-                    .clicked()
+                if secondary_button(
+                    ui,
+                    MiniIcon::External,
+                    "Open viewer",
+                    Vec2::new(btn_width, 32.0),
+                )
+                .clicked()
                 {
-                    self.send_video_reference();
+                    self.open_video_popup();
                 }
                 let sync_label = if self.video_sync_enabled {
                     "Sync On"
@@ -4524,7 +4540,14 @@ impl PhaseInstallerApp {
                 } else {
                     MiniIcon::Pause
                 };
-                if secondary_button(ui, sync_icon, sync_label, Vec2::new(btn_width, 32.0)).clicked()
+                if choice_button(
+                    ui,
+                    sync_icon,
+                    sync_label,
+                    self.video_sync_enabled,
+                    Vec2::new(btn_width, 32.0),
+                )
+                .clicked()
                 {
                     self.video_sync_enabled = !self.video_sync_enabled;
                     self.send_video_sync_enabled();
@@ -4773,7 +4796,7 @@ impl PhaseInstallerApp {
     fn options_tab(&mut self, ui: &mut Ui) {
         draw_panel(ui, |ui| {
             ui.vertical(|ui| {
-                section_label(ui, "Customization");
+                section_label(ui, "Updater behavior");
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
@@ -4801,9 +4824,24 @@ impl PhaseInstallerApp {
                     });
                 });
 
-                ui.add_space(14.0);
+                ui.add_space(12.0);
+                ui.checkbox(
+                    &mut self.backup_before_install,
+                    RichText::new("Back up the current plugin before install")
+                        .font(type_body())
+                        .color(phase::text_secondary()),
+                );
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut self.restart_studio_hint,
+                    RichText::new("Show the Roblox Studio restart reminder")
+                        .font(type_body())
+                        .color(phase::text_secondary()),
+                );
 
-                section_label(ui, "Marketplace Themes");
+                ui.add_space(20.0);
+
+                section_label(ui, "Appearance");
                 ui.add_space(6.0);
                 flat_group(ui, |ui| {
                         let current = self
@@ -4867,7 +4905,7 @@ impl PhaseInstallerApp {
                     ] {
                         let selected = self.theme_background_mode == mode;
                         let label = mode.label();
-                        if secondary_button(
+                        if choice_button(
                             ui,
                             if selected {
                                 MiniIcon::Check
@@ -4875,6 +4913,7 @@ impl PhaseInstallerApp {
                                 MiniIcon::Palette
                             },
                             label,
+                            selected,
                             Vec2::new(btn_width, 34.0),
                         )
                         .clicked()
@@ -4979,27 +5018,7 @@ impl PhaseInstallerApp {
 
                 ui.add_space(16.0);
 
-                flat_group(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.checkbox(
-                                &mut self.backup_before_install,
-                                RichText::new("Back up current plugin first")
-                                    .font(FontId::proportional(13.0))
-                                    .color(phase::text_secondary()),
-                            );
-                            ui.add_space(10.0);
-                            ui.checkbox(
-                                &mut self.restart_studio_hint,
-                                RichText::new("Show Roblox Studio restart reminder")
-                                    .font(FontId::proportional(13.0))
-                                    .color(phase::text_secondary()),
-                            );
-                        });
-                });
-
-                ui.add_space(16.0);
-
-                section_label(ui, "Plugin Recovery");
+                section_label(ui, "Plugin recovery");
                 ui.add_space(6.0);
                 flat_group(ui, |ui| {
                         ui.label(
@@ -5083,7 +5102,7 @@ impl PhaseInstallerApp {
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 let btn_width = (card_inner() - 24.0) / 2.0;
-                                if secondary_button(
+                                if danger_button(
                                     ui,
                                     MiniIcon::Trash,
                                     "Backup + Delete",
@@ -5104,7 +5123,7 @@ impl PhaseInstallerApp {
                                     self.plugin_data_reset_confirm = false;
                                 }
                             });
-                        } else if secondary_button(
+                        } else if danger_button(
                             ui,
                             MiniIcon::Trash,
                             "Backup + Delete Selected",
@@ -5129,7 +5148,7 @@ impl PhaseInstallerApp {
 
                 ui.add_space(16.0);
 
-                section_label(ui, "App Updates");
+                section_label(ui, "Companion update");
                 ui.add_space(6.0);
                 flat_group(ui, |ui| {
                         let latest = self
@@ -5202,7 +5221,7 @@ impl PhaseInstallerApp {
 
                 ui.add_space(16.0);
 
-                section_label(ui, "Connection Diagnostics");
+                section_label(ui, "Connection diagnostics");
                 ui.add_space(6.0);
                 flat_group(ui, |ui| {
                         let status = self
@@ -5308,7 +5327,7 @@ impl PhaseInstallerApp {
                             draw_icon(ui, MiniIcon::Lock, Vec2::splat(13.0), phase::text_muted());
                             ui.add_space(6.0);
                             ui.label(
-                                RichText::new("Phase Animator installer settings")
+                                RichText::new("Phase Companion settings")
                                     .font(FontId::proportional(12.0))
                                     .color(phase::text_muted()),
                             );
@@ -5595,9 +5614,9 @@ const SP_3: f32 = 12.0;
 const SP_4: f32 = 16.0;
 
 /// Corner radius for cards/panels.
-const CARD_ROUNDING: f32 = 18.0;
+const CARD_ROUNDING: f32 = 14.0;
 /// Corner radius for interactive controls (buttons, tabs, inputs).
-const CONTROL_ROUNDING: f32 = 12.0;
+const CONTROL_ROUNDING: f32 = 8.0;
 /// Shared translucent material tokens. The app cannot blur its own rendered
 /// backdrop in egui, so layered tint, highlight, rim and shadow create the
 /// same depth cue while preserving the live theme artwork beneath each plane.
@@ -5980,8 +5999,8 @@ fn configure_style(ctx: &Context) {
         widget.rounding = control_rounding;
     }
     style.visuals.window_rounding = Rounding::same(CARD_ROUNDING);
-    style.visuals.window_shadow = card_shadow();
-    style.visuals.popup_shadow = card_shadow();
+    style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+    style.visuals.popup_shadow = egui::epaint::Shadow::NONE;
     // Hairline borders read as quieter, more expensive than hard 1px lines.
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(
         1.0,
@@ -6604,11 +6623,10 @@ fn action_grid(ui: &mut Ui, count: usize, mut add_action: impl FnMut(&mut Ui, us
     }
 
     let width = ui.available_width().max(1.0);
-    let gap = ui.spacing().item_spacing.x;
-    let min_button_width = 108.0;
-    let columns = if count >= 3 && width >= min_button_width * 3.0 + gap * 2.0 {
+    let gap = PHASE_GRID_GAP;
+    let columns = if count >= 3 && width >= PHASE_MIN_ACTION_WIDTH * 3.0 + gap * 2.0 {
         3
-    } else if count >= 2 && width >= min_button_width * 2.0 + gap {
+    } else if count >= 2 && width >= PHASE_MIN_ACTION_WIDTH * 2.0 + gap {
         2
     } else {
         1
@@ -6618,25 +6636,39 @@ fn action_grid(ui: &mut Ui, count: usize, mut add_action: impl FnMut(&mut Ui, us
     while index < count {
         let remaining = count - index;
         let row_count = remaining.min(columns);
-        let row_button_width = if row_count == 1 {
-            width
-        } else {
-            ((width - gap * (row_count.saturating_sub(1)) as f32) / row_count as f32)
-                .max(min_button_width)
-        };
+        let row_button_width = phase_grid_cell_width(width, row_count, gap);
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for offset in 0..row_count {
-                add_action(ui, index + offset, Vec2::new(row_button_width, 36.0));
+                add_action(
+                    ui,
+                    index + offset,
+                    Vec2::new(row_button_width, PHASE_ACTION_HEIGHT),
+                );
             }
         });
 
         index += row_count;
         if index < count {
-            ui.add_space(8.0);
+            ui.add_space(PHASE_GRID_GAP);
         }
     }
+}
+
+fn phase_grid_cell_width(width: f32, columns: usize, gap: f32) -> f32 {
+    if columns <= 1 {
+        return width.max(1.0);
+    }
+    ((width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0)
+}
+
+fn phase_action_content_width(ui: &Ui, label: &str) -> f32 {
+    (text_width(ui, label, type_label())
+        + PHASE_ACTION_ICON_SLOT
+        + PHASE_ACTION_TEXT_GAP
+        + PHASE_ACTION_PADDING_X)
+        .max(96.0)
 }
 
 fn folder_picker_trigger(
@@ -9006,35 +9038,20 @@ fn primary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui::
         })
         .inner;
 
-    // Premium overlays: a soft accent halo that grows on hover, plus a lit top
-    // edge so the primary action reads as raised and alive.
-    let rect = response.rect;
-    let hv = hover_t(ui, response.id, response.hovered() && ui.is_enabled());
-    let painter = ui.painter();
-    if hv > 0.0 {
-        painter.rect_stroke(
-            rect.expand(2.0 + 2.0 * hv),
-            Rounding::same(CONTROL_ROUNDING + 2.0),
-            Stroke::new(1.5, color_with_alpha(phase::accent(), 0.32 * hv)),
-        );
+    if response.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    top_highlight(
-        painter,
-        rect,
-        CONTROL_ROUNDING,
-        color_with_alpha(Color32::WHITE, 0.12 * opacity),
-    );
     response
 }
 
 fn secondary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui::Response {
     let opacity = if ui.is_enabled() { 1.0 } else { 0.45 };
     let visuals = PhaseButtonVisuals {
-        fill: color_with_alpha(phase::input(), opacity),
-        hover_fill: color_with_alpha(phase::surface_hover(), opacity),
-        active_fill: color_with_alpha(phase::surface_active(), opacity),
-        stroke: Stroke::new(1.0, color_with_alpha(phase::line(), opacity)),
-        hover_stroke: Stroke::new(1.0, color_with_alpha(phase::accent(), opacity)),
+        fill: color_with_alpha(phase::input(), 0.38 * opacity),
+        hover_fill: color_with_alpha(phase::surface_hover(), 0.72 * opacity),
+        active_fill: color_with_alpha(phase::surface_active(), 0.78 * opacity),
+        stroke: Stroke::new(1.0, color_with_alpha(phase::line(), 0.58 * opacity)),
+        hover_stroke: Stroke::new(1.0, color_with_alpha(phase::line(), opacity)),
         active_stroke: Stroke::new(1.0, color_with_alpha(phase::line(), opacity)),
         text_color: color_with_alpha(phase::text_secondary(), opacity),
     };
@@ -9052,20 +9069,96 @@ fn secondary_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui
             )
         })
         .inner;
-    let hv = hover_t(ui, response.id, response.hovered() && ui.is_enabled());
-    if hv > 0.0 {
-        ui.painter().rect_stroke(
-            response.rect.expand(1.0 + hv),
-            Rounding::same(CONTROL_ROUNDING + 1.0),
-            Stroke::new(1.0, color_with_alpha(phase::accent(), 0.3 * hv)),
-        );
+    if response.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    top_highlight(
-        ui.painter(),
-        response.rect,
-        CONTROL_ROUNDING,
-        color_with_alpha(Color32::WHITE, 0.04 + 0.07 * hv),
-    );
+    response
+}
+
+fn choice_button(
+    ui: &mut Ui,
+    icon: MiniIcon,
+    text: &str,
+    selected: bool,
+    size: Vec2,
+) -> egui::Response {
+    let opacity = if ui.is_enabled() { 1.0 } else { 0.45 };
+    let visuals = PhaseButtonVisuals {
+        fill: color_with_alpha(
+            if selected {
+                lerp_color(phase::input(), phase::accent_dim(), 0.28)
+            } else {
+                phase::input()
+            },
+            opacity,
+        ),
+        hover_fill: color_with_alpha(phase::surface_hover(), opacity),
+        active_fill: color_with_alpha(phase::surface_active(), opacity),
+        stroke: Stroke::new(
+            1.0,
+            color_with_alpha(
+                if selected {
+                    phase::accent()
+                } else {
+                    phase::line()
+                },
+                if selected { 0.72 } else { 0.45 } * opacity,
+            ),
+        ),
+        hover_stroke: Stroke::new(1.0, color_with_alpha(phase::line(), opacity)),
+        active_stroke: Stroke::new(1.0, color_with_alpha(phase::accent(), opacity)),
+        text_color: color_with_alpha(
+            if selected {
+                phase::text()
+            } else {
+                phase::text_secondary()
+            },
+            opacity,
+        ),
+    };
+    let response = ui
+        .scope(|ui| {
+            apply_button_visuals(ui, visuals);
+            ui.add_sized(
+                size,
+                Button::new(icon_button_text(icon, text, None, 14.0, 15.0, 8.0))
+                    .frame(true)
+                    .min_size(size)
+                    .rounding(Rounding::same(CONTROL_ROUNDING))
+                    .wrap(false),
+            )
+        })
+        .inner;
+    if response.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn danger_button(ui: &mut Ui, icon: MiniIcon, text: &str, size: Vec2) -> egui::Response {
+    let opacity = if ui.is_enabled() { 1.0 } else { 0.45 };
+    let visuals = PhaseButtonVisuals {
+        fill: color_with_alpha(lerp_color(phase::input(), phase::red(), 0.08), opacity),
+        hover_fill: color_with_alpha(lerp_color(phase::input(), phase::red(), 0.15), opacity),
+        active_fill: color_with_alpha(lerp_color(phase::input(), phase::red(), 0.22), opacity),
+        stroke: Stroke::new(1.0, color_with_alpha(phase::red(), 0.42 * opacity)),
+        hover_stroke: Stroke::new(1.0, color_with_alpha(phase::red(), 0.82 * opacity)),
+        active_stroke: Stroke::new(1.0, color_with_alpha(phase::red(), opacity)),
+        text_color: color_with_alpha(phase::red(), opacity),
+    };
+    let response = ui
+        .scope(|ui| {
+            apply_button_visuals(ui, visuals);
+            ui.add_sized(
+                size,
+                Button::new(icon_button_text(icon, text, None, 14.0, 15.0, 8.0))
+                    .frame(true)
+                    .min_size(size)
+                    .rounding(Rounding::same(CONTROL_ROUNDING))
+                    .wrap(false),
+            )
+        })
+        .inner;
     if response.hovered() && ui.is_enabled() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
