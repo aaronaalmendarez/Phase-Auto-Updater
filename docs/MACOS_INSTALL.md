@@ -11,6 +11,9 @@ program, so macOS requires a one-time manual approval.
 3. Drag **Phase Companion** into the **Applications** folder.
 4. Open Phase Companion from Applications once. macOS may block the first
    launch because the developer cannot be verified.
+
+![The macOS warning shown when Phase Companion cannot be verified](images/macos-unverified-app-warning.png)
+
 5. Open **System Settings**, select **Privacy & Security**, and scroll to the
    **Security** section.
 6. Click **Open Anyway** for Phase Companion, authenticate with your Mac
