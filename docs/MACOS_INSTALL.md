@@ -7,6 +7,9 @@ program, so macOS requires a one-time manual approval.
 ## Install
 
 1. Download `Phase Companion.dmg` from the official GitHub release.
+
+![The Phase Companion macOS downloads, with the DMG selected](images/macos-release-downloads.png)
+
 2. Open the disk image.
 3. Drag **Phase Companion** into the **Applications** folder.
 
