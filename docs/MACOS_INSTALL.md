@@ -9,6 +9,9 @@ program, so macOS requires a one-time manual approval.
 1. Download `Phase Companion.dmg` from the official GitHub release.
 2. Open the disk image.
 3. Drag **Phase Companion** into the **Applications** folder.
+
+![The Phase Companion disk image with the app and Applications shortcut](images/macos-drag-to-applications.png)
+
 4. Open Phase Companion from Applications once. macOS may block the first
    launch because the developer cannot be verified.
 
