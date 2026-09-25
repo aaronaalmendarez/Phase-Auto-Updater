@@ -1,0 +1,30 @@
+# The repository holds source code and what's needed to build and release it.
+# Everything else in this folder (builds, screenshots, notes, archives) stays
+# local. To publish a new top-level file or folder, add it below.
+/*
+
+!/.gitignore
+!/README.md
+!/Cargo.toml
+!/Cargo.lock
+!/build.rs
+!/src/
+!/.cargo/
+!/.github/
+!/scripts/
+!/installer/
+
+# Only the assets the build embeds or ships.
+!/assets/
+/assets/*
+!/assets/PhaseAnimator.ico
+!/assets/PhaseAnimator.png
+!/assets/PhaseLogo.png
+!/assets/Phosphor.ttf
+!/assets/PHOSPHOR-LICENSE
+!/assets/RobloxTiltWhite.png
+
+# Never commit secrets or logs, even inside allowed folders.
+.env
+.env.*
+*.log

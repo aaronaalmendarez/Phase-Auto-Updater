@@ -1,0 +1,7 @@
+[target.x86_64-pc-windows-msvc]
+linker = "scripts/msvc-link-x64.cmd"
+
+[env]
+CC_x86_64_pc_windows_msvc = { value = "scripts/msvc-cl-x64.cmd", relative = true }
+CXX_x86_64_pc_windows_msvc = { value = "scripts/msvc-cl-x64.cmd", relative = true }
+AR_x86_64_pc_windows_msvc = { value = "scripts/msvc-lib-x64.cmd", relative = true }

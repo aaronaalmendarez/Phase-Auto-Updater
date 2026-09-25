@@ -1,0 +1,7648 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+mod detector;
+mod diagnostics;
+mod kit;
+mod motion;
+mod pages;
+mod release_channel;
+mod studio_patch;
+mod verification;
+mod video_reference;
+
+use release_channel::{InstalledRelease, ReleaseChannel};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
+
+use detector::{
+    PluginFile, PluginFolderCandidate, best_candidate, detect_plugin_folders, inspect_candidate,
+};
+use eframe::egui::{
+    self, Align, Align2, Button, Color32, ColorImage, Context, FontData, FontFamily, FontId,
+    IconData, Margin, Pos2, Rect, RichText, Rounding, Sense, Stroke, TextFormat, TextureHandle,
+    TextureOptions, Ui, Vec2, WidgetText,
+};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use tray_icon::{
+    Icon as TrayIconImage, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+};
+
+const APP_NAME: &str = "Phase Companion";
+const CURRENT_BUILD_ID: &str = "phase-2026-06-05-rustls-v0-19-8";
+const PHOSPHOR_FONT: &str = "phosphor-icons";
+const UI_FONT_REGULAR: &str = "phase-ui-regular";
+const UI_FONT_SEMIBOLD: &str = "phase-ui-semibold";
+const APP_WIDTH: f32 = 800.0;
+const APP_HEIGHT: f32 = 560.0;
+const MIN_APP_WIDTH: f32 = 560.0;
+const MIN_APP_HEIGHT: f32 = 480.0;
+const GRID_GAP: f32 = 8.0;
+const ACTION_HEIGHT: f32 = 42.0;
+const MIN_ACTION_WIDTH: f32 = 190.0;
+const TRAY_PANEL_WIDTH: f32 = 302.0;
+const TRAY_PANEL_HEIGHT: f32 = 326.0;
+const TRAY_CLOSE_DURATION: Duration = Duration::from_millis(180);
+const THEME_PALETTE_TRANSITION_SECS: f32 = 1.25;
+const THEME_BACKGROUND_TRANSITION_SECS: f32 = 1.0;
+const TOAST_WIDTH: f32 = 360.0;
+const TOAST_HEIGHT: f32 = 104.0;
+const TOAST_LIFETIME: Duration = Duration::from_secs(5);
+const TRAY_VIEWPORT_KEY: &str = "phase-tray-controls";
+const DIAGNOSTICS_VIEWPORT_KEY: &str = "phase-connection-diagnostics";
+const NOTIFICATION_VIEWPORT_KEY: &str = "phase-notification";
+const PARKED_WINDOW_POS: f32 = -32_000.0;
+#[cfg(target_os = "windows")]
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+fn main() -> eframe::Result<()> {
+    if std::env::args().any(|arg| arg == "--smoke-test") {
+        if run_smoke_test().is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if let Some(action) = studio_patch_arg_action() {
+        match studio_patch::run(action) {
+            Ok(outcome) => {
+                eprintln!("{}", outcome.message);
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("Studio shortcuts failed: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if let Some(path) = popup_arg_path() {
+        video_reference::install_popup_panic_logger();
+        if let Err(error) = video_reference::run_popup_window(&path) {
+            video_reference::append_popup_log(format!("popup failed before event loop: {error}"));
+            eprintln!("Phase video popup failed: {error}");
+        }
+        return Ok(());
+    }
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([APP_WIDTH, APP_HEIGHT])
+        .with_min_inner_size([MIN_APP_WIDTH, MIN_APP_HEIGHT])
+        .with_transparent(true)
+        .with_title(APP_NAME)
+        .with_icon(load_window_icon());
+    if std::env::var_os("PHASE_UI_SCREENSHOT").is_none()
+        && let Some(state) = load_window_state()
+    {
+        viewport = viewport.with_inner_size([
+            state.width.max(MIN_APP_WIDTH),
+            state.height.max(MIN_APP_HEIGHT),
+        ]);
+        if state.x > -2_000.0 && state.x < 16_000.0 && state.y > -100.0 && state.y < 16_000.0 {
+            viewport = viewport.with_position([state.x, state.y]);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Extend the themed content behind a transparent native title bar so
+        // the caption never lands on an opaque white strip. The native title
+        // and traffic-light controls stay available in this configuration.
+        viewport = viewport
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false);
+    }
+
+    let native_options = eframe::NativeOptions {
+        viewport,
+        persist_window: false,
+        vsync: true,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        APP_NAME,
+        native_options,
+        Box::new(|cc| Box::new(PhaseInstallerApp::new(cc))),
+    )
+}
+
+fn studio_patch_arg_action() -> Option<studio_patch::PatchAction> {
+    std::env::args().find_map(|arg| match arg.as_str() {
+        "--inspect-studio-shortcut-router" => Some(studio_patch::PatchAction::Inspect),
+        "--enable-studio-shortcut-router" => Some(studio_patch::PatchAction::Enable),
+        "--restore-studio-shortcut-router" => Some(studio_patch::PatchAction::Disable),
+        _ => None,
+    })
+}
+
+fn popup_arg_path() -> Option<PathBuf> {
+    let mut args = std::env::args_os();
+    while let Some(arg) = args.next() {
+        if arg == "--video-popup" {
+            return args.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+fn run_smoke_test() -> Result<(), String> {
+    if include_bytes!("../assets/PhaseAnimator.png").is_empty() {
+        return Err("Missing PhaseAnimator.png".to_owned());
+    }
+    if include_bytes!("../assets/PhaseLogo.png").is_empty() {
+        return Err("Missing PhaseLogo.png".to_owned());
+    }
+    if include_bytes!("../assets/RobloxTiltWhite.png").is_empty() {
+        return Err("Missing RobloxTiltWhite.png".to_owned());
+    }
+    if include_bytes!("../assets/Phosphor.ttf").is_empty() {
+        return Err("Missing Phosphor.ttf".to_owned());
+    }
+
+    let _folders = detect_plugin_folders();
+    let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+    if !plan.version_url().starts_with("https://") {
+        return Err("Invalid version URL".to_owned());
+    }
+    if !plan.update_stream_url().starts_with("wss://") {
+        return Err("Invalid update stream URL".to_owned());
+    }
+    let _ = install_id();
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallPhase {
+    Idle,
+    Checking,
+    Ready,
+    Downloading,
+    Installing,
+    Complete,
+    Error,
+}
+
+/// Top-level pages in the sidebar.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Page {
+    Home,
+    Reference,
+    Account,
+    Settings,
+}
+
+struct ActivityLine {
+    color: Color32,
+    text: String,
+}
+
+#[derive(Clone, Copy)]
+enum AvatarKind {
+    Phase,
+    Roblox,
+}
+
+struct AvatarFetchResult {
+    kind: AvatarKind,
+    key: String,
+    image: Result<ColorImage, String>,
+    roblox_username: Option<String>,
+}
+
+struct ThemeBackgroundFetchResult {
+    key: String,
+    image: Result<ColorImage, String>,
+}
+
+struct ThemePreviewFetchResult {
+    asset_id: String,
+    key: String,
+    image: Result<ColorImage, String>,
+}
+
+#[derive(Clone)]
+struct ThemeTransition {
+    from: phase::Palette,
+    to: phase::Palette,
+    started_at: Instant,
+    title: String,
+}
+
+#[derive(Clone, Copy)]
+enum NotificationTone {
+    Info,
+    Success,
+}
+
+#[derive(Clone)]
+struct PhaseNotification {
+    title: String,
+    body: String,
+    tone: NotificationTone,
+    created_at: Instant,
+    closing_started: Option<Instant>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThemeSelection {
+    asset_id: String,
+    title: String,
+    theme_code: String,
+    background_image_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ThemeBackgroundMode {
+    Fit,
+    Stretch,
+    #[default]
+    Crop,
+}
+
+struct InstallOutcome {
+    target_path: PathBuf,
+    backup_path: Option<PathBuf>,
+    version: String,
+    receipt: InstalledRelease,
+}
+
+enum InstallEvent {
+    Progress {
+        phase: InstallPhase,
+        color: Color32,
+        message: String,
+        progress: f32,
+    },
+    Finished(Result<InstallOutcome, String>),
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct TrayController {
+    _icon: TrayIcon,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+enum TraySignal {
+    ShowWindow,
+    ShowPanel { x: f32, y: f32 },
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountCache {
+    plugin_token: Option<String>,
+    linked_user: Option<verification::LinkedUser>,
+    roblox_user_id: String,
+    roblox_username: Option<String>,
+    activation: Option<verification::ActivationResponse>,
+    #[serde(default)]
+    selected_theme: Option<ThemeSelection>,
+    #[serde(default)]
+    theme_background_mode: ThemeBackgroundMode,
+    #[serde(default)]
+    stable_updates_paused: bool,
+    #[serde(default)]
+    installed_release: Option<InstalledRelease>,
+}
+
+struct PhaseInstallerApp {
+    shell: pages::ShellState,
+    build_access: Option<verification::CompanionBuildAccess>,
+    stable_updates_paused: bool,
+    installed_release: Option<InstalledRelease>,
+    logo: Option<TextureHandle>,
+    phase_avatar: Option<TextureHandle>,
+    phase_avatar_key: Option<String>,
+    roblox_avatar: Option<TextureHandle>,
+    roblox_avatar_key: Option<String>,
+    avatar_tx: Sender<AvatarFetchResult>,
+    avatar_rx: Receiver<AvatarFetchResult>,
+    theme_background: Option<TextureHandle>,
+    theme_outgoing_background: Option<TextureHandle>,
+    theme_background_key: Option<String>,
+    theme_background_fade_started: Option<Instant>,
+    theme_background_tx: Sender<ThemeBackgroundFetchResult>,
+    theme_background_rx: Receiver<ThemeBackgroundFetchResult>,
+    theme_preview_tx: Sender<ThemePreviewFetchResult>,
+    theme_preview_rx: Receiver<ThemePreviewFetchResult>,
+    theme_preview_textures: HashMap<String, TextureHandle>,
+    theme_preview_loading: HashSet<String>,
+    candidates: Vec<PluginFolderCandidate>,
+    selected_folder: Option<PathBuf>,
+    release: Option<verification::VersionResponse>,
+    local_release_current: bool,
+    release_error: Option<String>,
+    release_rx: Option<Receiver<Result<verification::VersionResponse, String>>>,
+    update_stream_rx: Option<Receiver<Result<verification::UpdateStreamEvent, String>>>,
+    link_code: Option<String>,
+    link_url: Option<String>,
+    link_expires_at: Option<String>,
+    link_rx: Option<Receiver<Result<verification::PluginLinkStartResponse, String>>>,
+    link_status_rx: Option<Receiver<Result<verification::PluginLinkStatusResponse, String>>>,
+    account_refresh_rx: Option<Receiver<Result<verification::PluginMeResponse, String>>>,
+    phase_disconnect_rx: Option<Receiver<Result<(), String>>>,
+    app_update_rx: Option<Receiver<Result<Option<verification::AppUpdateInfo>, String>>>,
+    app_update_install_rx: Option<Receiver<Result<PathBuf, String>>>,
+    app_update: Option<verification::AppUpdateInfo>,
+    app_update_error: Option<String>,
+    theme_assets: Vec<verification::PhaseThemeAsset>,
+    theme_fetch_rx: Option<Receiver<Result<Vec<verification::PhaseThemeAsset>, String>>>,
+    theme_apply_rx: Option<Receiver<Result<ThemeSelection, String>>>,
+    theme_applying_asset_id: Option<String>,
+    theme_transition: Option<ThemeTransition>,
+    theme_error: Option<String>,
+    diagnostics_rx: Option<Receiver<diagnostics::DiagnosticReport>>,
+    diagnostics_report: Option<diagnostics::DiagnosticReport>,
+    diagnostics_fix_rx: Option<Receiver<diagnostics::RepairEvent>>,
+    diagnostics_fix_report: Option<diagnostics::RepairReport>,
+    diagnostics_fix_steps: Vec<diagnostics::RepairStep>,
+    diagnostics_open: bool,
+    diagnostics_started_at: Option<Instant>,
+    diagnostics_fix_started_at: Option<Instant>,
+    selected_theme: Option<ThemeSelection>,
+    theme_search: String,
+    visible_theme_count: usize,
+    theme_background_mode: ThemeBackgroundMode,
+    last_link_poll: Option<Instant>,
+    linked_user: Option<verification::LinkedUser>,
+    plugin_token: Option<String>,
+    license_key: String,
+    roblox_user_id: String,
+    roblox_username: Option<String>,
+    roblox_oauth_state: Option<String>,
+    roblox_oauth_url: Option<String>,
+    roblox_oauth_expires_at: Option<String>,
+    roblox_oauth_rx: Option<Receiver<Result<verification::RobloxOAuthStartResponse, String>>>,
+    roblox_oauth_status_rx:
+        Option<Receiver<Result<verification::RobloxOAuthStatusResponse, String>>>,
+    last_roblox_oauth_poll: Option<Instant>,
+    activation_rx: Option<Receiver<Result<verification::ActivationResponse, String>>>,
+    install_rx: Option<Receiver<InstallEvent>>,
+    activation: Option<verification::ActivationResponse>,
+    activation_error: Option<String>,
+    backup_before_install: bool,
+    restart_studio_hint: bool,
+    plugin_settings_reset_themes: bool,
+    plugin_settings_reset_keybinds: bool,
+    plugin_settings_inventory: PluginSettingsInventory,
+    plugin_data_reset_confirm: bool,
+    plugin_data_reset_status: Option<String>,
+    studio_patch_status: studio_patch::PatchStatus,
+    studio_patch_rx: Option<Receiver<Result<studio_patch::PatchOutcome, String>>>,
+    studio_patch_action: Option<studio_patch::PatchAction>,
+    studio_patch_message: Option<String>,
+    video_bridge: video_reference::VideoReferenceBridge,
+    video_bridge_config: video_reference::BridgeConfig,
+    video_bridge_listening: bool,
+    video_bridge_connected: bool,
+    video_bridge_status: String,
+    video_source: String,
+    video_title: String,
+    video_duration_seconds: String,
+    video_fps: String,
+    video_start_frame: String,
+    video_offset_seconds: String,
+    video_playback_rate: String,
+    video_position_seconds: f64,
+    video_position_input: String,
+    video_sync_enabled: bool,
+    video_playing: bool,
+    video_phase_driven_playback: bool,
+    video_play_last_tick: Option<Instant>,
+    video_last_sync_sent: Option<Instant>,
+    video_seq: u64,
+    video_last_plugin_state: String,
+    video_last_reference_status: String,
+    phase: InstallPhase,
+    ui_started_at: Instant,
+    page: Page,
+    reset_body_scroll: bool,
+    progress: f32,
+    phase_started_at: Option<Instant>,
+    activity: Vec<ActivityLine>,
+
+    milestone: u32,
+    screenshot_path: Option<PathBuf>,
+    screenshot_frames: u32,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    tray: Option<TrayController>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    tray_rx: Receiver<TraySignal>,
+    close_dialog_open: bool,
+    allow_quit: bool,
+    hidden_to_tray: bool,
+    tray_notice_shown: bool,
+    tray_panel_open: bool,
+    tray_panel_closing: bool,
+    tray_panel_opened_at: Option<Instant>,
+    tray_panel_close_started: Option<Instant>,
+    tray_panel_had_focus: bool,
+    tray_panel_pos: Pos2,
+    main_window_pos: Option<Pos2>,
+    tray_anim_nonce: u64,
+    dialog_anim_nonce: u64,
+    notifications: VecDeque<PhaseNotification>,
+    notification_window_styled: bool,
+    theme_art_tint: Option<Color32>,
+    /// The untouched Phase mark, for the "Default" theme swatch.
+    logo_default: Option<TextureHandle>,
+    /// Palette the current brand icons were drawn for (None = default art).
+    logo_key: Option<Option<u64>>,
+    brand_icon: Option<image::RgbaImage>,
+    brand_icon_focused: bool,
+    window_state_saved: Option<WindowState>,
+    window_state_checked: Option<Instant>,
+}
+
+impl PhaseInstallerApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(target_os = "macos")]
+        cc.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+
+        configure_style(&cc.egui_ctx);
+
+        let candidates = detect_plugin_folders();
+        let selected_folder = best_candidate(&candidates).map(|candidate| candidate.path);
+        let (avatar_tx, avatar_rx) = mpsc::channel();
+        let (theme_background_tx, theme_background_rx) = mpsc::channel();
+        let (theme_preview_tx, theme_preview_rx) = mpsc::channel();
+        let video_bridge_config = video_reference::BridgeConfig::default_local();
+        let video_bridge =
+            video_reference::VideoReferenceBridge::start(video_bridge_config.clone());
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let (tray_tx, tray_rx) = mpsc::channel();
+
+        let mut app = Self {
+            shell: pages::ShellState::default(),
+            logo: load_logo(&cc.egui_ctx),
+            build_access: None,
+            stable_updates_paused: false,
+            installed_release: None,
+            phase_avatar: None,
+            phase_avatar_key: None,
+            roblox_avatar: None,
+            roblox_avatar_key: None,
+            avatar_tx,
+            avatar_rx,
+            theme_background: None,
+            theme_outgoing_background: None,
+            theme_background_key: None,
+            theme_background_fade_started: None,
+            theme_background_tx,
+            theme_background_rx,
+            theme_preview_tx,
+            theme_preview_rx,
+            theme_preview_textures: HashMap::new(),
+            theme_preview_loading: HashSet::new(),
+            candidates,
+            selected_folder,
+            release: None,
+            local_release_current: false,
+            release_error: None,
+            release_rx: None,
+            update_stream_rx: None,
+            link_code: None,
+            link_url: None,
+            link_expires_at: None,
+            link_rx: None,
+            link_status_rx: None,
+            account_refresh_rx: None,
+            phase_disconnect_rx: None,
+            app_update_rx: None,
+            app_update_install_rx: None,
+            app_update: None,
+            app_update_error: None,
+            theme_assets: Vec::new(),
+            theme_fetch_rx: None,
+            theme_apply_rx: None,
+            theme_applying_asset_id: None,
+            theme_transition: None,
+            theme_error: None,
+            diagnostics_rx: None,
+            diagnostics_report: None,
+            diagnostics_fix_rx: None,
+            diagnostics_fix_report: None,
+            diagnostics_fix_steps: Vec::new(),
+            diagnostics_open: false,
+            diagnostics_started_at: None,
+            diagnostics_fix_started_at: None,
+            selected_theme: None,
+            theme_search: String::new(),
+            visible_theme_count: 6,
+            theme_background_mode: ThemeBackgroundMode::Crop,
+            last_link_poll: None,
+            linked_user: None,
+            plugin_token: None,
+            license_key: String::new(),
+            roblox_user_id: String::new(),
+            roblox_username: None,
+            roblox_oauth_state: None,
+            roblox_oauth_url: None,
+            roblox_oauth_expires_at: None,
+            roblox_oauth_rx: None,
+            roblox_oauth_status_rx: None,
+            last_roblox_oauth_poll: None,
+            activation_rx: None,
+            install_rx: None,
+            activation: None,
+            activation_error: None,
+            backup_before_install: true,
+            restart_studio_hint: true,
+            plugin_settings_reset_themes: true,
+            plugin_settings_reset_keybinds: true,
+            plugin_settings_inventory: phase_plugin_settings_inventory(),
+            plugin_data_reset_confirm: false,
+            plugin_data_reset_status: None,
+            studio_patch_status: studio_patch::PatchStatus::checking(),
+            studio_patch_rx: None,
+            studio_patch_action: None,
+            studio_patch_message: None,
+            video_bridge,
+            video_bridge_config,
+            video_bridge_listening: false,
+            video_bridge_connected: false,
+            video_bridge_status: "Starting video bridge.".to_owned(),
+            video_source: String::new(),
+            video_title: String::new(),
+            video_duration_seconds: String::new(),
+            video_fps: "60".to_owned(),
+            video_start_frame: "0".to_owned(),
+            video_offset_seconds: "0".to_owned(),
+            video_playback_rate: "1".to_owned(),
+            video_position_seconds: 0.0,
+            video_position_input: "0".to_owned(),
+            video_sync_enabled: false,
+            video_playing: false,
+            video_phase_driven_playback: false,
+            video_play_last_tick: None,
+            video_last_sync_sent: None,
+            video_seq: 0,
+            video_last_plugin_state: "No Studio timeline state yet.".to_owned(),
+            video_last_reference_status: "No reference sent.".to_owned(),
+            phase: InstallPhase::Idle,
+            ui_started_at: Instant::now(),
+            page: Page::Home,
+            reset_body_scroll: false,
+            progress: 0.0,
+            phase_started_at: None,
+            activity: Vec::new(),
+            milestone: 0,
+            screenshot_path: std::env::var_os("PHASE_UI_SCREENSHOT")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty()),
+            screenshot_frames: 0,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            tray: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            tray_rx,
+            close_dialog_open: false,
+            allow_quit: false,
+            hidden_to_tray: false,
+            tray_notice_shown: false,
+            tray_panel_open: false,
+            tray_panel_closing: false,
+            tray_panel_opened_at: None,
+            tray_panel_close_started: None,
+            tray_panel_had_focus: false,
+            tray_panel_pos: Pos2::new(64.0, 64.0),
+            main_window_pos: None,
+            tray_anim_nonce: 0,
+            dialog_anim_nonce: 0,
+            notifications: VecDeque::new(),
+            notification_window_styled: false,
+            theme_art_tint: None,
+            logo_default: load_logo(&cc.egui_ctx),
+            logo_key: None,
+            brand_icon: None,
+            brand_icon_focused: false,
+            window_state_saved: None,
+            window_state_checked: None,
+        };
+
+        app.load_cached_accounts(&cc.egui_ctx);
+
+        app.log(
+            phase::blue(),
+            "Detected local Roblox Studio plugin folders.",
+        );
+        if let Some(path) = app.selected_folder.clone() {
+            app.log(
+                phase::green(),
+                format!("Install location: {}", compact_path(&path, 30)),
+            );
+        } else {
+            app.log(
+                phase::warning(),
+                "Choose a Roblox Studio plugin folder to continue.",
+            );
+        }
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        match TrayController::new(tray_tx, cc.egui_ctx.clone()) {
+            Ok(tray) => app.tray = Some(tray),
+            Err(error) => app.log(phase::warning(), format!("Tray unavailable: {error}")),
+        }
+
+        app.begin_version_check(Some(cc.egui_ctx.clone()));
+        app.begin_update_stream(&cc.egui_ctx);
+        app.begin_phase_account_refresh(&cc.egui_ctx);
+        app.begin_app_update_check(&cc.egui_ctx);
+        app.begin_theme_fetch(&cc.egui_ctx);
+        app.begin_studio_patch_action(studio_patch::PatchAction::Inspect, &cc.egui_ctx);
+
+        // Screenshot captures keep the active theme, exactly as the user sees it.
+        if app.screenshot_path.is_some() {
+            app.shell.install_location =
+                std::env::var("PHASE_UI_DIALOG").ok().as_deref() == Some("location");
+            if std::env::var("PHASE_UI_EMPTY_ACCOUNT")
+                .ok()
+                .is_some_and(|value| value == "1")
+            {
+                app.plugin_token = None;
+                app.linked_user = None;
+                app.activation = None;
+                app.roblox_user_id.clear();
+                app.roblox_username = None;
+                app.account_refresh_rx = None;
+            }
+            let tab = match std::env::var("PHASE_UI_TAB").ok().as_deref() {
+                Some("video") => Page::Reference,
+                Some("settings") | Some("options") => Page::Settings,
+                Some("account") => Page::Account,
+                _ => Page::Home,
+            };
+            app.page = tab;
+            if let Ok(source) = std::env::var("PHASE_UI_SOURCE") {
+                app.video_title = video_reference::default_title_for(&source);
+                app.video_source = source;
+            }
+            if std::env::var("PHASE_UI_THEME").ok().as_deref() == Some("default") {
+                phase::reset_palette();
+                configure_style(&cc.egui_ctx);
+                app.selected_theme = None;
+                app.theme_background = None;
+                app.theme_background_key = None;
+            }
+        }
+
+        app
+    }
+
+    fn open_page(&mut self, tab: Page) {
+        if self.page == tab {
+            return;
+        }
+        self.page = tab;
+        self.reset_body_scroll = true;
+    }
+
+    fn refresh_local_release_status(&mut self) {
+        self.local_release_current = self
+            .release
+            .as_ref()
+            .is_some_and(|release| self.local_matches_latest(release));
+    }
+
+    fn tick(&mut self, ctx: &Context) {
+        self.poll_version_check(ctx);
+        self.poll_update_stream(ctx);
+        self.poll_phase_account_link(ctx);
+        self.poll_roblox_oauth(ctx);
+        self.poll_activation(ctx);
+        self.poll_install(ctx);
+        self.poll_phase_account_refresh(ctx);
+        self.poll_phase_disconnect(ctx);
+        self.poll_app_update_check(ctx);
+        self.poll_app_update_install(ctx);
+        self.poll_studio_patch(ctx);
+        self.poll_theme_fetch(ctx);
+        self.poll_theme_apply(ctx);
+        self.poll_connection_diagnostics(ctx);
+        self.poll_connection_fix(ctx);
+        self.poll_avatar_fetches(ctx);
+        self.ensure_avatar_fetches(ctx);
+        self.poll_theme_background_fetches(ctx);
+        self.ensure_theme_background_fetch(ctx);
+        self.tick_theme_transition(ctx);
+        self.poll_theme_preview_fetches(ctx);
+        self.poll_tray(ctx);
+        self.poll_video_bridge(ctx);
+        self.tick_video_playback(ctx);
+        self.finish_tray_close(ctx);
+
+        if self.hidden_to_tray && self.tray_panel_open && !self.tray_panel_closing {
+            match ctx.input(|input| input.viewport().focused) {
+                Some(true) => self.tray_panel_had_focus = true,
+                Some(false)
+                    if self.tray_panel_had_focus
+                        && self.tray_panel_opened_at.is_some_and(|opened| {
+                            opened.elapsed() > Duration::from_millis(250)
+                        }) =>
+                {
+                    self.close_tray_popup(ctx);
+                }
+                _ => {}
+            }
+        }
+
+        let Some(started_at) = self.phase_started_at else {
+            return;
+        };
+
+        let elapsed = started_at.elapsed();
+        self.check_milestones();
+
+        match self.phase {
+            InstallPhase::Checking => {
+                self.progress = progress_for(elapsed, Duration::from_millis(900));
+                if self.progress >= 1.0 {
+                    if self.release_rx.is_some() {
+                        self.progress = 0.95;
+                        ctx.request_repaint();
+                    } else {
+                        self.phase = if self.release.is_some() {
+                            InstallPhase::Ready
+                        } else {
+                            InstallPhase::Idle
+                        };
+                        self.phase_started_at = None;
+                    }
+                } else {
+                    ctx.request_repaint();
+                }
+            }
+            InstallPhase::Downloading => {
+                self.progress = progress_for(elapsed, Duration::from_secs(12)).min(0.92);
+                ctx.request_repaint();
+            }
+            InstallPhase::Installing => {
+                self.progress =
+                    (0.72 + progress_for(elapsed, Duration::from_secs(6)) * 0.2).min(0.94);
+                ctx.request_repaint();
+            }
+            _ => {}
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        matches!(
+            self.phase,
+            InstallPhase::Checking | InstallPhase::Downloading | InstallPhase::Installing
+        )
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn poll_tray(&mut self, ctx: &Context) {
+        let signals: Vec<TraySignal> = self.tray_rx.try_iter().collect();
+        for signal in signals {
+            match signal {
+                TraySignal::ShowWindow => {
+                    log_tray_debug("app received show window");
+                    self.show_main_window(ctx);
+                }
+                TraySignal::ShowPanel { x, y } => {
+                    log_tray_debug(format!("app received show panel at {x:.0},{y:.0}"));
+                    if self.tray_panel_open && !self.tray_panel_closing {
+                        self.close_tray_popup(ctx);
+                    } else {
+                        self.show_tray_panel(ctx, x, y);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    fn poll_tray(&mut self, _ctx: &Context) {}
+
+    fn tray_available(&self) -> bool {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            self.tray.is_some()
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            false
+        }
+    }
+
+    fn show_main_window(&mut self, ctx: &Context) {
+        self.hidden_to_tray = false;
+        self.tray_panel_open = false;
+        self.tray_panel_closing = false;
+        self.tray_panel_close_started = None;
+        ctx.send_viewport_cmd_to(tray_viewport_id(), egui::ViewportCommand::Close);
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MousePassthrough(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Transparent(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Decorations(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Resizable(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MinInnerSize(Vec2::new(MIN_APP_WIDTH, MIN_APP_HEIGHT)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(Vec2::new(APP_WIDTH, APP_HEIGHT)),
+        );
+        if let Some(pos) = self.main_window_pos {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::OuterPosition(pos),
+            );
+        }
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Minimized(false),
+        );
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn show_tray_panel(&mut self, ctx: &Context, x: f32, y: f32) {
+        if !self.tray_panel_open {
+            self.tray_anim_nonce = self.tray_anim_nonce.wrapping_add(1);
+        }
+        self.tray_panel_open = true;
+        self.tray_panel_closing = false;
+        self.tray_panel_opened_at = Some(Instant::now());
+        self.tray_panel_close_started = None;
+        self.tray_panel_had_focus = false;
+        self.close_dialog_open = false;
+
+        let panel_x = (x - TRAY_PANEL_WIDTH + 14.0).max(8.0);
+        let panel_y = (y - TRAY_PANEL_HEIGHT - 8.0).max(8.0);
+        self.tray_panel_pos = Pos2::new(panel_x, panel_y);
+        if self.hidden_to_tray {
+            self.show_tray_panel_on_root(ctx);
+        } else {
+            ctx.send_viewport_cmd_to(tray_viewport_id(), egui::ViewportCommand::Focus);
+        }
+        ctx.request_repaint();
+    }
+
+    fn close_tray_popup(&mut self, ctx: &Context) {
+        if !self.tray_panel_open || self.tray_panel_closing {
+            return;
+        }
+        self.tray_panel_closing = true;
+        self.tray_panel_close_started = Some(Instant::now());
+        ctx.request_repaint();
+    }
+
+    fn finish_tray_close(&mut self, ctx: &Context) {
+        if !self.tray_panel_closing
+            || self
+                .tray_panel_close_started
+                .is_none_or(|started| started.elapsed() < TRAY_CLOSE_DURATION)
+        {
+            return;
+        }
+
+        self.tray_panel_open = false;
+        self.tray_panel_closing = false;
+        self.tray_panel_close_started = None;
+        if self.hidden_to_tray {
+            self.park_root_for_tray(ctx);
+        } else {
+            ctx.send_viewport_cmd_to(tray_viewport_id(), egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint();
+    }
+
+    fn minimize_to_tray(&mut self, ctx: &Context) {
+        self.remember_main_window_position(ctx);
+        self.hidden_to_tray = true;
+        self.close_dialog_open = false;
+        self.tray_panel_open = false;
+        self.tray_panel_closing = false;
+        self.tray_panel_close_started = None;
+        self.park_root_for_tray(ctx);
+        if !self.tray_notice_shown {
+            self.tray_notice_shown = true;
+            self.push_notification(
+                ctx,
+                "Phase Animator",
+                "Still running in the tray. Right-click for install actions.",
+                NotificationTone::Info,
+            );
+        }
+    }
+
+    fn show_tray_panel_on_root(&self, ctx: &Context) {
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MousePassthrough(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Transparent(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Decorations(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Resizable(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MinInnerSize(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::OuterPosition(self.tray_panel_pos),
+        );
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+    }
+
+    fn park_root_for_tray(&self, ctx: &Context) {
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Transparent(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Decorations(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Resizable(false),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MousePassthrough(true),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::MinInnerSize(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::OuterPosition(Pos2::new(PARKED_WINDOW_POS, PARKED_WINDOW_POS)),
+        );
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+    }
+
+    /// Recolor the Phase mark to the active theme everywhere it appears:
+    /// in-app logo, window/taskbar icon and tray icon. Default keeps the art.
+    fn refresh_brand_icons(&mut self, ctx: &Context) {
+        // eframe pushes its original icon onto the window the first time it
+        // becomes active (straight through Win32). Re-apply ours shortly after
+        // start and whenever the window regains focus so ours always wins.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        let regained = focused && !self.brand_icon_focused;
+        self.brand_icon_focused = focused;
+        let settling = self.ui_started_at.elapsed() < Duration::from_millis(2000);
+        if settling {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        if let Some(image) = &self.brand_icon
+            && (regained
+                || (settling && self.ui_started_at.elapsed() > Duration::from_millis(1500)))
+        {
+            set_native_window_icon(ctx, image);
+        }
+        if self.theme_transition.is_some() {
+            return;
+        }
+        let key = self.selected_theme.as_ref().map(|_| {
+            let (light, dark, stripe) = brand_stops();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(
+                &(light.to_array(), dark.to_array(), stripe.to_array()),
+                &mut hasher,
+            );
+            std::hash::Hasher::finish(&hasher)
+        });
+        if self.logo_key == Some(key) {
+            return;
+        }
+        self.logo_key = Some(key);
+        let image = brand_image(key.is_some().then(brand_stops));
+        let size = [image.width() as usize, image.height() as usize];
+        self.logo = Some(ctx.load_texture(
+            "phase-animator-logo-themed",
+            ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
+            TextureOptions::LINEAR,
+        ));
+        set_native_window_icon(ctx, &image);
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(tray) = &self.tray {
+            let small =
+                image::imageops::resize(&image, 32, 32, image::imageops::FilterType::Lanczos3);
+            if let Ok(icon) = TrayIconImage::from_rgba(small.into_raw(), 32, 32) {
+                tray.set_icon(icon);
+            }
+        }
+        self.brand_icon = Some(image);
+    }
+
+    fn persist_window_state(&mut self, ctx: &Context) {
+        if self.hidden_to_tray || self.screenshot_path.is_some() {
+            return;
+        }
+        if self
+            .window_state_checked
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.window_state_checked = Some(Instant::now());
+        let state = ctx.input(|input| {
+            let viewport = input.viewport();
+            if viewport.minimized == Some(true) || viewport.maximized == Some(true) {
+                return None;
+            }
+            let (inner, outer) = (viewport.inner_rect?, viewport.outer_rect?);
+            Some(WindowState {
+                width: inner.width().round(),
+                height: inner.height().round(),
+                x: outer.min.x.round(),
+                y: outer.min.y.round(),
+            })
+        });
+        let Some(state) = state.filter(|s| s.x > -1_000.0 && s.y > -1_000.0) else {
+            return;
+        };
+        if self.window_state_saved != Some(state) {
+            if self.window_state_saved.is_some() {
+                save_window_state(&state);
+            }
+            self.window_state_saved = Some(state);
+        }
+    }
+
+    fn remember_main_window_position(&mut self, ctx: &Context) {
+        if self.hidden_to_tray {
+            return;
+        }
+
+        let position = ctx.input(|input| input.viewport().outer_rect.map(|rect| rect.min));
+        if let Some(position) = position
+            && position.x > -1_000.0
+            && position.y > -1_000.0
+        {
+            self.main_window_pos = Some(position);
+        }
+    }
+
+    fn open_selected_folder(&mut self) {
+        let Some(path) = self.selected_folder.clone() else {
+            self.log(phase::warning(), "Choose an install location first.");
+            return;
+        };
+        if let Err(error) = open::that(&path) {
+            self.log(phase::warning(), format!("Could not open folder: {error}"));
+        }
+    }
+
+    fn request_quit(&mut self, ctx: &Context) {
+        self.allow_quit = true;
+        self.close_dialog_open = false;
+        self.close_tray_popup(ctx);
+        self.cleanup_tray();
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+    }
+
+    fn cleanup_tray(&mut self) {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(tray) = self.tray.take() {
+            tray.hide();
+        }
+    }
+
+    fn start_check(&mut self) {
+        self.phase = InstallPhase::Checking;
+        self.progress = 0.0;
+        self.phase_started_at = Some(Instant::now());
+        self.milestone = 0;
+        self.activity.clear();
+        self.log(phase::blue(), "Checking for updates...");
+        self.begin_version_check(None);
+    }
+
+    fn start_install(&mut self) {
+        self.start_install_channel(ReleaseChannel::Stable);
+    }
+
+    fn start_install_channel(&mut self, channel: ReleaseChannel) {
+        self.release_error = None;
+        if self.is_busy() {
+            return;
+        }
+
+        let Some(folder) = self.selected_folder.clone() else {
+            self.phase = InstallPhase::Error;
+            let error = "Select an install location first.".to_owned();
+            self.release_error = Some(error.clone());
+            self.log(phase::red(), error);
+            return;
+        };
+
+        let selected_release = match channel {
+            ReleaseChannel::Stable => self.release.clone(),
+            ReleaseChannel::EarlyAccess => self
+                .build_access
+                .as_ref()
+                .and_then(|access| access.downloadable_release())
+                .cloned(),
+        };
+        let Some(release) = selected_release else {
+            self.phase = InstallPhase::Error;
+            self.release_error =
+                Some("This channel does not have a verified download available yet.".to_owned());
+            self.log(
+                phase::red(),
+                "This channel does not have a verified download available yet.",
+            );
+            return;
+        };
+
+        if release.blocked || !release.download_available {
+            self.phase = InstallPhase::Error;
+            self.log(phase::red(), "This update is not available for install.");
+            return;
+        }
+
+        let Some(activation) = self.activation.clone() else {
+            self.phase = InstallPhase::Error;
+            self.open_page(Page::Account);
+            self.log(
+                phase::red(),
+                "Connect or verify your account before installing.",
+            );
+            return;
+        };
+
+        self.phase = InstallPhase::Downloading;
+        self.progress = 0.0;
+        self.phase_started_at = Some(Instant::now());
+        self.milestone = 3;
+        self.activity.clear();
+        self.log(phase::blue(), "Preparing update.");
+
+        let plugin_files = self
+            .selected_candidate()
+            .map(|candidate| candidate.plugin_files.clone())
+            .unwrap_or_default();
+        let license_key = self.license_key.trim().to_owned();
+        let backup_before_install =
+            self.backup_before_install || channel == ReleaseChannel::EarlyAccess;
+        let (tx, rx) = mpsc::channel();
+        self.install_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            run_install_worker(
+                tx,
+                folder,
+                plugin_files,
+                release,
+                activation,
+                license_key,
+                backup_before_install,
+            );
+        });
+    }
+
+    fn begin_version_check(&mut self, repaint: Option<Context>) {
+        if self.release_rx.is_some() {
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.release_error = None;
+        self.release_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let result = verification::fetch_version(&plan);
+            let _ = tx.send(result);
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn poll_version_check(&mut self, ctx: &Context) {
+        let Some(result) = self.release_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else {
+            return;
+        };
+
+        self.release_rx = None;
+        match result {
+            Ok(release) => {
+                let latest_version = release.latest_version.clone();
+                let required = release.required || release.update_required;
+                let local_current = self.local_matches_latest(&release);
+                let available = release.download_available && !release.blocked && !local_current;
+                self.release = Some(release);
+                self.local_release_current = local_current;
+                self.release_error = None;
+
+                if available {
+                    self.phase = InstallPhase::Ready;
+                    self.progress = 1.0;
+                    self.phase_started_at = None;
+                    self.log(
+                        phase::green(),
+                        format!("Version {latest_version} is available."),
+                    );
+                    if required {
+                        self.log(phase::warning(), "This update is required.");
+                    }
+                } else {
+                    self.phase = InstallPhase::Complete;
+                    self.progress = 1.0;
+                    self.phase_started_at = None;
+                    self.log(phase::green(), "Installed plugin is current.");
+                }
+            }
+            Err(error) => {
+                self.release_error = Some(error.clone());
+                self.local_release_current = false;
+                self.phase = InstallPhase::Error;
+                self.phase_started_at = None;
+                self.log(phase::red(), error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn begin_update_stream(&mut self, ctx: &Context) {
+        if self.update_stream_rx.is_some() {
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.update_stream_rx = Some(rx);
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::listen_for_updates(plan);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_update_stream(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .update_stream_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.update_stream_rx = None;
+        match result {
+            Ok(event) if !self.stable_updates_paused => {
+                let version = event
+                    .latest_version
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("new version");
+                self.log(phase::green(), format!("Update available: {version}."));
+                self.push_notification(
+                    ctx,
+                    "Phase Animator",
+                    format!("Update available: {version}"),
+                    NotificationTone::Success,
+                );
+                self.begin_version_check(Some(ctx.clone()));
+            }
+            Ok(_) | Err(_) => {}
+        }
+        self.begin_update_stream(ctx);
+        ctx.request_repaint();
+    }
+
+    fn start_connection_diagnostics(&mut self, ctx: &Context) {
+        self.diagnostics_open = true;
+        if self.diagnostics_rx.is_some() {
+            return;
+        }
+
+        let selected_folder = self.selected_folder.clone();
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        self.diagnostics_rx = Some(rx);
+        self.diagnostics_started_at = Some(Instant::now());
+        self.log(phase::blue(), "Running connection diagnostics.");
+
+        std::thread::spawn(move || {
+            let report = diagnostics::run(CURRENT_BUILD_ID, selected_folder);
+            let _ = tx.send(report);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_connection_diagnostics(&mut self, ctx: &Context) {
+        let Some(report) = self
+            .diagnostics_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.diagnostics_rx = None;
+        self.diagnostics_started_at = None;
+        let status = report.overall_status();
+        let summary = report.summary.clone();
+        self.diagnostics_report = Some(report);
+        match status {
+            diagnostics::DiagnosticStatus::Good => self.log(phase::green(), summary),
+            diagnostics::DiagnosticStatus::Warning => self.log(phase::warning(), summary),
+            diagnostics::DiagnosticStatus::Problem => self.log(phase::red(), summary),
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_connection_fix(&mut self, ctx: &Context) {
+        self.diagnostics_open = true;
+        if self.diagnostics_rx.is_some() || self.diagnostics_fix_rx.is_some() {
+            return;
+        }
+
+        let selected_folder = self.selected_folder.clone();
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        self.diagnostics_fix_rx = Some(rx);
+        self.diagnostics_fix_report = None;
+        self.diagnostics_fix_steps.clear();
+        self.diagnostics_fix_started_at = Some(Instant::now());
+        self.log(phase::blue(), "Running Phase fix assistant.");
+
+        std::thread::spawn(move || {
+            let report =
+                diagnostics::run_fix_assistant(CURRENT_BUILD_ID, selected_folder, |step| {
+                    let _ = tx.send(diagnostics::RepairEvent::Step(step));
+                    repaint.request_repaint();
+                });
+            let _ = tx.send(diagnostics::RepairEvent::Finished(report));
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_connection_fix(&mut self, ctx: &Context) {
+        let mut finished = None;
+        let mut disconnected = false;
+
+        if let Some(rx) = &self.diagnostics_fix_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(diagnostics::RepairEvent::Step(step)) => {
+                        self.diagnostics_fix_steps.push(step);
+                    }
+                    Ok(diagnostics::RepairEvent::Finished(report)) => {
+                        finished = Some(report);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(report) = finished {
+            let status = report.overall_status();
+            let summary = report.summary.clone();
+            self.diagnostics_report = Some(report.final_diagnostics.clone());
+            self.diagnostics_fix_report = Some(report);
+            self.diagnostics_fix_rx = None;
+            self.diagnostics_fix_started_at = None;
+            match status {
+                diagnostics::DiagnosticStatus::Good => self.log(phase::green(), summary),
+                diagnostics::DiagnosticStatus::Warning => self.log(phase::warning(), summary),
+                diagnostics::DiagnosticStatus::Problem => self.log(phase::red(), summary),
+            }
+            ctx.request_repaint();
+        } else if disconnected {
+            self.diagnostics_fix_rx = None;
+            self.diagnostics_fix_started_at = None;
+            self.log(
+                phase::red(),
+                "Phase fix assistant stopped before finishing.",
+            );
+            ctx.request_repaint();
+        } else if self.diagnostics_fix_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    fn local_matches_latest(&self, release: &verification::VersionResponse) -> bool {
+        let Some(info) = release.release.as_ref() else {
+            return false;
+        };
+        let Some(candidate) = self.selected_candidate() else {
+            return false;
+        };
+        let target_path = choose_install_target(&candidate.path, &candidate.plugin_files);
+        if !target_path.exists() {
+            return false;
+        };
+        let Ok(actual) = sha256_file(&target_path) else {
+            return false;
+        };
+        if info.personalized {
+            self.installed_release.as_ref().is_some_and(|receipt| {
+                receipt.matches(&target_path, &release.latest_build_id, &actual)
+            })
+        } else {
+            let expected = info.sha256.trim().to_ascii_lowercase();
+            expected.len() == 64 && actual == expected
+        }
+    }
+
+    fn has_local_phase_install(&self) -> bool {
+        let Some(folder) = self.selected_folder.as_ref() else {
+            return false;
+        };
+        let plugin_files = self
+            .selected_candidate()
+            .map(|candidate| candidate.plugin_files.clone())
+            .unwrap_or_default();
+        choose_install_target(folder, &plugin_files).exists()
+    }
+
+    fn account_summary(&self) -> String {
+        if let Some(user) = self.linked_user.as_ref().map(display_linked_user) {
+            return user;
+        }
+        if let Some(name) = self
+            .roblox_username
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            return name.to_owned();
+        }
+        if !self.roblox_user_id.trim().is_empty() {
+            return format!("Roblox {}", self.roblox_user_id.trim());
+        }
+        "Not connected".to_owned()
+    }
+
+    fn release_summary(&self) -> String {
+        self.release
+            .as_ref()
+            .map(|release| release.latest_version.clone())
+            .unwrap_or_else(|| "Checking".to_owned())
+    }
+
+    fn start_phase_account_link(&mut self, ctx: &Context) {
+        if self.link_rx.is_some() {
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let request = verification::PluginLinkStartRequest {
+            roblox_user_id: self.roblox_user_id.trim().to_owned(),
+            install_id: install_id(),
+            build_id: CURRENT_BUILD_ID.to_owned(),
+            product: "Phase Animator".to_owned(),
+            version: self
+                .release
+                .as_ref()
+                .map(|release| release.latest_version.clone())
+                .unwrap_or_else(|| "dev".to_owned()),
+        };
+        let (tx, rx) = mpsc::channel();
+        self.link_rx = Some(rx);
+        self.link_code = None;
+        self.link_url = None;
+        self.linked_user = None;
+        self.plugin_token = None;
+        self.build_access = None;
+        self.log(phase::blue(), "Opening Phase account connection.");
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::start_plugin_link(&plan, &request);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn begin_link_status_check(&mut self, ctx: &Context) {
+        if self.link_status_rx.is_some() || self.plugin_token.is_some() {
+            return;
+        }
+
+        let Some(code) = self.link_code.clone() else {
+            return;
+        };
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.link_status_rx = Some(rx);
+        self.last_link_poll = Some(Instant::now());
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::fetch_plugin_link_status(&plan, &code);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_phase_account_link(&mut self, ctx: &Context) {
+        if let Some(result) = self.link_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.link_rx = None;
+            match result {
+                Ok(session) => {
+                    self.link_code = Some(session.code.clone());
+                    self.link_url = Some(session.verify_url.clone());
+                    self.link_expires_at = Some(session.expires_at);
+                    self.log(phase::green(), format!("Link code ready: {}", session.code));
+                    if let Err(error) = open::that(&session.verify_url) {
+                        self.log(phase::warning(), format!("Open browser failed: {error}"));
+                    }
+                    self.begin_link_status_check(ctx);
+                }
+                Err(error) => self.log(phase::red(), error),
+            }
+            ctx.request_repaint();
+        }
+
+        if self.link_code.is_some()
+            && self.plugin_token.is_none()
+            && self.link_status_rx.is_none()
+            && self
+                .last_link_poll
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
+        {
+            self.begin_link_status_check(ctx);
+        }
+
+        let Some(result) = self
+            .link_status_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.link_status_rx = None;
+        match result {
+            Ok(status) if status.status == "linked" => {
+                let access_token = status.token.clone().unwrap_or_default();
+                let access_message = status.message.clone().unwrap_or_default();
+                self.plugin_token = status.plugin_token.clone();
+                self.linked_user = status.user.clone();
+                self.link_code = None;
+                self.link_url = None;
+                self.link_expires_at = status.expires_at.clone();
+                let name = self
+                    .linked_user
+                    .as_ref()
+                    .map(display_linked_user)
+                    .unwrap_or_else(|| "Phase account".to_owned());
+                self.log(phase::green(), format!("Connected to {name}."));
+                if !access_token.is_empty() {
+                    let user_id_text = status.roblox_user_id.clone().unwrap_or_default();
+                    let activation_mode = status
+                        .activation_mode
+                        .clone()
+                        .unwrap_or_else(|| "licenseKey".to_owned());
+                    let user_id = user_id_text
+                        .parse::<u64>()
+                        .ok()
+                        .or_else(|| (activation_mode == "phaseAccount").then_some(0_u64));
+                    if let Some(user_id) = user_id {
+                        if !user_id_text.trim().is_empty() {
+                            self.roblox_user_id = user_id_text;
+                        }
+                        self.activation_error = None;
+                        self.activation = Some(verification::ActivationResponse {
+                            ok: true,
+                            active: true,
+                            activation_mode,
+                            product: "Phase Animator".to_owned(),
+                            user_id,
+                            install_id: status.install_id.clone().unwrap_or_else(install_id),
+                            asset_id: Some(verification::ROBLOX_PLUGIN_ASSET_ID),
+                            token: access_token,
+                            expires_at: 0,
+                            licensee: status
+                                .licensee
+                                .clone()
+                                .unwrap_or_else(|| format!("Phase account {name}")),
+                            message: if access_message.is_empty() {
+                                "Phase account license verified.".to_owned()
+                            } else {
+                                access_message.clone()
+                            },
+                        });
+                        self.log(phase::green(), "Phase account license verified.");
+                    }
+                } else if status
+                    .access_status
+                    .as_deref()
+                    .is_some_and(|value| value != "verified" && value != "pending")
+                    && !access_message.is_empty()
+                {
+                    self.log(phase::warning(), access_message);
+                }
+                self.save_account_cache();
+                self.begin_phase_account_refresh(ctx);
+            }
+            Ok(status) => {
+                self.link_expires_at = status.expires_at;
+            }
+            Err(error) => self.log(phase::warning(), error),
+        }
+        ctx.request_repaint();
+    }
+
+    fn begin_phase_account_refresh(&mut self, ctx: &Context) {
+        if self.account_refresh_rx.is_some() {
+            return;
+        }
+        let Some(plugin_token) = self.plugin_token.clone() else {
+            return;
+        };
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.account_refresh_rx = Some(rx);
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::fetch_plugin_me(&plan, &plugin_token);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_phase_account_refresh(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .account_refresh_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.account_refresh_rx = None;
+        match result {
+            Ok(me) if me.plugin_linked => {
+                self.build_access = me.build_access;
+                let session = me.plugin_session;
+                self.linked_user = Some(me.user);
+                if let Some(session) = session {
+                    if let Some(user_id_text) = session
+                        .roblox_user_id
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        self.roblox_user_id = user_id_text.to_owned();
+                    }
+                    if let Some(token) = session
+                        .activation_token
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        let activation_mode = session
+                            .activation_mode
+                            .clone()
+                            .unwrap_or_else(|| "licenseKey".to_owned());
+                        let user_id = self
+                            .roblox_user_id
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                            .or_else(|| (activation_mode == "phaseAccount").then_some(0_u64));
+                        if let Some(user_id) = user_id {
+                            self.activation_error = None;
+                            self.activation = Some(verification::ActivationResponse {
+                                ok: true,
+                                active: true,
+                                activation_mode,
+                                product: "Phase Animator".to_owned(),
+                                user_id,
+                                install_id: session.install_id.clone().unwrap_or_else(install_id),
+                                asset_id: Some(verification::ROBLOX_PLUGIN_ASSET_ID),
+                                token: token.to_owned(),
+                                expires_at: 0,
+                                licensee: session
+                                    .licensee
+                                    .clone()
+                                    .unwrap_or_else(|| format!("Phase account {user_id}")),
+                                message: session
+                                    .message
+                                    .clone()
+                                    .unwrap_or_else(|| "Phase account access verified.".to_owned()),
+                            });
+                        }
+                    }
+                }
+                if self.plugin_token.is_some() {
+                    self.log(phase::green(), "Phase account restored.");
+                }
+                self.save_account_cache();
+            }
+            Ok(_) => {
+                self.clear_phase_account(true);
+                self.log(phase::warning(), "Phase account link expired.");
+            }
+            Err(error) => {
+                self.build_access = None;
+                self.log(
+                    phase::warning(),
+                    format!("{error}. Saved account connection kept."),
+                );
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_roblox_oauth(&mut self, ctx: &Context) {
+        if self.roblox_oauth_rx.is_some() {
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let request = verification::RobloxOAuthStartRequest {
+            install_id: install_id(),
+            build_id: CURRENT_BUILD_ID.to_owned(),
+            product: "Phase Animator".to_owned(),
+            version: self
+                .release
+                .as_ref()
+                .map(|release| release.latest_version.clone())
+                .unwrap_or_else(|| "dev".to_owned()),
+        };
+        let (tx, rx) = mpsc::channel();
+        self.roblox_oauth_rx = Some(rx);
+        self.roblox_oauth_state = None;
+        self.roblox_oauth_url = None;
+        self.roblox_oauth_expires_at = None;
+        self.roblox_username = None;
+        self.roblox_user_id.clear();
+        self.activation = None;
+        self.activation_error = None;
+        self.log(phase::blue(), "Starting Roblox browser verification.");
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::start_roblox_oauth(&plan, &request);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn begin_roblox_oauth_status_check(&mut self, ctx: &Context) {
+        if self.roblox_oauth_status_rx.is_some() || self.activation.is_some() {
+            return;
+        }
+
+        let Some(state) = self.roblox_oauth_state.clone() else {
+            return;
+        };
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let current_install_id = install_id();
+        let (tx, rx) = mpsc::channel();
+        self.roblox_oauth_status_rx = Some(rx);
+        self.last_roblox_oauth_poll = Some(Instant::now());
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                verification::fetch_roblox_oauth_status(&plan, &state, &current_install_id);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_roblox_oauth(&mut self, ctx: &Context) {
+        if let Some(result) = self
+            .roblox_oauth_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.roblox_oauth_rx = None;
+            match result {
+                Ok(session) => {
+                    self.roblox_oauth_state = Some(session.state.clone());
+                    self.roblox_oauth_url = Some(session.url.clone());
+                    self.roblox_oauth_expires_at = Some(session.expires_at);
+                    self.log(phase::green(), "Roblox verification link ready.");
+                    if let Err(error) = open::that(&session.url) {
+                        self.log(phase::warning(), format!("Open browser failed: {error}"));
+                    }
+                    self.begin_roblox_oauth_status_check(ctx);
+                }
+                Err(error) => {
+                    self.activation_error = Some(error.clone());
+                    self.log(phase::red(), error);
+                }
+            }
+            ctx.request_repaint();
+        }
+
+        if self.roblox_oauth_state.is_some()
+            && self.activation.is_none()
+            && self.roblox_oauth_status_rx.is_none()
+            && self
+                .last_roblox_oauth_poll
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
+        {
+            self.begin_roblox_oauth_status_check(ctx);
+        }
+
+        let Some(result) = self
+            .roblox_oauth_status_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.roblox_oauth_status_rx = None;
+        match result {
+            Ok(status) if status.status == "verified" => {
+                let user_id_text = status.roblox_user_id.clone().unwrap_or_default();
+                let Ok(user_id) = user_id_text.parse::<u64>() else {
+                    self.activation_error =
+                        Some("Roblox OAuth returned an invalid user ID.".to_owned());
+                    self.log(phase::red(), "Roblox OAuth returned an invalid user ID.");
+                    ctx.request_repaint();
+                    return;
+                };
+
+                self.roblox_user_id = user_id_text;
+                self.roblox_username = status.roblox_username.clone();
+                self.activation_error = None;
+                self.activation = Some(verification::ActivationResponse {
+                    ok: true,
+                    active: true,
+                    activation_mode: status
+                        .activation_mode
+                        .unwrap_or_else(|| "robloxPurchase".to_owned()),
+                    product: "Phase Animator".to_owned(),
+                    user_id,
+                    install_id: status.install_id.unwrap_or_else(install_id),
+                    asset_id: status
+                        .asset_id
+                        .as_deref()
+                        .and_then(|asset_id| asset_id.parse::<u64>().ok()),
+                    token: status.token.unwrap_or_default(),
+                    expires_at: 0,
+                    licensee: status
+                        .licensee
+                        .unwrap_or_else(|| format!("Roblox account {user_id}")),
+                    message: status
+                        .message
+                        .unwrap_or_else(|| "Roblox OAuth purchase verified.".to_owned()),
+                });
+                let name = self
+                    .roblox_username
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or(&self.roblox_user_id);
+                self.log(phase::green(), format!("Roblox verified: {name}."));
+                self.save_account_cache();
+            }
+            Ok(status) if status.status == "denied" => {
+                let message = status
+                    .message
+                    .unwrap_or_else(|| "Roblox verification was denied.".to_owned());
+                self.activation = None;
+                self.activation_error = Some(message.clone());
+                self.log(phase::red(), message);
+            }
+            Ok(status) => {
+                self.roblox_oauth_expires_at = status.expires_at;
+            }
+            Err(error) => {
+                self.activation_error = Some(error.clone());
+                self.log(phase::warning(), error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_activation(&mut self, ctx: &Context) {
+        if self.activation_rx.is_some() {
+            return;
+        }
+
+        let Ok(user_id) = self.roblox_user_id.trim().parse::<u64>() else {
+            self.activation_error = Some("Verify Roblox in browser first.".to_owned());
+            self.log(phase::red(), "Verify Roblox in browser first.");
+            return;
+        };
+
+        let license_key = self.license_key.trim().to_owned();
+        if license_key.is_empty() {
+            self.activation_error = Some("Enter a Phase license key.".to_owned());
+            self.log(phase::red(), "Enter a Phase license key.");
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let request = verification::ActivationRequest {
+            activation_mode: "licenseKey".to_owned(),
+            license_key: Some(license_key),
+            user_id,
+            install_id: install_id(),
+            asset_id: None,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.activation_rx = Some(rx);
+        self.activation = None;
+        self.activation_error = None;
+        self.log(
+            phase::blue(),
+            "Activating license key for verified Roblox account.",
+        );
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::activate_install(&plan, &request);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_activation(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .activation_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.activation_rx = None;
+        match result {
+            Ok(activation) => {
+                self.log(phase::green(), activation.message.clone());
+                self.activation_error = None;
+                self.activation = Some(activation);
+                self.save_account_cache();
+            }
+            Err(error) => {
+                self.activation = None;
+                self.activation_error = Some(error.clone());
+                self.log(phase::red(), error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn poll_install(&mut self, ctx: &Context) {
+        let Some(rx) = self.install_rx.as_ref() else {
+            return;
+        };
+        let events: Vec<InstallEvent> = rx.try_iter().collect();
+        if events.is_empty() {
+            return;
+        }
+
+        let mut finished = false;
+        for event in events {
+            match event {
+                InstallEvent::Progress {
+                    phase,
+                    color,
+                    message,
+                    progress,
+                } => {
+                    self.phase = phase;
+                    self.phase_started_at = Some(Instant::now());
+                    self.progress = progress;
+                    self.log(color, message);
+                }
+                InstallEvent::Finished(result) => {
+                    finished = true;
+                    self.phase_started_at = None;
+                    match result {
+                        Ok(outcome) => {
+                            self.stable_updates_paused =
+                                outcome.receipt.channel == ReleaseChannel::EarlyAccess;
+                            self.installed_release = Some(outcome.receipt);
+                            self.save_account_cache();
+                            self.phase = InstallPhase::Complete;
+                            self.progress = 1.0;
+                            self.log(
+                                phase::green(),
+                                format!("Installed Phase Animator {}.", outcome.version),
+                            );
+                            if let Some(backup) = outcome.backup_path {
+                                self.log(
+                                    phase::blue(),
+                                    format!("Backup saved: {}", compact_path(&backup, 34)),
+                                );
+                            }
+                            self.log(
+                                phase::green(),
+                                format!("Installed at {}", compact_path(&outcome.target_path, 34)),
+                            );
+                            self.refresh_detection();
+                            self.begin_version_check(Some(ctx.clone()));
+                        }
+                        Err(error) => {
+                            self.phase = InstallPhase::Error;
+                            self.progress = 0.0;
+                            self.release_error = Some(error.clone());
+                            self.log(phase::red(), error);
+                        }
+                    }
+                }
+            }
+        }
+
+        if finished {
+            self.install_rx = None;
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_phase_disconnect(&mut self, ctx: &Context) {
+        if self.phase_disconnect_rx.is_some() {
+            return;
+        }
+
+        let Some(plugin_token) = self.plugin_token.clone() else {
+            self.clear_phase_account(true);
+            return;
+        };
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.phase_disconnect_rx = Some(rx);
+        self.log(phase::blue(), "Disconnecting Phase account.");
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::disconnect_plugin_me(&plan, &plugin_token);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_phase_disconnect(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .phase_disconnect_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.phase_disconnect_rx = None;
+        match result {
+            Ok(()) => {
+                self.clear_phase_account(true);
+                self.log(phase::green(), "Phase account disconnected.");
+            }
+            Err(error) => {
+                self.clear_phase_account(true);
+                self.log(phase::warning(), error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn begin_app_update_check(&mut self, ctx: &Context) {
+        if self.app_update_rx.is_some() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.app_update_rx = Some(rx);
+        self.app_update_error = None;
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::fetch_latest_app_update(env!("CARGO_PKG_VERSION"));
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_app_update_check(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .app_update_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.app_update_rx = None;
+        match result {
+            Ok(Some(update)) => {
+                self.log(
+                    phase::blue(),
+                    format!("Installer update {} is available.", update.version),
+                );
+                self.push_notification(
+                    ctx,
+                    "Phase Companion",
+                    format!("Installer update {} is available", update.version),
+                    NotificationTone::Info,
+                );
+                self.app_update = Some(update);
+                self.app_update_error = None;
+            }
+            Ok(None) => {
+                self.app_update_error = None;
+            }
+            Err(error) => {
+                self.app_update_error = Some(error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_app_update_install(&mut self, ctx: &Context) {
+        if self.app_update_install_rx.is_some() {
+            return;
+        }
+
+        let Some(update) = self.app_update.clone() else {
+            self.begin_app_update_check(ctx);
+            return;
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.app_update_install_rx = Some(rx);
+        self.log(
+            phase::blue(),
+            format!("Downloading installer {}.", update.version),
+        );
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = download_and_launch_app_update(update);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_app_update_install(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .app_update_install_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.app_update_install_rx = None;
+        match result {
+            Ok(path) => {
+                self.log(
+                    phase::green(),
+                    format!("Installer launched: {}", compact_path(&path, 34)),
+                );
+            }
+            Err(error) => {
+                self.app_update_error = Some(error.clone());
+                self.log(phase::red(), error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn begin_studio_patch_action(&mut self, action: studio_patch::PatchAction, ctx: &Context) {
+        if self.studio_patch_rx.is_some() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.studio_patch_rx = Some(rx);
+        self.studio_patch_action = Some(action);
+        self.studio_patch_message = None;
+        if action == studio_patch::PatchAction::Inspect {
+            self.studio_patch_status = studio_patch::PatchStatus::checking();
+        }
+
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = studio_patch::run(action);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_studio_patch(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .studio_patch_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.studio_patch_rx = None;
+        let action = self
+            .studio_patch_action
+            .take()
+            .unwrap_or(studio_patch::PatchAction::Inspect);
+        match result {
+            Ok(outcome) => {
+                self.studio_patch_status = outcome.status;
+                if action != studio_patch::PatchAction::Inspect {
+                    self.log(
+                        if outcome.changed {
+                            phase::green()
+                        } else {
+                            phase::blue()
+                        },
+                        outcome.message.clone(),
+                    );
+                    self.push_notification(
+                        ctx,
+                        "Studio shortcuts",
+                        &outcome.message,
+                        if outcome.changed {
+                            NotificationTone::Success
+                        } else {
+                            NotificationTone::Info
+                        },
+                    );
+                    self.studio_patch_message = Some(outcome.message);
+                }
+            }
+            Err(error) => {
+                self.log(phase::red(), error.clone());
+                self.push_notification(ctx, "Studio shortcuts", &error, NotificationTone::Info);
+                self.studio_patch_message = Some(error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn begin_theme_fetch(&mut self, ctx: &Context) {
+        if self.theme_fetch_rx.is_some() {
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.theme_fetch_rx = Some(rx);
+        self.theme_error = None;
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::fetch_phase_themes(&plan);
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_theme_fetch(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .theme_fetch_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.theme_fetch_rx = None;
+        match result {
+            Ok(themes) => {
+                self.theme_assets = themes;
+                self.visible_theme_count = self.visible_theme_count.max(6);
+                self.theme_error = None;
+            }
+            Err(error) => {
+                self.theme_error = Some(error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_theme_apply(&mut self, ctx: &Context, asset: verification::PhaseThemeAsset) {
+        if self.theme_apply_rx.is_some() {
+            return;
+        }
+
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.theme_apply_rx = Some(rx);
+        self.theme_applying_asset_id = Some(asset.id.clone());
+        self.theme_error = None;
+        self.log(phase::blue(), format!("Applying {} theme.", asset.title));
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = verification::install_phase_theme(&plan, &asset.id).and_then(|response| {
+                let theme_code = response.theme_code.trim().to_owned();
+                if theme_code.is_empty() {
+                    return Err("Theme did not include a Phase theme code.".to_owned());
+                }
+                Ok(ThemeSelection {
+                    asset_id: response.asset.id,
+                    title: response.asset.title,
+                    background_image_id: parse_theme_background_image_id(&theme_code),
+                    theme_code,
+                })
+            });
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_theme_apply(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .theme_apply_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+
+        self.theme_apply_rx = None;
+        match result {
+            Ok(selection) => {
+                if let Some(palette) = phase::palette_from_theme_code(&selection.theme_code) {
+                    self.theme_transition = Some(ThemeTransition {
+                        from: phase::snapshot(),
+                        to: palette,
+                        started_at: Instant::now(),
+                        title: selection.title.clone(),
+                    });
+                    self.theme_outgoing_background = self.theme_background.take();
+                    self.theme_background_key = None;
+                    self.theme_background_fade_started = None;
+                    self.selected_theme = Some(selection.clone());
+                    self.save_account_cache();
+                } else {
+                    self.theme_applying_asset_id = None;
+                    self.theme_error = Some("Theme code did not include enough colors.".to_owned());
+                }
+            }
+            Err(error) => {
+                self.theme_applying_asset_id = None;
+                self.theme_error = Some(error.clone());
+                self.log(phase::red(), error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn tick_theme_transition(&mut self, ctx: &Context) {
+        if let Some(transition) = self.theme_transition.clone() {
+            let linear = (transition.started_at.elapsed().as_secs_f32()
+                / THEME_PALETTE_TRANSITION_SECS)
+                .clamp(0.0, 1.0);
+            let blend = linear * linear * (3.0 - 2.0 * linear);
+            phase::set_palette(phase::blend(transition.from, transition.to, blend));
+            configure_style(ctx);
+            // Continuous repaint is paced by eframe's vsync, so 120/144/240 Hz
+            // displays receive native-refresh animation instead of a 60 FPS cap.
+            ctx.request_repaint();
+
+            if linear >= 1.0 {
+                phase::set_palette(transition.to);
+                configure_style(ctx);
+                self.theme_transition = None;
+                self.theme_applying_asset_id = None;
+                self.log(
+                    phase::green(),
+                    format!("Theme applied: {}", transition.title),
+                );
+            }
+        }
+
+        if let Some(started) = self.theme_background_fade_started {
+            ctx.request_repaint();
+            if started.elapsed().as_secs_f32() >= THEME_BACKGROUND_TRANSITION_SECS {
+                self.theme_outgoing_background = None;
+                self.theme_background_fade_started = None;
+            }
+        }
+    }
+
+    fn reset_theme(&mut self, ctx: &Context) {
+        phase::reset_palette();
+        configure_style(ctx);
+        self.selected_theme = None;
+        self.theme_background = None;
+        self.theme_outgoing_background = None;
+        self.theme_background_key = None;
+        self.theme_background_fade_started = None;
+        self.theme_transition = None;
+        self.theme_applying_asset_id = None;
+        self.save_account_cache();
+        self.log(phase::green(), "Restored default Phase theme.");
+    }
+
+    fn reset_phase_plugin_data(&mut self) {
+        let categories = self.selected_plugin_settings_categories();
+        if categories.is_empty() {
+            self.plugin_data_reset_status =
+                Some("Choose at least one settings category.".to_owned());
+            return;
+        }
+
+        match reset_phase_plugin_settings(&categories) {
+            Ok(summary) => {
+                self.plugin_data_reset_confirm = false;
+                let message = if summary.removed_keys == 0 {
+                    "No matching Phase Animator plugin settings were found.".to_owned()
+                } else {
+                    format!(
+                        "Backed up and deleted {} Phase setting{} across {} Roblox settings file{}.",
+                        summary.removed_keys,
+                        plural(summary.removed_keys),
+                        summary.files_changed,
+                        plural(summary.files_changed)
+                    )
+                };
+                self.plugin_data_reset_status = Some(message.clone());
+                self.log(phase::green(), message);
+                self.plugin_settings_inventory = phase_plugin_settings_inventory();
+            }
+            Err(error) => {
+                self.plugin_data_reset_status = Some(error.clone());
+                self.log(phase::red(), error);
+            }
+        }
+    }
+
+    fn selected_plugin_settings_categories(&self) -> Vec<PluginSettingsCategory> {
+        let mut categories = Vec::new();
+        if self.plugin_settings_reset_themes {
+            categories.push(PluginSettingsCategory::Themes);
+        }
+        if self.plugin_settings_reset_keybinds {
+            categories.push(PluginSettingsCategory::Keybinds);
+        }
+        categories
+    }
+
+    fn disconnect_roblox_account(&mut self) {
+        self.roblox_user_id.clear();
+        self.roblox_username = None;
+        self.roblox_oauth_state = None;
+        self.roblox_oauth_url = None;
+        self.roblox_oauth_expires_at = None;
+        self.roblox_avatar = None;
+        self.roblox_avatar_key = None;
+        self.activation = None;
+        self.activation_error = None;
+        self.save_account_cache();
+        self.log(phase::green(), "Roblox account disconnected locally.");
+    }
+
+    fn clear_phase_account(&mut self, save: bool) {
+        self.build_access = None;
+        self.linked_user = None;
+        self.plugin_token = None;
+        self.link_code = None;
+        self.link_url = None;
+        self.link_expires_at = None;
+        self.phase_avatar = None;
+        self.phase_avatar_key = None;
+        if save {
+            self.save_account_cache();
+        }
+    }
+
+    fn load_cached_accounts(&mut self, ctx: &Context) {
+        let Some(cache) = load_account_cache() else {
+            return;
+        };
+        self.plugin_token = cache.plugin_token;
+        self.linked_user = cache.linked_user;
+        self.roblox_user_id = cache.roblox_user_id;
+        self.roblox_username = cache.roblox_username;
+        self.activation = cache.activation;
+        self.selected_theme = cache.selected_theme;
+        self.theme_background_mode = cache.theme_background_mode;
+        self.stable_updates_paused = cache.stable_updates_paused;
+        self.installed_release = cache.installed_release;
+        if let Some(selection) = &self.selected_theme
+            && let Some(palette) = phase::palette_from_theme_code(&selection.theme_code)
+        {
+            phase::set_palette(palette);
+            configure_style(ctx);
+        }
+        if self.plugin_token.is_some() || !self.roblox_user_id.trim().is_empty() {
+            self.log(phase::blue(), "Restored saved account connection.");
+        }
+    }
+
+    fn save_account_cache(&self) {
+        // Captures may simulate account state; never persist a visual fixture.
+        if self.screenshot_path.is_some() {
+            return;
+        }
+        let cache = AccountCache {
+            plugin_token: self.plugin_token.clone(),
+            linked_user: self.linked_user.clone(),
+            roblox_user_id: self.roblox_user_id.clone(),
+            roblox_username: self.roblox_username.clone(),
+            activation: self.activation.clone(),
+            selected_theme: self.selected_theme.clone(),
+            theme_background_mode: self.theme_background_mode,
+            stable_updates_paused: self.stable_updates_paused,
+            installed_release: self.installed_release.clone(),
+        };
+        save_account_cache(&cache);
+    }
+
+    fn ensure_avatar_fetches(&mut self, ctx: &Context) {
+        if let Some(url) = self
+            .linked_user
+            .as_ref()
+            .and_then(|user| user.avatar_url.as_deref())
+            .filter(|url| !url.trim().is_empty())
+            && self.phase_avatar_key.as_deref() != Some(url)
+        {
+            let key = url.to_owned();
+            self.phase_avatar_key = Some(key.clone());
+            self.phase_avatar = None;
+            spawn_avatar_fetch(
+                self.avatar_tx.clone(),
+                AvatarKind::Phase,
+                key.clone(),
+                ctx.clone(),
+                move || verification::fetch_phase_avatar_image(&key),
+            );
+        }
+
+        let roblox_user_id = self.roblox_user_id.trim();
+        if !roblox_user_id.is_empty() && self.roblox_avatar_key.as_deref() != Some(roblox_user_id) {
+            let key = roblox_user_id.to_owned();
+            self.roblox_avatar_key = Some(key.clone());
+            self.roblox_avatar = None;
+            spawn_avatar_fetch(
+                self.avatar_tx.clone(),
+                AvatarKind::Roblox,
+                key.clone(),
+                ctx.clone(),
+                move || verification::fetch_roblox_avatar_full_body_image(&key),
+            );
+        }
+    }
+
+    fn poll_avatar_fetches(&mut self, ctx: &Context) {
+        while let Ok(result) = self.avatar_rx.try_recv() {
+            let result_is_current = match result.kind {
+                AvatarKind::Phase => self.phase_avatar_key.as_deref() == Some(result.key.as_str()),
+                AvatarKind::Roblox => {
+                    self.roblox_avatar_key.as_deref() == Some(result.key.as_str())
+                }
+            };
+            if !result_is_current {
+                continue;
+            }
+            if matches!(result.kind, AvatarKind::Roblox)
+                && let Some(username) = result
+                    .roblox_username
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|username| !username.is_empty())
+                && self.roblox_username.as_deref() != Some(username)
+            {
+                self.roblox_username = Some(username.to_owned());
+                self.save_account_cache();
+            }
+            let Ok(image) = result.image else {
+                continue;
+            };
+            let texture = ctx.load_texture(
+                format!(
+                    "identity-avatar-{}-{}",
+                    match result.kind {
+                        AvatarKind::Phase => "phase",
+                        AvatarKind::Roblox => "roblox",
+                    },
+                    result.key
+                ),
+                image,
+                TextureOptions::LINEAR,
+            );
+            match result.kind {
+                AvatarKind::Phase => self.phase_avatar = Some(texture),
+                AvatarKind::Roblox => self.roblox_avatar = Some(texture),
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn ensure_theme_background_fetch(&mut self, ctx: &Context) {
+        let Some(image_id) = self
+            .selected_theme
+            .as_ref()
+            .and_then(|theme| theme.background_image_id.as_deref())
+            .filter(|id| !id.trim().is_empty())
+        else {
+            return;
+        };
+
+        if self.theme_background_key.as_deref() == Some(image_id) {
+            return;
+        }
+
+        let key = image_id.to_owned();
+        self.theme_background_key = Some(key.clone());
+        self.theme_background = None;
+        spawn_theme_background_fetch(
+            self.theme_background_tx.clone(),
+            key.clone(),
+            ctx.clone(),
+            move || verification::fetch_roblox_asset_thumbnail_image(&key),
+        );
+    }
+
+    fn poll_theme_background_fetches(&mut self, ctx: &Context) {
+        while let Ok(result) = self.theme_background_rx.try_recv() {
+            // A fetch from a previously selected theme can finish after the
+            // user has switched or restored the default. Never let that stale
+            // texture replace the active theme's background.
+            if self.theme_background_key.as_deref() != Some(result.key.as_str()) {
+                continue;
+            }
+            let image = match result.image {
+                Ok(image) => image,
+                Err(error) => {
+                    self.log(phase::warning(), error);
+                    continue;
+                }
+            };
+            self.theme_art_tint = Some(average_color(&image));
+            self.theme_background = Some(ctx.load_texture(
+                format!("theme-background-{}", result.key),
+                image,
+                TextureOptions::LINEAR,
+            ));
+            self.theme_background_fade_started = Some(Instant::now());
+            ctx.request_repaint();
+        }
+    }
+
+    fn ensure_theme_preview_fetch(&mut self, ctx: &Context, asset: &verification::PhaseThemeAsset) {
+        let background_image = asset.theme_preview.background_image.trim();
+        let preview_url = asset.theme_preview_image_url.trim().to_owned();
+        if (background_image.is_empty() && preview_url.is_empty())
+            || self.theme_preview_textures.contains_key(&asset.id)
+            || self.theme_preview_loading.contains(&asset.id)
+        {
+            return;
+        }
+
+        let asset_id = asset.id.clone();
+        let key = background_image.to_owned();
+        self.theme_preview_loading.insert(asset_id.clone());
+        spawn_theme_preview_fetch(
+            self.theme_preview_tx.clone(),
+            asset_id,
+            key.clone(),
+            ctx.clone(),
+            move || {
+                if !preview_url.is_empty() {
+                    verification::fetch_phase_avatar_image(&preview_url).or_else(|error| {
+                        if key.is_empty() {
+                            Err(error)
+                        } else {
+                            verification::fetch_roblox_asset_thumbnail_image(&key)
+                        }
+                    })
+                } else {
+                    verification::fetch_roblox_asset_thumbnail_image(&key)
+                }
+            },
+        );
+    }
+
+    fn poll_theme_preview_fetches(&mut self, ctx: &Context) {
+        while let Ok(result) = self.theme_preview_rx.try_recv() {
+            let Ok(image) = result.image else {
+                continue;
+            };
+            self.theme_preview_loading.remove(&result.asset_id);
+            let texture = ctx.load_texture(
+                format!("theme-preview-{}-{}", result.asset_id, result.key),
+                image,
+                TextureOptions::LINEAR,
+            );
+            self.theme_preview_textures.insert(result.asset_id, texture);
+            ctx.request_repaint();
+        }
+    }
+
+    fn refresh_detection(&mut self) {
+        let previous = self.selected_folder.clone();
+        self.candidates = detect_plugin_folders();
+        self.selected_folder = previous
+            .filter(|path| path.exists())
+            .or_else(|| best_candidate(&self.candidates).map(|candidate| candidate.path));
+        self.refresh_local_release_status();
+        self.log(phase::blue(), "Install locations refreshed.");
+    }
+
+    fn choose_folder(&mut self) {
+        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            let candidate = inspect_candidate(folder.clone(), "Manual selection".to_owned());
+            self.selected_folder = Some(folder.clone());
+            if !self
+                .candidates
+                .iter()
+                .any(|existing| normalize_path(&existing.path) == normalize_path(&folder))
+            {
+                self.candidates.insert(0, candidate);
+            }
+            self.refresh_local_release_status();
+            self.log(
+                phase::green(),
+                format!("Selected {}", compact_path(&folder, 30)),
+            );
+        }
+    }
+
+    fn open_folder(&mut self) {
+        let Some(path) = self.selected_folder.clone() else {
+            self.log(phase::warning(), "No install location selected.");
+            return;
+        };
+
+        match open::that(&path) {
+            Ok(_) => self.log(phase::blue(), "Opened install location."),
+            Err(error) => self.log(phase::red(), format!("Could not open folder: {error}")),
+        }
+    }
+
+    fn poll_video_bridge(&mut self, ctx: &Context) {
+        for event in self.video_bridge.poll() {
+            match event {
+                video_reference::BridgeEvent::Listening { url } => {
+                    self.video_bridge_listening = true;
+                    self.video_bridge_status = format!("Listening on {url}");
+                    self.log(phase::green(), "Video reference bridge is listening.");
+                }
+                video_reference::BridgeEvent::ClientConnected => {
+                    self.video_bridge_connected = true;
+                    self.video_bridge_status = "Studio connected to video bridge.".to_owned();
+                    self.log(phase::green(), "Studio connected to video bridge.");
+                }
+                video_reference::BridgeEvent::ClientDisconnected => {
+                    self.video_bridge_connected = false;
+                    self.video_bridge_status = "Studio disconnected from video bridge.".to_owned();
+                    self.video_playing = false;
+                    self.video_play_last_tick = None;
+                    self.log(phase::warning(), "Studio disconnected from video bridge.");
+                }
+                video_reference::BridgeEvent::PacketReceived(packet) => {
+                    self.handle_video_packet(packet);
+                }
+                video_reference::BridgeEvent::PacketSent { op } => {
+                    self.video_bridge_status = format!("Sent {op} to Studio.");
+                }
+                video_reference::BridgeEvent::SendFailed { op, message } => {
+                    self.video_bridge_status = format!("{op} failed: {message}");
+                    self.log(phase::warning(), self.video_bridge_status.clone());
+                }
+                video_reference::BridgeEvent::Error(error) => {
+                    self.video_bridge_status = error.clone();
+                    self.log(phase::red(), error);
+                }
+                video_reference::BridgeEvent::Stopped => {
+                    self.video_bridge_listening = false;
+                    self.video_bridge_connected = false;
+                    self.video_bridge_status = "Video bridge stopped.".to_owned();
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn handle_video_packet(&mut self, packet: video_reference::VideoPacket) {
+        let payload = video_reference::packet_payload(&packet);
+        match packet.op.as_str() {
+            "hello" => {
+                self.video_last_plugin_state = "Studio hello received.".to_owned();
+            }
+            "ping" => {
+                self.video_bridge_status = "Ping received from Studio.".to_owned();
+            }
+            "ack" | "hello.ok" => {
+                self.video_last_reference_status = payload
+                    .get("video_reference")
+                    .and_then(reference_summary)
+                    .unwrap_or_else(|| "Studio acknowledged video bridge packet.".to_owned());
+                self.video_bridge_status = "Studio acknowledged video bridge packet.".to_owned();
+            }
+            "error" => {
+                let message = payload
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Studio reported a video bridge error.");
+                self.video_bridge_status = message.to_owned();
+                self.log(phase::red(), message);
+            }
+            "reference.status" => {
+                self.video_last_reference_status = payload
+                    .get("video_reference")
+                    .or_else(|| payload.get("reference"))
+                    .and_then(reference_summary)
+                    .or_else(|| {
+                        payload
+                            .get("status")
+                            .or_else(|| payload.get("message"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "Studio reference state received.".to_owned());
+            }
+            "sync.enabled" => {
+                self.video_sync_enabled = payload
+                    .get("enabled")
+                    .or_else(|| payload.get("sync_enabled"))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(self.video_sync_enabled);
+                self.video_last_plugin_state = if self.video_sync_enabled {
+                    "Studio video sync enabled.".to_owned()
+                } else {
+                    "Studio video sync disabled.".to_owned()
+                };
+            }
+            "sync.timeline" | "sync.seek" | "sync.playback" => {
+                self.apply_video_timeline_payload(packet.op.as_str(), payload);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_video_timeline_payload(&mut self, op: &str, payload: &serde_json::Value) {
+        let seconds = payload
+            .get("seconds")
+            .or_else(|| payload.get("video_seconds"))
+            .or_else(|| payload.get("position_seconds"))
+            .and_then(|value| value.as_f64());
+        let frame = payload.get("frame").and_then(|value| value.as_i64());
+        let fps = payload.get("fps").and_then(|value| value.as_f64());
+        let playback_rate = payload
+            .get("playback_rate")
+            .or_else(|| payload.get("PlaybackRate"))
+            .or_else(|| payload.get("rate"))
+            .and_then(|value| value.as_f64());
+        let playing = payload.get("playing").and_then(|value| value.as_bool());
+        if let Some(sync_enabled) = payload
+            .get("sync_enabled")
+            .or_else(|| payload.get("enabled"))
+            .and_then(|value| value.as_bool())
+        {
+            self.video_sync_enabled = sync_enabled;
+        }
+        if op == "sync.playback"
+            && let Some(playing) = playing
+        {
+            self.video_playing = playing;
+            self.video_phase_driven_playback = playing;
+            self.video_play_last_tick = playing.then(Instant::now);
+        }
+        if let Some(seconds) = seconds {
+            self.video_position_seconds = seconds.max(0.0);
+            self.video_position_input = format_seconds(self.video_position_seconds);
+        }
+        if let Some(fps) = fps {
+            self.video_fps = format_seconds(fps.max(1.0));
+        }
+        if let Some(playback_rate) = playback_rate {
+            self.video_playback_rate = format_seconds(playback_rate.clamp(0.05, 8.0));
+        }
+        let frame_text = frame
+            .map(|frame| format!("frame {frame}"))
+            .unwrap_or_else(|| "frame unknown".to_owned());
+        let seconds_text = seconds
+            .map(|seconds| format!("{seconds:.3}s"))
+            .unwrap_or_else(|| "seconds unknown".to_owned());
+        self.video_last_plugin_state = format!("{op}: {frame_text}, {seconds_text}");
+    }
+
+    fn tick_video_playback(&mut self, ctx: &Context) {
+        if !self.video_playing {
+            self.video_play_last_tick = None;
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some(previous) = self.video_play_last_tick {
+            let rate = parse_f64_or(&self.video_playback_rate, 1.0).clamp(0.05, 8.0);
+            self.video_position_seconds += previous.elapsed().as_secs_f64() * rate;
+            self.video_position_input = format_seconds(self.video_position_seconds);
+        }
+        self.video_play_last_tick = Some(now);
+
+        let should_send = self
+            .video_last_sync_sent
+            .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(100));
+        if should_send {
+            if !self.video_phase_driven_playback {
+                self.send_video_timeline("sync.timeline");
+            }
+            self.video_last_sync_sent = Some(now);
+        }
+        ctx.request_repaint_after(Duration::from_millis(33));
+    }
+
+    fn restart_video_bridge(&mut self) {
+        self.video_bridge.stop();
+        std::thread::sleep(Duration::from_millis(80));
+        self.video_bridge =
+            video_reference::VideoReferenceBridge::start(self.video_bridge_config.clone());
+        self.video_bridge_listening = false;
+        self.video_bridge_connected = false;
+        self.video_bridge_status = "Restarting video bridge.".to_owned();
+        self.log(phase::blue(), "Restarting video reference bridge.");
+    }
+
+    fn pick_video_file(&mut self) -> bool {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Video", &["mp4", "mov", "m4v", "webm"])
+            .pick_file()
+        else {
+            return false;
+        };
+        self.video_source = path.to_string_lossy().to_string();
+        if self.video_title.trim().is_empty() {
+            self.video_title = video_reference::default_title_for(&self.video_source);
+        }
+        self.video_last_reference_status = "Local video selected.".to_owned();
+        true
+    }
+
+    fn video_reference_draft(&self) -> Result<video_reference::ReferenceDraft, String> {
+        let source = self.video_source.trim().to_owned();
+        if source.is_empty() {
+            return Err("Choose a YouTube URL or local MP4 first.".to_owned());
+        }
+
+        let title = self.video_title.trim();
+        Ok(video_reference::ReferenceDraft {
+            source_kind: video_reference::source_kind_for(&source),
+            source: source.clone(),
+            title: if title.is_empty() {
+                video_reference::default_title_for(&source)
+            } else {
+                title.to_owned()
+            },
+            duration_seconds: parse_f64_or(&self.video_duration_seconds, 0.0),
+            fps: parse_f64_or(&self.video_fps, 60.0),
+            start_frame: parse_i64_or(&self.video_start_frame, 0),
+            offset_seconds: parse_f64_or(&self.video_offset_seconds, 0.0),
+            playback_rate: parse_f64_or(&self.video_playback_rate, 1.0),
+        })
+    }
+
+    fn open_video_popup(&mut self) {
+        let draft = match self.video_reference_draft() {
+            Ok(draft) => draft,
+            Err(error) => {
+                self.video_bridge_status = error.clone();
+                self.log(phase::warning(), error);
+                return;
+            }
+        };
+        match video_reference::open_reference_popup(&draft) {
+            Ok(_) => {
+                self.video_bridge
+                    .send("reference.set", draft.payload(), None);
+                self.video_last_reference_status = format!("Opened popup: {}", draft.title);
+                self.video_bridge_status = "Video popup opened.".to_owned();
+            }
+            Err(error) => {
+                self.video_bridge_status = error.clone();
+                self.log(phase::red(), error);
+            }
+        }
+    }
+
+    fn clear_video_reference(&mut self) {
+        self.video_bridge.send("reference.clear", json!({}), None);
+        self.video_last_reference_status = "Clear request sent.".to_owned();
+    }
+
+    fn send_video_sync_enabled(&mut self) {
+        self.video_bridge.send(
+            "sync.enabled",
+            json!({
+                "enabled": self.video_sync_enabled,
+            }),
+            None,
+        );
+    }
+
+    fn send_video_ping(&mut self) {
+        self.video_bridge.send(
+            "ping",
+            json!({
+                "side": "phase-rust-companion",
+            }),
+            None,
+        );
+    }
+
+    fn send_video_timeline(&mut self, op: &str) {
+        self.video_seq = self.video_seq.saturating_add(1);
+        let fps = parse_f64_or(&self.video_fps, 60.0).max(1.0);
+        let start_frame = parse_i64_or(&self.video_start_frame, 0).max(0);
+        let offset = parse_f64_or(&self.video_offset_seconds, 0.0);
+        let playback_rate = parse_f64_or(&self.video_playback_rate, 1.0).clamp(0.05, 8.0);
+        let frame = start_frame + ((self.video_position_seconds - offset) * fps).round() as i64;
+        self.video_bridge.send(
+            op,
+            json!({
+                "seq": self.video_seq,
+                "frame": frame.max(0),
+                "seconds": self.video_position_seconds,
+                "fps": fps,
+                "playing": self.video_playing,
+                "playback_rate": playback_rate,
+            }),
+            None,
+        );
+    }
+
+    fn seek_video_sync(&mut self) {
+        self.video_phase_driven_playback = false;
+        self.video_position_seconds = parse_f64_or(&self.video_position_input, 0.0).max(0.0);
+        self.video_position_input = format_seconds(self.video_position_seconds);
+        self.send_video_timeline("sync.seek");
+    }
+
+    fn set_video_playing(&mut self, playing: bool) {
+        self.video_phase_driven_playback = false;
+        self.video_position_seconds =
+            parse_f64_or(&self.video_position_input, self.video_position_seconds).max(0.0);
+        self.video_position_input = format_seconds(self.video_position_seconds);
+        self.video_playing = playing;
+        self.video_play_last_tick = playing.then(Instant::now);
+        self.send_video_timeline("sync.playback");
+    }
+
+    fn selected_candidate(&self) -> Option<&PluginFolderCandidate> {
+        let selected = self.selected_folder.as_ref()?;
+        self.candidates
+            .iter()
+            .find(|candidate| normalize_path(&candidate.path) == normalize_path(selected))
+    }
+
+    fn log(&mut self, color: Color32, text: impl Into<String>) {
+        self.activity.push(ActivityLine {
+            color,
+            text: text.into(),
+        });
+        if self.activity.len() > 7 {
+            self.activity.remove(0);
+        }
+    }
+}
+
+fn run_install_worker(
+    tx: Sender<InstallEvent>,
+    folder: PathBuf,
+    plugin_files: Vec<PluginFile>,
+    release: verification::VersionResponse,
+    activation: verification::ActivationResponse,
+    license_key: String,
+    backup_before_install: bool,
+) {
+    let result = install_update(
+        &tx,
+        folder,
+        plugin_files,
+        release,
+        activation,
+        license_key,
+        backup_before_install,
+    );
+    let _ = tx.send(InstallEvent::Finished(result));
+}
+
+fn download_and_launch_app_update(update: verification::AppUpdateInfo) -> Result<PathBuf, String> {
+    let mut path = std::env::temp_dir();
+    let file_name = if update.asset_name.trim().is_empty() {
+        format!(
+            "PhaseAutoUpdater-{}.msi",
+            safe_file_fragment(&update.version)
+        )
+    } else {
+        safe_file_fragment(&update.asset_name)
+    };
+    path.push(file_name);
+    verification::download_url_to_file(&update.download_url, &path)?;
+
+    Command::new("msiexec")
+        .arg("/i")
+        .arg(&path)
+        .arg("/passive")
+        .spawn()
+        .map_err(|error| format!("Could not launch installer update: {error}"))?;
+
+    Ok(path)
+}
+
+fn install_update(
+    tx: &Sender<InstallEvent>,
+    folder: PathBuf,
+    plugin_files: Vec<PluginFile>,
+    release: verification::VersionResponse,
+    activation: verification::ActivationResponse,
+    license_key: String,
+    backup_before_install: bool,
+) -> Result<InstallOutcome, String> {
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| format!("Could not prepare install folder: {error}"))?;
+
+    // Never replace "the first .rbxm" unless it clearly looks like ours. A lot
+    // of creators keep multiple local plugins in this folder.
+    let target_path = choose_install_target(&folder, &plugin_files);
+    let temp_path = temporary_download_path(&folder);
+    let expected_from_version = release
+        .release
+        .as_ref()
+        .map(|info| info.sha256.trim().to_ascii_lowercase())
+        .filter(|hash| hash.len() == 64);
+
+    send_install_progress(
+        tx,
+        InstallPhase::Downloading,
+        phase::blue(),
+        "Refreshing install access.",
+        0.12,
+    );
+
+    let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+    let activation = refresh_activation_for_download(&plan, &activation, &license_key);
+    let request = verification::DownloadSessionRequest {
+        activation_mode: activation.activation_mode.clone(),
+        user_id: activation.user_id,
+        install_id: activation.install_id.clone(),
+        asset_id: (activation.activation_mode == "robloxPurchase")
+            .then_some(activation.asset_id)
+            .flatten(),
+        license_key: (activation.activation_mode == "licenseKey" && !license_key.is_empty())
+            .then_some(license_key),
+        token: activation.token.clone(),
+        build_id: CURRENT_BUILD_ID.to_owned(),
+        target_build_id: Some(release.latest_build_id.clone()),
+    };
+    let session = verification::create_download_session(&plan, &request)?;
+    if !session.ok {
+        return Err("Install was not authorized.".to_owned());
+    }
+    if session.build_id != release.latest_build_id {
+        return Err("The server returned a different build than the selected channel.".to_owned());
+    }
+    let channel = if release.access_channel == "early-access" {
+        ReleaseChannel::EarlyAccess
+    } else {
+        ReleaseChannel::Stable
+    };
+    if channel == ReleaseChannel::EarlyAccess
+        && (session.sha256.len() != 64 || !session.sha256.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err("The personal build is missing its verified file hash.".to_owned());
+    }
+
+    send_install_progress(
+        tx,
+        InstallPhase::Downloading,
+        phase::blue(),
+        "Downloading update package.",
+        0.36,
+    );
+    verification::download_plugin_to_file(&session.download_url, &temp_path)?;
+
+    let expected_hash = session
+        .sha256
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .collect::<String>();
+    let expected_hash = if expected_hash.len() == 64 {
+        expected_hash
+    } else {
+        expected_from_version.ok_or_else(|| "Update metadata is missing a file hash.".to_owned())?
+    };
+
+    let actual_hash = sha256_file(&temp_path)?;
+    if actual_hash != expected_hash {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err("Downloaded update could not be verified.".to_owned());
+    }
+
+    if session.size > 0 {
+        let actual_size = std::fs::metadata(&temp_path)
+            .map_err(|error| format!("Could not inspect update package: {error}"))?
+            .len();
+        if actual_size != session.size {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err("Downloaded update size did not match.".to_owned());
+        }
+    }
+
+    send_install_progress(
+        tx,
+        InstallPhase::Installing,
+        phase::green(),
+        "Update package verified.",
+        0.72,
+    );
+
+    let backup_path = if target_path.exists() && backup_before_install {
+        let backup_path = next_backup_path(&target_path);
+        std::fs::copy(&target_path, &backup_path)
+            .map_err(|error| format!("Could not create backup: {error}"))?;
+        send_install_progress(
+            tx,
+            InstallPhase::Installing,
+            phase::blue(),
+            "Created local backup.",
+            0.82,
+        );
+        Some(backup_path)
+    } else {
+        None
+    };
+
+    if target_path.exists() {
+        // Windows will not overwrite an existing file with rename(), so remove
+        // after the backup has been made and the new file has passed checks.
+        std::fs::remove_file(&target_path)
+            .map_err(|error| format!("Could not replace installed plugin: {error}"))?;
+    }
+    std::fs::rename(&temp_path, &target_path)
+        .map_err(|error| format!("Could not install update: {error}"))?;
+
+    send_install_progress(
+        tx,
+        InstallPhase::Installing,
+        phase::green(),
+        "Plugin files updated.",
+        0.94,
+    );
+
+    Ok(InstallOutcome {
+        receipt: InstalledRelease {
+            channel,
+            build_id: session.build_id,
+            sha256: actual_hash,
+            path: target_path.clone(),
+        },
+        target_path,
+        backup_path,
+        version: session.version,
+    })
+}
+
+fn refresh_activation_for_download(
+    plan: &verification::VerificationPlan,
+    activation: &verification::ActivationResponse,
+    license_key: &str,
+) -> verification::ActivationResponse {
+    let request = match activation.activation_mode.as_str() {
+        "robloxPurchase" | "earlyAccess" => Some(verification::ActivationRequest {
+            activation_mode: "robloxPurchase".to_owned(),
+            license_key: None,
+            user_id: activation.user_id,
+            install_id: install_id(),
+            asset_id: activation
+                .asset_id
+                .or(Some(verification::ROBLOX_PLUGIN_ASSET_ID)),
+        }),
+        "licenseKey" if !license_key.trim().is_empty() => Some(verification::ActivationRequest {
+            activation_mode: "licenseKey".to_owned(),
+            license_key: Some(license_key.trim().to_owned()),
+            user_id: activation.user_id,
+            install_id: install_id(),
+            asset_id: None,
+        }),
+        _ => None,
+    };
+
+    request
+        .as_ref()
+        .and_then(|request| verification::activate_install(plan, request).ok())
+        // The server may resolve an eligible Roblox owner to Early Access.
+        // Accept only the same identity and local install, preserving the
+        // returned mode/token pair rather than mixing two activation scopes.
+        .filter(|refreshed| {
+            refreshed.ok
+                && refreshed.active
+                && (refreshed.activation_mode == activation.activation_mode
+                    || matches!(
+                        (
+                            activation.activation_mode.as_str(),
+                            refreshed.activation_mode.as_str()
+                        ),
+                        ("robloxPurchase", "earlyAccess") | ("earlyAccess", "robloxPurchase")
+                    ))
+                && refreshed.user_id == activation.user_id
+                && refreshed.install_id == install_id()
+                && !refreshed.token.trim().is_empty()
+        })
+        .unwrap_or_else(|| activation.clone())
+}
+
+fn send_install_progress(
+    tx: &Sender<InstallEvent>,
+    phase: InstallPhase,
+    color: Color32,
+    message: impl Into<String>,
+    progress: f32,
+) {
+    let _ = tx.send(InstallEvent::Progress {
+        phase,
+        color,
+        message: message.into(),
+        progress,
+    });
+}
+
+fn choose_install_target(folder: &Path, plugin_files: &[PluginFile]) -> PathBuf {
+    let preferred = folder.join("PhaseAnimator.rbxm");
+    if preferred.exists() {
+        return preferred;
+    }
+
+    for plugin_file in plugin_files {
+        if plugin_file
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("PhaseAnimator.rbxm"))
+        {
+            return plugin_file.path.clone();
+        }
+    }
+
+    for plugin_file in plugin_files {
+        let name = plugin_file
+            .path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .replace([' ', '_', '-'], "")
+            .to_ascii_lowercase();
+        if name.contains("phaseanimator") {
+            return plugin_file.path.clone();
+        }
+    }
+
+    // New install or folder has unrelated plugins. Use our own filename.
+    preferred
+}
+
+fn temporary_download_path(folder: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    folder.join(format!(".phase-animator-{stamp}.download"))
+}
+
+fn next_backup_path(target_path: &Path) -> PathBuf {
+    let file_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("PhaseAnimator.rbxm");
+    let first = target_path.with_file_name(format!("{file_name}.bak"));
+    if !first.exists() {
+        return first;
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    target_path.with_file_name(format!("{file_name}.{stamp}.bak"))
+}
+
+fn safe_file_fragment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl TrayController {
+    fn new(tx: Sender<TraySignal>, ctx: Context) -> Result<Self, String> {
+        let icon = load_tray_icon().ok_or_else(|| "Could not load tray icon.".to_owned())?;
+        let icon = TrayIconBuilder::new()
+            .with_tooltip("Phase Companion")
+            .with_menu_on_left_click(false)
+            .with_menu_on_right_click(false)
+            .with_icon(icon)
+            .build()
+            .map_err(|error| format!("Could not create tray icon: {error}"))?;
+        log_tray_debug("tray icon created");
+
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            log_tray_debug(format!("event {event:?}"));
+            let signal = match event {
+                TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    button_state: MouseButtonState::Up,
+                    position,
+                    ..
+                } => {
+                    log_tray_debug("right up");
+                    Some(TraySignal::ShowPanel {
+                        x: position.x as f32,
+                        y: position.y as f32,
+                    })
+                }
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => {
+                    log_tray_debug("left up");
+                    reveal_window_for_tray_signal();
+                    Some(TraySignal::ShowWindow)
+                }
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    log_tray_debug("left double");
+                    reveal_window_for_tray_signal();
+                    Some(TraySignal::ShowWindow)
+                }
+                _ => None,
+            };
+            if let Some(signal) = signal {
+                let _ = tx.send(signal);
+                ctx.request_repaint();
+            }
+        }));
+
+        Ok(Self { _icon: icon })
+    }
+
+    fn hide(&self) {
+        let _ = self._icon.set_visible(false);
+        log_tray_debug("tray icon hidden");
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl TrayController {
+    fn set_icon(&self, icon: TrayIconImage) {
+        let _ = self._icon.set_icon(Some(icon));
+    }
+}
+
+impl Drop for TrayController {
+    fn drop(&mut self) {
+        self.hide();
+    }
+}
+
+impl eframe::App for PhaseInstallerApp {
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        apply_windows_title_bar(frame, self.hidden_to_tray && self.tray_panel_open);
+        self.remember_main_window_position(ctx);
+        self.persist_window_state(ctx);
+        self.handle_close_request(ctx);
+        self.tick_screenshot_harness(ctx);
+        self.tick(ctx);
+        self.refresh_brand_icons(ctx);
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none().fill(if self.hidden_to_tray || backdrop_active() {
+                    Color32::TRANSPARENT
+                } else {
+                    phase::background()
+                }),
+            )
+            .show(ctx, |ui| {
+                if self.hidden_to_tray {
+                    if self.tray_panel_open {
+                        self.tray_panel(ui);
+                    } else {
+                        ui.allocate_space(ui.available_size());
+                    }
+                    return;
+                }
+
+                self.render_companion_root(ui);
+            });
+        self.show_notification_viewport(ctx);
+        if !self.hidden_to_tray {
+            self.draw_close_dialog(ctx);
+            self.show_tray_popup_viewport(ctx);
+            self.show_diagnostics_viewport(ctx);
+        }
+
+        // Keep a low-frequency idle tick so async receivers are polled even if
+        // the user is not moving the mouse. High-frequency repainting is
+        // requested locally by active animations/progress/video playback.
+        let repaint_after = if self.hidden_to_tray && !self.tray_panel_open {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_millis(250)
+        };
+        ctx.request_repaint_after(repaint_after);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.video_bridge.stop();
+        self.cleanup_tray();
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+}
+
+impl PhaseInstallerApp {
+    fn push_notification(
+        &mut self,
+        ctx: &Context,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        tone: NotificationTone,
+    ) {
+        if self.notifications.is_empty() {
+            self.notification_window_styled = false;
+        }
+        if self.notifications.len() >= 3 {
+            self.notifications.pop_back();
+        }
+        self.notifications.push_back(PhaseNotification {
+            title: title.into(),
+            body: body.into(),
+            tone,
+            created_at: Instant::now(),
+            closing_started: None,
+        });
+        ctx.request_repaint();
+    }
+
+    fn show_notification_viewport(&mut self, ctx: &Context) {
+        let Some(front) = self.notifications.front_mut() else {
+            return;
+        };
+        if front.closing_started.is_none() && front.created_at.elapsed() >= TOAST_LIFETIME {
+            front.closing_started = Some(Instant::now());
+        }
+        if front
+            .closing_started
+            .is_some_and(|started| started.elapsed() >= Duration::from_millis(180))
+        {
+            self.notifications.pop_front();
+            if let Some(next) = self.notifications.front_mut() {
+                next.created_at = Instant::now();
+                next.closing_started = None;
+            } else {
+                self.notification_window_styled = false;
+                ctx.send_viewport_cmd_to(notification_viewport_id(), egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        let notification = self.notifications.front().cloned().unwrap();
+        let monitor = ctx
+            .input(|input| input.viewport().monitor_size)
+            .unwrap_or(Vec2::new(1920.0, 1080.0));
+        let position = Pos2::new(
+            (monitor.x - TOAST_WIDTH - 18.0).max(8.0),
+            (monitor.y - TOAST_HEIGHT - 54.0).max(8.0),
+        );
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Phase notification")
+            .with_position(position)
+            .with_inner_size(Vec2::new(TOAST_WIDTH, TOAST_HEIGHT))
+            .with_min_inner_size(Vec2::new(TOAST_WIDTH, TOAST_HEIGHT))
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(false)
+            .with_visible(true);
+
+        ctx.show_viewport_immediate(notification_viewport_id(), builder, |toast_ctx, _class| {
+            if !self.notification_window_styled {
+                self.notification_window_styled = apply_notification_window_style();
+            }
+            if toast_ctx.input(|input| input.viewport().close_requested()) {
+                toast_ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if let Some(front) = self.notifications.front_mut() {
+                    front.closing_started.get_or_insert_with(Instant::now);
+                }
+            }
+
+            let open = (notification.created_at.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0);
+            let open = ease_out_cubic(open);
+            let close = notification
+                .closing_started
+                .map(|started| (started.elapsed().as_secs_f32() / 0.18).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+            let visibility = open * (1.0 - ease_out_cubic(close));
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
+                .show(toast_ctx, |ui| {
+                    if phase_notification_panel(ui, &notification, self.logo.as_ref(), visibility)
+                        && let Some(front) = self.notifications.front_mut()
+                    {
+                        front.closing_started.get_or_insert_with(Instant::now);
+                    }
+                });
+            toast_ctx.request_repaint();
+        });
+    }
+
+    fn show_diagnostics_viewport(&mut self, ctx: &Context) {
+        if !self.diagnostics_open {
+            return;
+        }
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Phase Connection Diagnostics")
+            .with_inner_size(Vec2::new(520.0, 540.0))
+            .with_min_inner_size(Vec2::new(420.0, 420.0))
+            .with_transparent(false)
+            .with_resizable(true)
+            .with_taskbar(true)
+            .with_visible(true);
+
+        ctx.show_viewport_immediate(diagnostics_viewport_id(), builder, |diag_ctx, _class| {
+            if diag_ctx.input(|input| input.viewport().close_requested()) {
+                self.diagnostics_open = false;
+                return;
+            }
+
+            if diag_ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.diagnostics_open = false;
+                return;
+            }
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(phase::background()))
+                .show(diag_ctx, |ui| {
+                    self.diagnostics_panel(ui);
+                });
+        });
+    }
+
+    fn diagnostics_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(14.0);
+        ui.vertical_centered(|ui| {
+            let panel_width = (ui.available_width() - 28.0).clamp(280.0, 560.0);
+            ui.set_min_width(panel_width);
+            ui.set_max_width(panel_width);
+            let running = self.diagnostics_rx.is_some();
+            let fix_running = self.diagnostics_fix_rx.is_some();
+            let busy = running || fix_running;
+            let status = self
+                .diagnostics_fix_report
+                .as_ref()
+                .map(diagnostics::RepairReport::overall_status)
+                .or_else(|| {
+                    self.diagnostics_report
+                        .as_ref()
+                        .map(diagnostics::DiagnosticReport::overall_status)
+                });
+            let summary = if running {
+                self.diagnostics_started_at
+                    .map(|started| format!("Checking... {}s", started.elapsed().as_secs()))
+                    .unwrap_or_else(|| "Checking...".to_owned())
+            } else if fix_running {
+                self.diagnostics_fix_started_at
+                    .map(|started| {
+                        format!("Fix assistant running... {}s", started.elapsed().as_secs())
+                    })
+                    .unwrap_or_else(|| "Fix assistant running...".to_owned())
+            } else {
+                self.diagnostics_fix_report
+                    .as_ref()
+                    .map(|report| report.summary.clone())
+                    .or_else(|| {
+                        self.diagnostics_report
+                            .as_ref()
+                            .map(|report| report.summary.clone())
+                    })
+                    .unwrap_or_else(|| "Run a check to see what is blocking connection.".to_owned())
+            };
+            let status_label = if running {
+                "Checking"
+            } else if fix_running {
+                "Fixing"
+            } else {
+                status
+                    .map(diagnostics::DiagnosticStatus::label)
+                    .unwrap_or("Ready")
+            };
+            let summary_color = if running || fix_running {
+                phase::blue()
+            } else {
+                match status {
+                    Some(diagnostics::DiagnosticStatus::Good) => phase::green(),
+                    Some(diagnostics::DiagnosticStatus::Warning) => phase::warning(),
+                    Some(diagnostics::DiagnosticStatus::Problem) => phase::red(),
+                    None => phase::blue(),
+                }
+            };
+
+            card_header(
+                ui,
+                Icon::Search,
+                summary_color,
+                "Connection status",
+                &summary,
+                Some((status_label, summary_color)),
+            );
+
+            ui.add_space(10.0);
+            action_grid(ui, 4, |ui, index, size| match index {
+                0 => {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        let label = if running { "Checking" } else { "Run Check" };
+                        if primary_button(ui, Icon::Search, label, size).clicked() {
+                            self.start_connection_diagnostics(ui.ctx());
+                        }
+                    });
+                }
+                1 => {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if secondary_button(ui, Icon::Gear, "Fix Assist", size).clicked() {
+                            self.start_connection_fix(ui.ctx());
+                        }
+                    });
+                }
+                2 => {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if secondary_button(ui, Icon::Refresh, "Retry", size).clicked() {
+                            self.start_connection_diagnostics(ui.ctx());
+                        }
+                    });
+                }
+                _ => {
+                    ui.add_enabled_ui(
+                        self.diagnostics_report.is_some() || self.diagnostics_fix_report.is_some(),
+                        |ui| {
+                            if secondary_button(ui, Icon::External, "Copy Log", size).clicked() {
+                                if let Some(report) = &self.diagnostics_fix_report {
+                                    ui.output_mut(|output| {
+                                        output.copied_text = report.to_plain_text()
+                                    });
+                                    self.log(phase::blue(), "Copied fix assistant log.");
+                                } else if let Some(report) = &self.diagnostics_report {
+                                    ui.output_mut(|output| {
+                                        output.copied_text = report.to_plain_text()
+                                    });
+                                    self.log(phase::blue(), "Copied diagnostic report.");
+                                }
+                            }
+                        },
+                    );
+                }
+            });
+
+            ui.add_space(12.0);
+            let report_width = ui.available_width();
+            egui::ScrollArea::vertical()
+                .id_source("phase-diagnostics-report")
+                .max_height((ui.available_height() - 12.0).max(180.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_min_width(report_width);
+                    ui.set_max_width(report_width);
+                    if running && self.diagnostics_report.is_none() {
+                        diagnostics_waiting_card(ui);
+                    }
+                    if let Some(report) = &self.diagnostics_report {
+                        for check in &report.checks {
+                            diagnostics_check_card(ui, check);
+                            ui.add_space(8.0);
+                        }
+                    }
+                    let repair_steps = self
+                        .diagnostics_fix_report
+                        .as_ref()
+                        .map(|report| report.steps.as_slice())
+                        .unwrap_or(self.diagnostics_fix_steps.as_slice());
+                    if fix_running && repair_steps.is_empty() {
+                        diagnostics_fix_waiting_card(ui);
+                    }
+                    if !repair_steps.is_empty() {
+                        ui.add_space(8.0);
+                        section_label(ui, "Assisted Fix Log");
+                        ui.add_space(8.0);
+                        for step in repair_steps {
+                            diagnostics_repair_card(ui, step, fix_running);
+                            ui.add_space(8.0);
+                        }
+                    }
+                    if let Some(report) = &self.diagnostics_fix_report {
+                        ui.add_space(2.0);
+                        diagnostics_likely_cause_card(ui, report);
+                    }
+                });
+        });
+    }
+
+    fn show_tray_popup_viewport(&mut self, ctx: &Context) {
+        if !self.tray_panel_open {
+            return;
+        }
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Phase Companion Controls")
+            .with_position(self.tray_panel_pos)
+            .with_inner_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT))
+            .with_min_inner_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT))
+            .with_transparent(true)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(true)
+            .with_visible(true);
+
+        ctx.show_viewport_immediate(tray_viewport_id(), builder, |tray_ctx, _class| {
+            if tray_ctx.input(|input| input.viewport().close_requested()) {
+                tray_ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_tray_popup(tray_ctx);
+                return;
+            }
+
+            if tray_ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.close_tray_popup(tray_ctx);
+                return;
+            }
+
+            if !self.tray_panel_closing {
+                match tray_ctx.input(|input| input.viewport().focused) {
+                    Some(true) => self.tray_panel_had_focus = true,
+                    Some(false)
+                        if self.tray_panel_had_focus
+                            && self.tray_panel_opened_at.is_some_and(|opened| {
+                                opened.elapsed() > Duration::from_millis(250)
+                            }) =>
+                    {
+                        self.close_tray_popup(tray_ctx);
+                    }
+                    _ => {}
+                }
+            }
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(Color32::TRANSPARENT))
+                .show(tray_ctx, |ui| {
+                    self.tray_panel(ui);
+                });
+        });
+    }
+
+    fn tray_panel(&mut self, ui: &mut Ui) {
+        ui.set_min_size(Vec2::new(TRAY_PANEL_WIDTH, TRAY_PANEL_HEIGHT));
+
+        let raw_t = ui.ctx().animate_bool_with_time(
+            egui::Id::new(("phase-tray-pop", self.tray_anim_nonce)),
+            !self.tray_panel_closing,
+            TRAY_CLOSE_DURATION.as_secs_f32(),
+        );
+        let fade_t = ease_out_cubic(raw_t).clamp(0.0, 1.0);
+        if self.tray_panel_closing || fade_t < 0.999 {
+            ui.ctx().request_repaint();
+        }
+        ui.add_space((1.0 - fade_t) * 8.0);
+
+        ui.scope(|ui| {
+            ui.set_opacity(fade_t);
+            egui::Frame::none()
+                .fill(phase::background())
+                .stroke(Stroke::new(1.0, phase::line()))
+                .rounding(Rounding::same(10.0))
+                .outer_margin(Margin::same(1.0))
+                .inner_margin(Margin::same(12.0))
+                .show(ui, |ui| {
+                    let content_width = TRAY_PANEL_WIDTH - 26.0;
+                    ui.set_width(content_width);
+                    self.tray_panel_contents(ui, content_width);
+                });
+        });
+    }
+
+    fn tray_panel_contents(&mut self, ui: &mut Ui, content_width: f32) {
+        ui.vertical_centered(|ui| {
+            ui.set_width(content_width);
+            ui.horizontal(|ui| {
+                if let Some(logo) = &self.logo {
+                    let image = egui::Image::new(logo).fit_to_exact_size(Vec2::splat(34.0));
+                    ui.add(image);
+                }
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Phase Companion")
+                            .font(type_heading())
+                            .strong()
+                            .color(phase::text()),
+                    );
+                    ui.label(
+                        RichText::new("Background update controls")
+                            .font(FontId::proportional(11.5))
+                            .color(phase::text_secondary()),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if tray_close_button(ui).clicked() {
+                        self.close_tray_popup(ui.ctx());
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            compact_info_row(ui, "Status", phase_text(self.phase), content_width);
+            compact_info_row(ui, "Account", &self.account_summary(), content_width);
+            compact_info_row(ui, "Latest", &self.release_summary(), content_width);
+
+            ui.add_space(12.0);
+            let action_width = content_width;
+            if primary_button(
+                ui,
+                Icon::External,
+                "Open Window",
+                Vec2::new(action_width, 34.0),
+            )
+            .clicked()
+            {
+                self.show_main_window(ui.ctx());
+            }
+
+            ui.add_space(8.0);
+            action_grid(ui, 4, |ui, index, size| match index {
+                0 => {
+                    ui.add_enabled_ui(!self.is_busy(), |ui| {
+                        if secondary_button(ui, Icon::Refresh, "Check", size).clicked() {
+                            self.open_page(Page::Home);
+                            self.start_check();
+                        }
+                    });
+                }
+                1 => {
+                    ui.add_enabled_ui(self.phase == InstallPhase::Ready && !self.is_busy(), |ui| {
+                        if secondary_button(ui, Icon::Bolt, "Install", size).clicked() {
+                            self.open_page(Page::Home);
+                            self.start_install();
+                        }
+                    });
+                }
+                2 => {
+                    ui.add_enabled_ui(self.selected_folder.is_some(), |ui| {
+                        if secondary_button(ui, Icon::Folder, "Folder", size).clicked() {
+                            self.open_selected_folder();
+                        }
+                    });
+                }
+                _ => {
+                    if secondary_button(ui, Icon::External, "Quit", size).clicked() {
+                        self.request_quit(ui.ctx());
+                    }
+                }
+            });
+        });
+    }
+
+    fn handle_close_request(&mut self, ctx: &Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+
+        if self.allow_quit {
+            self.cleanup_tray();
+            return;
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.tray_panel_open {
+            self.close_tray_popup(ctx);
+        }
+        if !self.close_dialog_open {
+            self.dialog_anim_nonce = self.dialog_anim_nonce.wrapping_add(1);
+        }
+        self.close_dialog_open = true;
+    }
+
+    fn draw_close_dialog(&mut self, ctx: &Context) {
+        if !self.close_dialog_open {
+            return;
+        }
+
+        let raw_t = ctx.animate_bool_with_time(
+            egui::Id::new(("phase-close-dialog-pop", self.dialog_anim_nonce)),
+            true,
+            0.18,
+        );
+        let pop_t = ease_out_back(raw_t).clamp(0.0, 1.0);
+        let fade_t = ease_out_cubic(raw_t).clamp(0.0, 1.0);
+        let scale = 0.94 + 0.06 * pop_t;
+        let width = 378.0 * scale;
+        let title_color = color_with_alpha(phase::text(), fade_t);
+        let body_color = color_with_alpha(phase::text_secondary(), fade_t);
+
+        egui::Window::new("Keep Phase Companion running?")
+            .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, (1.0 - pop_t) * 12.0))
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(color_with_alpha(phase::surface(), fade_t))
+                    .stroke(Stroke::new(1.0, color_with_alpha(phase::line(), fade_t)))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(Margin::same(18.0 * scale)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                ui.label(
+                    RichText::new("Keep Phase Companion running?")
+                        .font(FontId::proportional(18.0))
+                        .strong()
+                        .color(title_color),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Minimize it to the tray to keep update checks and quick install actions available.")
+                        .font(FontId::proportional(13.0))
+                        .color(body_color),
+                );
+                if !self.tray_available() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Tray icon is not available in this build.")
+                            .font(FontId::proportional(12.5))
+                            .color(color_with_alpha(phase::warning(), fade_t)),
+                    );
+                }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if danger_button(ui, Icon::External, "Quit", Vec2::new(104.0, 36.0))
+                        .clicked()
+                    {
+                        self.request_quit(ctx);
+                    }
+                    if secondary_button(ui, Icon::Gear, "Cancel", Vec2::new(112.0, 36.0))
+                        .clicked()
+                    {
+                        self.close_dialog_open = false;
+                    }
+                    ui.add_enabled_ui(self.tray_available(), |ui| {
+                        if primary_button(
+                            ui,
+                            Icon::Download,
+                            "Minimize",
+                            Vec2::new(132.0, 36.0),
+                        )
+                        .clicked()
+                        {
+                            self.minimize_to_tray(ctx);
+                        }
+                    });
+                });
+            });
+    }
+
+    /// Screenshot harness: when `PHASE_UI_SCREENSHOT` is set, resize the
+    /// window, wait for animations to settle, save a PNG there and quit.
+    fn tick_screenshot_harness(&mut self, ctx: &Context) {
+        let Some(path) = self.screenshot_path.clone() else {
+            return;
+        };
+        self.screenshot_frames += 1;
+        match self.screenshot_frames {
+            2 => {
+                let width = std::env::var("PHASE_UI_WIDTH")
+                    .ok()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(APP_WIDTH);
+                let height = std::env::var("PHASE_UI_HEIGHT")
+                    .ok()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(APP_HEIGHT);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(width, height)));
+            }
+            frame if frame == capture_frame() => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot)
+            }
+            _ => {}
+        }
+
+        let captured = ctx.input(|input| {
+            input.raw.events.iter().find_map(|event| match event {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = captured {
+            save_screenshot_image(&path, &image);
+            self.allow_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        // Keep frames flowing so the frame budget elapses quickly even when the
+        // app would otherwise idle.
+        ctx.request_repaint();
+    }
+
+    fn paint_theme_background(&self, ui: &mut Ui) {
+        let rect = ui.max_rect();
+        let painter = ui.painter();
+
+        // Under Mica the canvas is translucent so the system material shows.
+        let has_art = self.theme_background.is_some() || self.theme_outgoing_background.is_some();
+        painter.rect_filled(
+            rect,
+            Rounding::ZERO,
+            if backdrop_active() && !has_art {
+                color_with_alpha(phase::background(), 0.62)
+            } else {
+                phase::background()
+            },
+        );
+
+        // Keep the outgoing image alive until the incoming texture is loaded,
+        // then crossfade them rather than flashing through an empty canvas.
+        let image_blend = self
+            .theme_background_fade_started
+            .map(|started| {
+                let t = (started.elapsed().as_secs_f32() / THEME_BACKGROUND_TRANSITION_SECS)
+                    .clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            })
+            .unwrap_or(if self.theme_background.is_some() {
+                1.0
+            } else {
+                0.0
+            });
+        if let Some(texture) = &self.theme_outgoing_background {
+            paint_theme_texture(painter, rect, texture, self.theme_background_mode, 1.0);
+        }
+        if let Some(texture) = &self.theme_background {
+            paint_theme_texture(
+                painter,
+                rect,
+                texture,
+                self.theme_background_mode,
+                image_blend,
+            );
+        }
+        if self.theme_background.is_some() || self.theme_outgoing_background.is_some() {
+            painter.rect_filled(
+                rect,
+                Rounding::ZERO,
+                color_with_alpha(phase::background(), 0.38),
+            );
+        }
+    }
+
+    fn has_theme_background_art(&self) -> bool {
+        self.theme_background.is_some() || self.theme_outgoing_background.is_some()
+    }
+
+    fn check_milestones(&mut self) {
+        let Some(started_at) = self.phase_started_at else {
+            return;
+        };
+        let elapsed = started_at.elapsed();
+
+        match self.phase {
+            InstallPhase::Checking => {
+                if elapsed >= Duration::from_millis(150) && self.milestone == 0 {
+                    self.log(phase::blue(), "Checking for updates...");
+                    self.milestone = 1;
+                } else if elapsed >= Duration::from_millis(400) && self.milestone == 1 {
+                    self.log(phase::green(), "Update service is available.");
+                    self.milestone = 2;
+                } else if elapsed >= Duration::from_millis(650) && self.milestone == 2 {
+                    let target = self
+                        .release
+                        .as_ref()
+                        .map(|release| release.latest_version.as_str())
+                        .unwrap_or("latest");
+                    self.log(phase::blue(), format!("Preparing version {target}."));
+                    self.milestone = 3;
+                }
+            }
+            InstallPhase::Downloading | InstallPhase::Installing => {}
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared drawing helpers for the tray panel, notifications and diagnostics.
+// Colors always come from `phase::*` so themes apply.
+
+const GAP_XS: f32 = 4.0;
+const GAP_S: f32 = 8.0;
+const GAP_M: f32 = 12.0;
+const GAP_L: f32 = 16.0;
+
+/// Corner radius for cards/panels.
+const CARD_ROUNDING: f32 = 14.0;
+/// Corner radius for interactive controls (buttons, tabs, inputs).
+const CONTROL_ROUNDING: f32 = 12.0;
+fn type_heading() -> FontId {
+    type_display(17.0)
+}
+fn type_body() -> FontId {
+    FontId::proportional(13.0)
+}
+fn type_label() -> FontId {
+    FontId::proportional(11.5)
+}
+fn type_caption() -> FontId {
+    FontId::proportional(10.0)
+}
+fn type_display(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(UI_FONT_SEMIBOLD.into()))
+}
+
+/// Translucent fill for text inputs so theme artwork shows through.
+fn input_fill() -> Color32 {
+    color_with_alpha(lerp_color(phase::input(), Color32::WHITE, 0.035), 0.48)
+}
+
+/// Frame on which the screenshot harness captures; `PHASE_UI_CAPTURE_FRAME`
+/// delays it.
+fn capture_frame() -> u32 {
+    std::env::var("PHASE_UI_CAPTURE_FRAME")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(170)
+}
+
+/// Save a viewport screenshot from the harness as a PNG.
+fn save_screenshot_image(path: &std::path::Path, image: &ColorImage) {
+    let [width, height] = image.size;
+    let mut buffer = image::RgbaImage::new(width as u32, height as u32);
+    for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+        *pixel = image::Rgba(image[(x as usize, y as usize)].to_array());
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match buffer.save(path) {
+        Ok(()) => eprintln!("Phase UI screenshot saved to {}", path.display()),
+        Err(error) => eprintln!("Phase UI screenshot failed: {error}"),
+    }
+}
+
+/// A 1px line that fades out toward both ends.
+fn gradient_hline(
+    painter: &egui::Painter,
+    x_range: std::ops::RangeInclusive<f32>,
+    y: f32,
+    color: Color32,
+) {
+    let x0 = *x_range.start();
+    let x1 = *x_range.end();
+    if x1 - x0 < 2.0 {
+        return;
+    }
+    let edge = color_with_alpha(color, 0.0);
+    let mid = (x0 + x1) * 0.5;
+    let (top, bot) = (y - 0.5, y + 0.5);
+    let mut mesh = egui::Mesh::default();
+    for (x, c) in [(x0, edge), (mid, color), (x1, edge)] {
+        mesh.colored_vertex(Pos2::new(x, top), c);
+        mesh.colored_vertex(Pos2::new(x, bot), c);
+    }
+    // verts: 0/1 left, 2/3 mid, 4/5 right
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 3, 2);
+    mesh.add_triangle(2, 3, 4);
+    mesh.add_triangle(3, 5, 4);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Radial gradient from `color` at the center to transparent at `radius`.
+fn radial_gradient(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32) {
+    const SEGMENTS: u32 = 40;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(center, color);
+    let edge = color_with_alpha(color, 0.0);
+    for index in 0..=SEGMENTS {
+        let angle = std::f32::consts::TAU * index as f32 / SEGMENTS as f32;
+        mesh.colored_vertex(
+            center + Vec2::new(angle.cos() * radius, angle.sin() * radius),
+            edge,
+        );
+    }
+    for index in 0..SEGMENTS {
+        mesh.add_triangle(0, index + 1, index + 2);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Faint highlight along the inside top edge of a raised surface.
+fn top_highlight(painter: &egui::Painter, rect: Rect, rounding: f32, color: Color32) {
+    let inset = rounding.max(2.0);
+    gradient_hline(
+        painter,
+        (rect.left() + inset)..=(rect.right() - inset),
+        rect.top() + 1.0,
+        color,
+    );
+}
+
+/// Smoothed 0→1 hover amount for a widget.
+fn hover_t(ui: &Ui, id: egui::Id, hovered: bool) -> f32 {
+    ui.ctx().animate_bool_with_time(id, hovered, 0.12)
+}
+
+/// Width of `text` laid out on a single line.
+fn text_width(ui: &Ui, text: &str, font: FontId) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap(text.to_owned(), font, Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
+fn configure_style(ctx: &Context) {
+    egui_extras::install_image_loaders(ctx);
+    let mut fonts = egui::FontDefinitions::default();
+    let fallback_proportional = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    let windows_fonts = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .map(|path| path.join("Fonts"));
+    let regular_loaded = windows_fonts
+        .as_ref()
+        .and_then(|path| std::fs::read(path.join("segoeui.ttf")).ok())
+        .map(|bytes| {
+            fonts
+                .font_data
+                .insert(UI_FONT_REGULAR.to_owned(), FontData::from_owned(bytes));
+        })
+        .is_some();
+    let semibold_loaded = windows_fonts
+        .as_ref()
+        .and_then(|path| std::fs::read(path.join("seguisb.ttf")).ok())
+        .map(|bytes| {
+            fonts
+                .font_data
+                .insert(UI_FONT_SEMIBOLD.to_owned(), FontData::from_owned(bytes));
+        })
+        .is_some();
+
+    if regular_loaded {
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, UI_FONT_REGULAR.to_owned());
+    }
+    let mut display_family = Vec::new();
+    if semibold_loaded {
+        display_family.push(UI_FONT_SEMIBOLD.to_owned());
+    }
+    if regular_loaded {
+        display_family.push(UI_FONT_REGULAR.to_owned());
+    }
+    display_family.extend(fallback_proportional.iter().cloned());
+    fonts
+        .families
+        .insert(FontFamily::Name(UI_FONT_SEMIBOLD.into()), display_family);
+
+    fonts.font_data.insert(
+        PHOSPHOR_FONT.to_owned(),
+        FontData::from_static(include_bytes!("../assets/Phosphor.ttf")),
+    );
+    let mut icon_family = vec![PHOSPHOR_FONT.to_owned()];
+    if let Some(default_fonts) = fonts.families.get(&FontFamily::Proportional) {
+        icon_family.extend(default_fonts.iter().cloned());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name(PHOSPHOR_FONT.into()), icon_family);
+    ctx.set_fonts(fonts);
+
+    let mut style = (*ctx.style()).clone();
+    let background = phase::background();
+    style.visuals.dark_mode =
+        (u32::from(background.r()) + u32::from(background.g()) + u32::from(background.b())) < 384;
+    style.visuals.override_text_color = Some(phase::text());
+    style.visuals.panel_fill = phase::background();
+    style.visuals.window_fill = phase::surface();
+    style.visuals.window_stroke = Stroke::new(1.0, phase::line());
+    style.visuals.extreme_bg_color = phase::input();
+    style.visuals.code_bg_color = phase::input();
+    style.visuals.faint_bg_color = phase::surface_hover();
+    style.visuals.hyperlink_color = phase::blue();
+    style.visuals.warn_fg_color = phase::warning();
+    style.visuals.error_fg_color = phase::red();
+    style.visuals.selection.bg_fill = phase::accent_dim();
+    style.visuals.selection.stroke = Stroke::new(1.0, phase::text());
+    style.visuals.text_cursor = Stroke::new(1.5, phase::accent());
+    for (widget, fill, foreground, border) in [
+        (
+            &mut style.visuals.widgets.noninteractive,
+            phase::surface(),
+            phase::text_secondary(),
+            phase::line(),
+        ),
+        (
+            &mut style.visuals.widgets.inactive,
+            phase::input(),
+            phase::text(),
+            phase::line(),
+        ),
+        (
+            &mut style.visuals.widgets.hovered,
+            phase::surface_hover(),
+            phase::text(),
+            phase::accent_hover(),
+        ),
+        (
+            &mut style.visuals.widgets.active,
+            phase::surface_active(),
+            phase::text(),
+            phase::accent(),
+        ),
+        (
+            &mut style.visuals.widgets.open,
+            phase::surface_active(),
+            phase::text(),
+            phase::line(),
+        ),
+    ] {
+        widget.bg_fill = fill;
+        widget.weak_bg_fill = fill;
+        widget.fg_stroke = Stroke::new(1.0, foreground);
+        widget.bg_stroke = Stroke::new(1.0, border);
+        widget.rounding = Rounding::same(CONTROL_ROUNDING);
+    }
+    style.visuals.window_rounding = Rounding::same(CARD_ROUNDING);
+    style.visuals.menu_rounding = Rounding::same(CONTROL_ROUNDING);
+    style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+    style.visuals.popup_shadow = egui::epaint::Shadow::NONE;
+
+    style.spacing.item_spacing = Vec2::new(GAP_S, GAP_S);
+    style.spacing.button_padding = Vec2::new(GAP_L, GAP_S + 2.0);
+    style.spacing.menu_margin = Margin::same(GAP_S);
+    ctx.set_style(style);
+}
+
+fn load_logo(ctx: &Context) -> Option<TextureHandle> {
+    load_embedded_texture(
+        ctx,
+        "phase-animator-logo",
+        include_bytes!("../assets/PhaseAnimator.png"),
+    )
+}
+
+fn load_embedded_texture(ctx: &Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+    let color_image = ColorImage::from_rgba_unmultiplied(size, &pixels);
+    Some(ctx.load_texture(name, color_image, TextureOptions::LINEAR))
+}
+
+/// Title-bar (small) and taskbar (big) icons. On Windows these are set
+/// directly with WM_SETICON at the display's scale, the same way eframe sets
+/// its startup icon, so the two never disagree.
+#[cfg(target_os = "windows")]
+fn set_native_window_icon(ctx: &Context, image: &image::RgbaImage) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateIconFromResourceEx, ICON_BIG, ICON_SMALL, LR_DEFAULTCOLOR, SendMessageW, WM_SETICON,
+    };
+    let hwnd = MAIN_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void;
+    if hwnd.is_null() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
+            IconData {
+                rgba: image.as_raw().clone(),
+                width: image.width(),
+                height: image.height(),
+            },
+        ))));
+        return;
+    }
+    let scale = ctx.pixels_per_point().max(1.0);
+    for (kind, logical) in [(ICON_BIG, 32.0_f32), (ICON_SMALL, 16.0)] {
+        let side = (logical * scale).round().max(16.0) as u32;
+        let resized =
+            image::imageops::resize(image, side, side, image::imageops::FilterType::Lanczos3);
+        let mut png = Vec::new();
+        if image::DynamicImage::ImageRgba8(resized)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_err()
+        {
+            continue;
+        }
+        unsafe {
+            let icon = CreateIconFromResourceEx(
+                png.as_ptr(),
+                png.len() as u32,
+                1,
+                0x0003_0000,
+                side as i32,
+                side as i32,
+                LR_DEFAULTCOLOR,
+            );
+            if !icon.is_null() {
+                SendMessageW(hwnd, WM_SETICON, kind as usize, icon as isize);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_native_window_icon(ctx: &Context, image: &image::RgbaImage) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
+        IconData {
+            rgba: image.as_raw().clone(),
+            width: image.width(),
+            height: image.height(),
+        },
+    ))));
+}
+
+/// The Phase mark, squared and downsampled once for all recolors.
+fn brand_base() -> &'static image::RgbaImage {
+    static BASE: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let Ok(image) = image::load_from_memory(include_bytes!("../assets/PhaseAnimator.png"))
+            .map(|image| image.to_rgba8())
+        else {
+            return image::RgbaImage::new(1, 1);
+        };
+        let side = image.width().min(image.height()).max(1);
+        let square = image::imageops::crop_imm(
+            &image,
+            (image.width() - side) / 2,
+            (image.height() - side) / 2,
+            side,
+            side,
+        )
+        .to_image();
+        image::imageops::resize(&square, 256, 256, image::imageops::FilterType::Lanczos3)
+    })
+}
+
+/// Light stop, dark stop and stripe color for the active palette.
+///
+/// The original mark runs from deep violet to hot pink (about 70° of hue).
+/// Themed marks keep that two-tone depth: the light stop is the accent, the
+/// dark stop is the accent turned toward indigo and deepened. Nearly
+/// grey accents get a tonal ramp instead. Light accents knock the stripes out
+/// to the background so they don't disappear into a pale mark.
+fn brand_stops() -> (Color32, Color32, Color32) {
+    use egui::ecolor::HsvaGamma;
+    let light = phase::accent_hover();
+    let mut dark = HsvaGamma::from(phase::accent());
+    if dark.s > 0.15 {
+        // Deepen toward indigo (250°) along the shortest way round, like the
+        // original's pink-to-violet sweep, by at most 45°.
+        let toward = (250.0 / 360.0 - dark.h + 0.5).rem_euclid(1.0) - 0.5;
+        dark.h = (dark.h + toward.clamp(-45.0 / 360.0, 45.0 / 360.0)).rem_euclid(1.0);
+        dark.s = (dark.s * 1.1).min(1.0);
+    }
+    dark.v *= 0.52;
+    let luminance = |c: Color32| {
+        (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0
+    };
+    let stripe = if luminance(light) > 0.62 {
+        phase::background()
+    } else {
+        Color32::WHITE
+    };
+    (light, Color32::from(dark), stripe)
+}
+
+/// Gradient-map the mark onto `stops`; `None` returns the original art.
+fn brand_image(stops: Option<(Color32, Color32, Color32)>) -> image::RgbaImage {
+    let base = brand_base();
+    let Some((light, dark, stripe)) = stops else {
+        return base.clone();
+    };
+    let mut out = base.clone();
+    for pixel in out.pixels_mut() {
+        let [r, g, b, a] = pixel.0;
+        if a == 0 {
+            continue;
+        }
+        let hsva = egui::ecolor::HsvaGamma::from(Color32::from_rgb(r, g, b));
+        // Position along the original violet→pink ramp, from hue and value.
+        let hue_t = ((hsva.h * 360.0 - 255.0) / 80.0).clamp(0.0, 1.0);
+        let value_t = ((hsva.v - 0.45) / 0.55).clamp(0.0, 1.0);
+        let t = hue_t * 0.55 + value_t * 0.45;
+        let mapped = lerp_color(dark, light, t);
+        // Unsaturated pixels are the stripes; edges blend smoothly.
+        let color = lerp_color(stripe, mapped, (hsva.s * 1.4).clamp(0.0, 1.0));
+        pixel.0 = [color.r(), color.g(), color.b(), a];
+    }
+    out
+}
+
+fn load_window_icon() -> IconData {
+    let bytes = include_bytes!("../assets/PhaseAnimator.png");
+    let Ok(image) = image::load_from_memory(bytes).map(|image| image.to_rgba8()) else {
+        return IconData::default();
+    };
+
+    let width = image.width();
+    let height = image.height();
+    let side = width.min(height).max(1);
+    let offset_x = (width - side) / 2;
+    let offset_y = (height - side) / 2;
+    let mut square = image::RgbaImage::new(side, side);
+    for y in 0..side {
+        for x in 0..side {
+            square.put_pixel(x, y, *image.get_pixel(offset_x + x, offset_y + y));
+        }
+    }
+
+    let resized = image::imageops::resize(&square, 256, 256, image::imageops::FilterType::Lanczos3);
+    IconData {
+        rgba: resized.into_raw(),
+        width: 256,
+        height: 256,
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn load_tray_icon() -> Option<TrayIconImage> {
+    let bytes = include_bytes!("../assets/PhaseAnimator.png");
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let width = image.width();
+    let height = image.height();
+    let side = width.min(height).max(1);
+    let offset_x = (width - side) / 2;
+    let offset_y = (height - side) / 2;
+    let mut square = image::RgbaImage::new(side, side);
+    for y in 0..side {
+        for x in 0..side {
+            square.put_pixel(x, y, *image.get_pixel(offset_x + x, offset_y + y));
+        }
+    }
+
+    let resized = image::imageops::resize(&square, 32, 32, image::imageops::FilterType::Lanczos3);
+    TrayIconImage::from_rgba(resized.into_raw(), 32, 32).ok()
+}
+
+fn tray_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(TRAY_VIEWPORT_KEY)
+}
+
+fn diagnostics_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(DIAGNOSTICS_VIEWPORT_KEY)
+}
+
+fn notification_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(NOTIFICATION_VIEWPORT_KEY)
+}
+
+#[cfg(target_os = "windows")]
+fn apply_notification_window_style() -> bool {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL,
+        DwmSetWindowAttribute,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let title: Vec<u16> = "Phase notification\0".encode_utf16().collect();
+    let corner_preference = DWMWCP_ROUNDSMALL;
+    let border_color = DWMWA_COLOR_NONE;
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return false;
+        }
+        let corner_result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &corner_preference as *const _ as *const _,
+            core::mem::size_of_val(&corner_preference) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            &border_color as *const _ as *const _,
+            core::mem::size_of_val(&border_color) as u32,
+        );
+        corner_result == 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_notification_window_style() -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_title_bar(frame: &eframe::Frame, tray_panel: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_DEFAULT, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
+    };
+
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(window) = handle.as_raw() else {
+        return;
+    };
+
+    let hwnd = window.hwnd.get() as *mut core::ffi::c_void;
+    MAIN_HWND.store(hwnd as isize, Ordering::Relaxed);
+    let caption = color_ref(phase::surface());
+    let text = color_ref(phase::text());
+    let border = color_ref(phase::accent_dim());
+    let corner_preference = if tray_panel {
+        DWMWCP_ROUNDSMALL
+    } else {
+        DWMWCP_DEFAULT
+    };
+
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR as u32,
+            &caption as *const _ as *const _,
+            core::mem::size_of_val(&caption) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TEXT_COLOR as u32,
+            &text as *const _ as *const _,
+            core::mem::size_of_val(&text) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            &border as *const _ as *const _,
+            core::mem::size_of_val(&border) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &corner_preference as *const _ as *const _,
+            core::mem::size_of_val(&corner_preference) as u32,
+        );
+    }
+    apply_system_backdrop(hwnd, !tray_panel);
+}
+
+/// 0 = not applied yet, 1 = Mica on, 2 = unsupported (pre-22H2), 3 = off.
+#[cfg(target_os = "windows")]
+static BACKDROP_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Windows 11 Mica behind the main window. Older systems reject the
+/// attribute and keep the opaque canvas. Set `PHASE_NO_MICA=1` to opt out.
+#[cfg(target_os = "windows")]
+fn apply_system_backdrop(hwnd: *mut core::ffi::c_void, enabled: bool) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMSBT_MAINWINDOW, DWMSBT_NONE, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    };
+    use windows_sys::Win32::UI::Controls::MARGINS;
+
+    let current = BACKDROP_STATE.load(Ordering::Relaxed);
+    let target = if enabled && std::env::var_os("PHASE_NO_MICA").is_none() {
+        1
+    } else {
+        3
+    };
+    if current == 2 || current == target {
+        return;
+    }
+    let kind = if target == 1 {
+        DWMSBT_MAINWINDOW
+    } else {
+        DWMSBT_NONE
+    };
+    let background = phase::background();
+    let dark: i32 =
+        ((background.r() as u32 + background.g() as u32 + background.b() as u32) < 384) as i32;
+    let extend = if target == 1 { -1 } else { 0 };
+    let margins = MARGINS {
+        cxLeftWidth: extend,
+        cxRightWidth: extend,
+        cyTopHeight: extend,
+        cyBottomHeight: extend,
+    };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            &dark as *const _ as *const _,
+            core::mem::size_of_val(&dark) as u32,
+        );
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE as u32,
+            &kind as *const _ as *const _,
+            core::mem::size_of_val(&kind) as u32,
+        );
+        if result != 0 {
+            BACKDROP_STATE.store(2, Ordering::Relaxed);
+            return;
+        }
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+    BACKDROP_STATE.store(target, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "windows")]
+fn backdrop_active() -> bool {
+    BACKDROP_STATE.load(Ordering::Relaxed) == 1
+}
+
+#[cfg(not(target_os = "windows"))]
+fn backdrop_active() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_title_bar(_frame: &eframe::Frame, _tray_panel: bool) {}
+
+#[cfg(target_os = "windows")]
+fn reveal_window_for_tray_signal() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
+    };
+
+    let hwnd = MAIN_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void;
+    if hwnd.is_null() {
+        log_tray_debug("window reveal skipped: missing hwnd");
+        return;
+    }
+
+    unsafe {
+        let shown = ShowWindow(hwnd, SW_SHOWNORMAL);
+        let focused = SetForegroundWindow(hwnd);
+        log_tray_debug(format!(
+            "window reveal requested: hwnd={}, show={}, focus={}",
+            hwnd as isize, shown, focused
+        ));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn reveal_window_for_tray_signal() {}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn log_tray_debug(message: impl AsRef<str>) {
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join("PhaseTrayDebug.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f32())
+        .unwrap_or_default();
+    let _ = writeln!(file, "[{elapsed:.3}] {}", message.as_ref());
+}
+
+fn color_ref(color: Color32) -> u32 {
+    (color.r() as u32) | ((color.g() as u32) << 8) | ((color.b() as u32) << 16)
+}
+
+fn spawn_avatar_fetch(
+    tx: Sender<AvatarFetchResult>,
+    kind: AvatarKind,
+    key: String,
+    ctx: Context,
+    loader: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let roblox_username = match kind {
+            AvatarKind::Phase => None,
+            AvatarKind::Roblox => verification::fetch_roblox_username(&key).ok(),
+        };
+        let image = loader().and_then(|bytes| match kind {
+            AvatarKind::Phase => decode_circular_avatar_image(bytes),
+            AvatarKind::Roblox => decode_full_body_avatar_image(bytes),
+        });
+        let _ = tx.send(AvatarFetchResult {
+            kind,
+            key,
+            image,
+            roblox_username,
+        });
+        ctx.request_repaint();
+    });
+}
+
+fn spawn_theme_background_fetch(
+    tx: Sender<ThemeBackgroundFetchResult>,
+    key: String,
+    ctx: Context,
+    loader: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let image = loader().and_then(decode_texture_image);
+        let _ = tx.send(ThemeBackgroundFetchResult { key, image });
+        ctx.request_repaint();
+    });
+}
+
+fn spawn_theme_preview_fetch(
+    tx: Sender<ThemePreviewFetchResult>,
+    asset_id: String,
+    key: String,
+    ctx: Context,
+    loader: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let image = loader().and_then(decode_texture_image);
+        let _ = tx.send(ThemePreviewFetchResult {
+            asset_id,
+            key,
+            image,
+        });
+        ctx.request_repaint();
+    });
+}
+
+fn decode_texture_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
+    let image = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Invalid theme background image: {error}"))?
+        .to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+    Ok(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+fn decode_circular_avatar_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
+    let image = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Invalid avatar image: {error}"))?
+        .to_rgba8();
+
+    let source_width = image.width();
+    let source_height = image.height();
+    let side = source_width.min(source_height).max(1);
+    let offset_x = (source_width - side) / 2;
+    let offset_y = (source_height - side) / 2;
+    let mut square = image::RgbaImage::new(side, side);
+    for y in 0..side {
+        for x in 0..side {
+            let pixel = *image.get_pixel(offset_x + x, offset_y + y);
+            square.put_pixel(x, y, pixel);
+        }
+    }
+
+    let center = (side as f32 - 1.0) * 0.5;
+    let radius = side as f32 * 0.5;
+    let soft_edge = radius.max(1.0) - 1.5;
+    for y in 0..side {
+        for x in 0..side {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let alpha_scale = if dist <= soft_edge {
+                1.0
+            } else if dist <= radius {
+                ((radius - dist) / (radius - soft_edge)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let pixel = square.get_pixel_mut(x, y);
+            pixel.0[3] = ((pixel.0[3] as f32) * alpha_scale) as u8;
+        }
+    }
+
+    let size = [side as usize, side as usize];
+    let pixels = square.into_raw();
+    Ok(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+fn decode_full_body_avatar_image(bytes: Vec<u8>) -> Result<ColorImage, String> {
+    let image = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Invalid Roblox avatar image: {error}"))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel.0[3] > 8 {
+            bounds = Some(match bounds {
+                Some((min_x, min_y, max_x, max_y)) => {
+                    (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                }
+                None => (x, y, x, y),
+            });
+        }
+    }
+    let image = if let Some((min_x, min_y, max_x, max_y)) = bounds {
+        let padding = 4;
+        let left = min_x.saturating_sub(padding);
+        let top = min_y.saturating_sub(padding);
+        let right = (max_x + padding).min(width.saturating_sub(1));
+        let bottom = (max_y + padding).min(height.saturating_sub(1));
+        image::imageops::crop_imm(&image, left, top, right - left + 1, bottom - top + 1).to_image()
+    } else {
+        image
+    };
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+    Ok(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+/// Section header: icon, title with a subtitle, and an optional status on
+/// the right.
+fn card_header(
+    ui: &mut Ui,
+    icon: Icon,
+    icon_color: Color32,
+    title: &str,
+    subtitle: &str,
+    status: Option<(&str, Color32)>,
+) {
+    let width = ui.available_width();
+    let status_w = status
+        .map(|(t, _)| status_indicator_width(ui, t) + GAP_S)
+        .unwrap_or(0.0);
+    let icon_sz = 22.0;
+    let text_w = (width - icon_sz - GAP_M - status_w).max(60.0);
+    ui.horizontal(|ui| {
+        draw_icon(ui, icon, Vec2::splat(icon_sz), icon_color);
+        ui.add_space(GAP_M);
+        ui.vertical(|ui| {
+            ui.set_width(text_w);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(title)
+                        .font(type_heading())
+                        .strong()
+                        .color(phase::text()),
+                )
+                .wrap(false),
+            );
+            ui.add_space(1.0);
+            scrolling_label(ui, subtitle, text_w, type_label(), phase::text_muted());
+        });
+        if let Some((t, c)) = status {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                status_indicator(ui, t, c);
+            });
+        }
+    });
+}
+
+fn section_label(ui: &mut Ui, text: &str) {
+    ui.horizontal(|ui| {
+        let label = ui.label(
+            RichText::new(text.to_uppercase())
+                .font(type_label())
+                .color(phase::text_muted()),
+        );
+        // Trailing gradient hairline fills the rest of the row so sections read
+        // as clearly delimited groups, fading out toward the edge.
+        let y = label.rect.center().y + 0.5;
+        let x0 = label.rect.right() + GAP_S;
+        let x1 = ui.max_rect().right();
+        if x1 > x0 + GAP_S {
+            gradient_hline(
+                ui.painter(),
+                x0..=x1,
+                y,
+                color_with_alpha(phase::line(), 0.85),
+            );
+        }
+    });
+}
+
+fn action_grid(ui: &mut Ui, count: usize, mut add_action: impl FnMut(&mut Ui, usize, Vec2)) {
+    if count == 0 {
+        return;
+    }
+
+    let width = ui.available_width().max(1.0);
+    let gap = GRID_GAP;
+    let columns = if count >= 3 && width >= MIN_ACTION_WIDTH * 3.0 + gap * 2.0 {
+        3
+    } else if count >= 2 && width >= MIN_ACTION_WIDTH * 2.0 + gap {
+        2
+    } else {
+        1
+    };
+
+    let mut index = 0;
+    while index < count {
+        let remaining = count - index;
+        let row_count = remaining.min(columns);
+        let row_button_width = phase_grid_cell_width(width, row_count, gap);
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for offset in 0..row_count {
+                add_action(
+                    ui,
+                    index + offset,
+                    Vec2::new(row_button_width, ACTION_HEIGHT),
+                );
+            }
+        });
+
+        index += row_count;
+        if index < count {
+            ui.add_space(GRID_GAP);
+        }
+    }
+}
+
+fn phase_grid_cell_width(width: f32, columns: usize, gap: f32) -> f32 {
+    if columns <= 1 {
+        return width.max(1.0);
+    }
+    ((width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(1.0)
+}
+
+/// Phosphor icon glyphs used in the UI.
+#[derive(Clone, Copy)]
+enum Icon {
+    Bolt,
+    CheckCircle,
+    Download,
+    External,
+    Folder,
+    Gear,
+    Key,
+    Lock,
+    Refresh,
+    Search,
+    Link,
+    ShieldCheck,
+    Info,
+    Clock,
+    Play,
+    Pause,
+    Trash,
+    Palette,
+    Sparkle,
+    Broadcast,
+    FilmStrip,
+    House,
+    PuzzlePiece,
+    UploadSimple,
+    UserCircle,
+    Sliders,
+    ArrowRight,
+    Warning,
+    Check,
+    CaretDown,
+    CaretRight,
+    MonitorPlay,
+    Wrench,
+    SignOut,
+    Package,
+    FolderOpen,
+    YoutubeLogo,
+    Heartbeat,
+    Keyboard,
+    SkipBack,
+    SkipForward,
+    Image,
+    DownloadSimple,
+}
+
+impl Icon {
+    fn glyph(self) -> &'static str {
+        match self {
+            Icon::Bolt => "\u{E2DE}",           // lightning
+            Icon::CheckCircle => "\u{E184}",    // check-circle
+            Icon::Download => "\u{E20A}",       // download
+            Icon::External => "\u{E5DE}",       // arrow-square-out
+            Icon::Folder => "\u{E24A}",         // folder-notch
+            Icon::Gear => "\u{E272}",           // gear-six
+            Icon::Key => "\u{E2D6}",            // key
+            Icon::Lock => "\u{E308}",           // lock-simple
+            Icon::Refresh => "\u{E094}",        // arrows-clockwise
+            Icon::Search => "\u{E30C}",         // magnifying-glass
+            Icon::Link => "\u{E2E2}",           // link
+            Icon::ShieldCheck => "\u{E40C}",    // shield-check
+            Icon::Info => "\u{E2CE}",           // info
+            Icon::Clock => "\u{E19A}",          // clock
+            Icon::Play => "\u{E3D0}",           // play
+            Icon::Pause => "\u{E39E}",          // pause
+            Icon::Trash => "\u{E4A6}",          // trash
+            Icon::Palette => "\u{E6C8}",        // palette
+            Icon::Sparkle => "\u{E6A2}",        // sparkle
+            Icon::Broadcast => "\u{E0F2}",      // broadcast
+            Icon::FilmStrip => "\u{E792}",      // film-strip
+            Icon::House => "\u{E2C2}",          // house
+            Icon::PuzzlePiece => "\u{E596}",    // puzzle-piece
+            Icon::UploadSimple => "\u{E4C0}",   // upload-simple
+            Icon::UserCircle => "\u{E4C4}",     // user-circle
+            Icon::Sliders => "\u{E434}",        // sliders-horizontal
+            Icon::ArrowRight => "\u{E06C}",     // arrow-right
+            Icon::Warning => "\u{E4E0}",        // warning
+            Icon::Check => "\u{E182}",          // check
+            Icon::CaretDown => "\u{E136}",      // caret-down
+            Icon::CaretRight => "\u{E13A}",     // caret-right
+            Icon::MonitorPlay => "\u{E58C}",    // monitor-play
+            Icon::Wrench => "\u{E5D4}",         // wrench
+            Icon::SignOut => "\u{E42A}",        // sign-out
+            Icon::Package => "\u{E390}",        // package
+            Icon::FolderOpen => "\u{E256}",     // folder-open
+            Icon::YoutubeLogo => "\u{E4FC}",    // youtube-logo
+            Icon::Heartbeat => "\u{E2AC}",      // heartbeat
+            Icon::Keyboard => "\u{E2D8}",       // keyboard
+            Icon::SkipBack => "\u{E5A4}",       // skip-back
+            Icon::SkipForward => "\u{E5A6}",    // skip-forward
+            Icon::Image => "\u{E2CA}",          // image
+            Icon::DownloadSimple => "\u{E20C}", // download-simple
+        }
+    }
+}
+
+fn draw_icon(ui: &mut Ui, icon: Icon, size: Vec2, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    draw_icon_at(ui.painter(), rect, icon, color);
+}
+
+fn draw_icon_at(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        icon.glyph(),
+        FontId::new(
+            rect.height().min(rect.width()) * 0.92,
+            FontFamily::Name(PHOSPHOR_FONT.into()),
+        ),
+        color,
+    );
+}
+
+fn phase_notification_panel(
+    ui: &mut Ui,
+    notification: &PhaseNotification,
+    logo: Option<&TextureHandle>,
+    visibility: f32,
+) -> bool {
+    let visibility = visibility.clamp(0.0, 1.0);
+    let slide = (1.0 - visibility) * 24.0;
+    let shell = ui.max_rect().shrink(1.0).translate(Vec2::new(slide, 0.0));
+    let tone = match notification.tone {
+        NotificationTone::Info => phase::blue(),
+        NotificationTone::Success => phase::green(),
+    };
+    let painter = ui.painter().clone();
+    painter.rect_filled(
+        shell,
+        Rounding::same(9.0),
+        color_with_alpha(phase::surface(), visibility),
+    );
+    painter.rect_stroke(
+        shell,
+        Rounding::same(9.0),
+        Stroke::new(1.0, color_with_alpha(phase::line(), visibility)),
+    );
+    if let Some(texture) = logo {
+        let logo_rect = Rect::from_center_size(
+            Pos2::new(shell.left() + 30.0, shell.center().y - 2.0),
+            Vec2::splat(30.0),
+        );
+        painter.image(
+            texture.id(),
+            logo_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            color_with_alpha(Color32::WHITE, visibility),
+        );
+    }
+
+    let text_left = shell.left() + 54.0;
+    painter.text(
+        Pos2::new(text_left, shell.top() + 20.0),
+        Align2::LEFT_CENTER,
+        &notification.title,
+        type_heading(),
+        color_with_alpha(phase::text(), visibility),
+    );
+    let body_rect = Rect::from_min_max(
+        Pos2::new(text_left, shell.top() + 34.0),
+        Pos2::new(shell.right() - 38.0, shell.bottom() - 14.0),
+    );
+    ui.allocate_ui_at_rect(body_rect, |ui| {
+        ui.set_opacity(visibility);
+        ui.add(
+            egui::Label::new(
+                RichText::new(&notification.body)
+                    .font(type_body())
+                    .color(phase::text_secondary()),
+            )
+            .wrap(true),
+        );
+    });
+
+    let close_rect = Rect::from_center_size(
+        Pos2::new(shell.right() - 18.0, shell.top() + 18.0),
+        Vec2::splat(28.0),
+    );
+    let close = ui.interact(
+        close_rect,
+        ui.make_persistent_id("phase-notification-close"),
+        Sense::click(),
+    );
+    let close_color = if close.hovered() {
+        phase::text()
+    } else {
+        phase::text_muted()
+    };
+    let center = close_rect.center();
+    let extent = 3.5;
+    let stroke = Stroke::new(1.5, color_with_alpha(close_color, visibility));
+    painter.line_segment(
+        [
+            Pos2::new(center.x - extent, center.y - extent),
+            Pos2::new(center.x + extent, center.y + extent),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(center.x + extent, center.y - extent),
+            Pos2::new(center.x - extent, center.y + extent),
+        ],
+        stroke,
+    );
+    if close.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let remaining = (1.0
+        - notification.created_at.elapsed().as_secs_f32() / TOAST_LIFETIME.as_secs_f32())
+    .clamp(0.0, 1.0);
+    let progress = Rect::from_min_size(
+        Pos2::new(shell.left() + 10.0, shell.bottom() - 3.0),
+        Vec2::new((shell.width() - 20.0) * remaining, 2.0),
+    );
+    painter.rect_filled(
+        progress,
+        Rounding::same(1.0),
+        color_with_alpha(tone, 0.72 * visibility),
+    );
+    close.clicked()
+}
+
+fn tray_close_button(ui: &mut Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    let hover = hover_t(ui, response.id, response.hovered());
+    if hover > 0.0 {
+        ui.painter().rect_filled(
+            rect,
+            Rounding::same(CONTROL_ROUNDING),
+            color_with_alpha(phase::surface_hover(), hover),
+        );
+    }
+    let center = rect.center();
+    let extent = 4.0;
+    let color = lerp_color(phase::text_muted(), phase::text(), hover);
+    let stroke = Stroke::new(1.6, color);
+    ui.painter().line_segment(
+        [
+            Pos2::new(center.x - extent, center.y - extent),
+            Pos2::new(center.x + extent, center.y + extent),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(center.x + extent, center.y - extent),
+            Pos2::new(center.x - extent, center.y + extent),
+        ],
+        stroke,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text("Close tray controls")
+}
+
+fn compact_info_row(ui: &mut Ui, label: &str, value: &str, width: f32) {
+    ui.horizontal(|ui| {
+        ui.set_width(width);
+        let label_width = 66.0_f32.min(width * 0.38);
+        let value_width = (width - label_width - 8.0).max(72.0);
+        ui.add_sized(
+            Vec2::new(label_width, 18.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .font(FontId::proportional(12.0))
+                    .color(phase::text_muted()),
+            )
+            .wrap(false),
+        );
+        scrolling_label(
+            ui,
+            value,
+            value_width,
+            FontId::proportional(12.5),
+            phase::text_secondary(),
+        );
+    });
+}
+
+fn scrolling_label(ui: &mut Ui, text: &str, width: f32, font: FontId, color: Color32) {
+    let height = font.size + 8.0;
+    egui::ScrollArea::horizontal()
+        .id_source(ui.next_auto_id())
+        .max_width(width)
+        .max_height(height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_min_width(width);
+            ui.add(egui::Label::new(RichText::new(text).font(font).color(color)).wrap(false));
+        });
+}
+
+/// Layout width of the borderless status rail and its label.
+fn status_indicator_width(ui: &Ui, text: &str) -> f32 {
+    2.0 + GAP_S + text_width(ui, text, type_label())
+}
+
+fn status_indicator(ui: &mut Ui, text: &str, color: Color32) {
+    let animated = matches!(
+        text,
+        "Waiting" | "Checking" | "Fixing" | "Loading" | "Starting"
+    );
+    let rail_color = if animated {
+        let time = ui.input(|input| input.time) as f32;
+        let pulse = 0.55 + 0.45 * ((time * 5.0).sin() * 0.5 + 0.5);
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        color_with_alpha(color, pulse)
+    } else {
+        color
+    };
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP_S;
+        let (rail, _) = ui.allocate_exact_size(Vec2::new(2.0, 14.0), Sense::hover());
+        ui.painter()
+            .rect_filled(rail, Rounding::same(1.0), rail_color);
+        ui.add(
+            egui::Label::new(
+                RichText::new(text)
+                    .font(type_label())
+                    .color(phase::text_secondary()),
+            )
+            .wrap(false),
+        );
+    });
+}
+
+fn diagnostics_waiting_card(ui: &mut Ui) {
+    card_header(
+        ui,
+        Icon::Refresh,
+        phase::blue(),
+        "Checking connection",
+        "This should only take a few seconds.",
+        Some(("Running", phase::blue())),
+    );
+}
+
+fn diagnostics_fix_waiting_card(ui: &mut Ui) {
+    let time = ui.ctx().input(|input| input.time) as f32;
+    let pulse = 0.55 + 0.45 * ((time * 4.0).sin() * 0.5 + 0.5);
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
+
+    card_header(
+        ui,
+        Icon::Gear,
+        color_with_alpha(phase::accent(), pulse),
+        "Preparing fix assistant",
+        "Safe network checks will appear here as they finish.",
+        Some(("Running", phase::accent())),
+    );
+    ui.add_space(GAP_S);
+    animated_diagnostics_bar(ui, ui.available_width(), pulse);
+}
+
+fn diagnostics_check_card(ui: &mut Ui, check: &diagnostics::DiagnosticCheck) {
+    let color = match check.status {
+        diagnostics::DiagnosticStatus::Good => phase::green(),
+        diagnostics::DiagnosticStatus::Warning => phase::warning(),
+        diagnostics::DiagnosticStatus::Problem => phase::red(),
+    };
+    let icon = match check.status {
+        diagnostics::DiagnosticStatus::Good => Icon::CheckCircle,
+        diagnostics::DiagnosticStatus::Warning | diagnostics::DiagnosticStatus::Problem => {
+            Icon::Gear
+        }
+    };
+
+    ui.horizontal_top(|ui| {
+        draw_icon(ui, icon, Vec2::splat(18.0), color);
+        ui.add_space(GAP_S);
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(&check.title)
+                        .font(type_heading())
+                        .strong()
+                        .color(phase::text()),
+                );
+                status_indicator(ui, check.status.label(), color);
+                if let Some(elapsed) = check.elapsed_ms {
+                    ui.label(
+                        RichText::new(format!("{elapsed} ms"))
+                            .font(type_caption())
+                            .color(phase::text_muted()),
+                    );
+                }
+            });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&check.detail)
+                        .font(type_body())
+                        .color(phase::text_secondary()),
+                )
+                .wrap(true),
+            );
+            if !check.next_step.trim().is_empty() && check.next_step != "No action needed." {
+                ui.add_space(GAP_XS);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Try: {}", check.next_step))
+                            .font(type_label())
+                            .color(color),
+                    )
+                    .wrap(true),
+                );
+            }
+        });
+    });
+    ui.add_space(GAP_S);
+    ui.separator();
+}
+
+fn diagnostics_repair_card(ui: &mut Ui, step: &diagnostics::RepairStep, animate: bool) {
+    let color = match step.status {
+        diagnostics::DiagnosticStatus::Good => phase::green(),
+        diagnostics::DiagnosticStatus::Warning => phase::warning(),
+        diagnostics::DiagnosticStatus::Problem => phase::red(),
+    };
+    let icon = match step.status {
+        diagnostics::DiagnosticStatus::Good => Icon::CheckCircle,
+        diagnostics::DiagnosticStatus::Warning => Icon::Info,
+        diagnostics::DiagnosticStatus::Problem => Icon::Gear,
+    };
+    let t = if animate {
+        let id = ui.make_persistent_id(("phase-repair-step", &step.title, &step.action));
+        ease_out_cubic(ui.ctx().animate_bool_with_time(id, true, 0.22))
+    } else {
+        1.0
+    };
+
+    ui.add_space((1.0 - t) * 7.0);
+    ui.scope(|ui| {
+        ui.set_opacity(0.28 + 0.72 * t);
+        ui.horizontal_top(|ui| {
+            draw_icon(ui, icon, Vec2::splat(18.0), color);
+            ui.add_space(GAP_S);
+            ui.vertical(|ui| {
+                let width = ui.available_width();
+                ui.set_width(width);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(&step.title)
+                            .font(type_heading())
+                            .strong()
+                            .color(phase::text()),
+                    );
+                    status_indicator(ui, step.status.label(), color);
+                    if let Some(elapsed) = step.elapsed_ms {
+                        ui.label(
+                            RichText::new(format!("{elapsed} ms"))
+                                .font(type_caption())
+                                .color(phase::text_muted()),
+                        );
+                    }
+                });
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&step.detail)
+                            .font(type_body())
+                            .color(phase::text_secondary()),
+                    )
+                    .wrap(true),
+                );
+                if !step.action.trim().is_empty() {
+                    ui.add_space(GAP_XS);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("Action: {}", step.action))
+                                .font(type_label())
+                                .color(phase::text_muted()),
+                        )
+                        .wrap(true),
+                    );
+                }
+                if let Some(output) = step
+                    .raw_output
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    ui.add_space(GAP_S);
+                    diagnostics_output_panel(ui, output, width);
+                }
+            });
+        });
+        ui.add_space(GAP_S);
+        ui.separator();
+    });
+}
+
+fn diagnostics_output_panel(ui: &mut Ui, output: &str, width: f32) {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if let Some(snapshot) = parse_diagnostic_snapshot(trimmed) {
+        diagnostics_snapshot_panel(ui, &snapshot, width);
+        return;
+    }
+
+    let command = parse_command_output(trimmed);
+    let success = command.exit.as_deref() == Some("0") && command.stderr.is_empty();
+    let accent = if success {
+        phase::green()
+    } else {
+        phase::warning()
+    };
+
+    egui::Frame::none()
+        .fill(input_fill())
+        .stroke(Stroke::new(1.0, color_with_alpha(accent, 0.36)))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 9.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 20.0).max(220.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                draw_icon(
+                    ui,
+                    if success {
+                        Icon::CheckCircle
+                    } else {
+                        Icon::Info
+                    },
+                    Vec2::splat(14.0),
+                    accent,
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(if success {
+                        "Command succeeded"
+                    } else {
+                        "Command output"
+                    })
+                    .font(FontId::proportional(11.4))
+                    .strong()
+                    .color(phase::text()),
+                );
+                if let Some(exit) = &command.exit {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("exit {exit}"))
+                            .font(FontId::monospace(9.6))
+                            .color(accent),
+                    );
+                }
+            });
+
+            let mut wrote = false;
+            if let Some(status) = &command.status_code {
+                ui.add_space(7.0);
+                command_meta_row(
+                    ui,
+                    "HTTP",
+                    if status == "200" { "200 OK" } else { status },
+                    status == "200",
+                    inner_width,
+                );
+                wrote = true;
+            }
+            if let Some(content_type) = &command.content_type {
+                ui.add_space(if wrote { 4.0 } else { 7.0 });
+                command_meta_row(
+                    ui,
+                    "Content",
+                    clean_content_type(content_type),
+                    true,
+                    inner_width,
+                );
+                wrote = true;
+            }
+
+            if let Some(body) = &command.body_prefix {
+                ui.add_space(8.0);
+                if !phase_response_summary(ui, body, inner_width) {
+                    command_text_block(
+                        ui,
+                        "Response",
+                        &[body.to_owned()],
+                        inner_width,
+                        phase::text_muted(),
+                    );
+                }
+                wrote = true;
+            }
+
+            let proxy_summary = proxy_settings_summary(&command.stdout);
+            let winhttp_summary = winhttp_proxy_summary(&command.stdout);
+            let dns_flushed = dns_flush_succeeded(&command.stdout);
+
+            if let Some(proxy) = &proxy_summary {
+                ui.add_space(if wrote { 8.0 } else { 7.0 });
+                proxy_settings_panel(ui, proxy, inner_width);
+                wrote = true;
+            } else if let Some(winhttp) = &winhttp_summary {
+                ui.add_space(if wrote { 8.0 } else { 7.0 });
+                winhttp_proxy_panel(ui, winhttp, inner_width);
+                wrote = true;
+            } else if dns_flushed {
+                ui.add_space(if wrote { 8.0 } else { 7.0 });
+                simple_command_summary(
+                    ui,
+                    Icon::CheckCircle,
+                    "DNS cache flushed",
+                    "Windows resolver cache was cleared.",
+                    phase::green(),
+                    inner_width,
+                );
+                wrote = true;
+            }
+
+            if !command.stdout.is_empty() {
+                let show_stdout = command.body_prefix.is_none()
+                    && proxy_summary.is_none()
+                    && winhttp_summary.is_none()
+                    && !dns_flushed;
+                if show_stdout {
+                    ui.add_space(if wrote { 8.0 } else { 7.0 });
+                    command_text_block(
+                        ui,
+                        "Stdout",
+                        &command.stdout,
+                        inner_width,
+                        phase::text_secondary(),
+                    );
+                    wrote = true;
+                }
+            }
+
+            if !command.stderr.is_empty() {
+                ui.add_space(if wrote { 8.0 } else { 7.0 });
+                command_text_block(ui, "Stderr", &command.stderr, inner_width, phase::warning());
+            }
+        });
+}
+
+#[derive(Default)]
+struct CommandOutputView {
+    exit: Option<String>,
+    status_code: Option<String>,
+    content_type: Option<String>,
+    body_prefix: Option<String>,
+    stdout: Vec<String>,
+    stderr: Vec<String>,
+}
+
+fn parse_command_output(output: &str) -> CommandOutputView {
+    let mut parsed = CommandOutputView::default();
+    let mut section = "";
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match trimmed {
+            "Stdout:" => {
+                section = "stdout";
+                continue;
+            }
+            "Stderr:" => {
+                section = "stderr";
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Exit:") {
+            parsed.exit = Some(value.trim().to_owned());
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("StatusCode=") {
+            parsed.status_code = Some(value.trim().to_owned());
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("ContentType=") {
+            parsed.content_type = Some(value.trim().to_owned());
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("BodyPrefix=") {
+            parsed.body_prefix = Some(value.trim().to_owned());
+            continue;
+        }
+
+        match section {
+            "stderr" => parsed.stderr.push(trimmed.to_owned()),
+            _ => parsed.stdout.push(trimmed.to_owned()),
+        }
+    }
+
+    parsed
+}
+
+fn command_meta_row(ui: &mut Ui, label: &str, value: &str, positive: bool, width: f32) {
+    let color = if positive {
+        phase::green()
+    } else {
+        phase::warning()
+    };
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.06))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::symmetric(8.0, 5.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 16.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(label)
+                        .font(FontId::proportional(10.2))
+                        .strong()
+                        .color(phase::text_muted()),
+                );
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(value)
+                            .font(FontId::proportional(10.5))
+                            .color(color),
+                    )
+                    .wrap(true),
+                );
+            });
+        });
+}
+
+fn phase_response_summary(ui: &mut Ui, body: &str, width: f32) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+
+    let latest = value
+        .get("latestVersion")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown version");
+    let build = value
+        .get("latestBuildId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown build");
+    let message = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+
+    egui::Frame::none()
+        .fill(color_with_alpha(phase::green(), 0.07))
+        .stroke(Stroke::new(1.0, color_with_alpha(phase::green(), 0.22)))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 20.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                draw_icon(ui, Icon::CheckCircle, Vec2::splat(14.0), phase::green());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Phase responded")
+                        .font(FontId::proportional(11.0))
+                        .strong()
+                        .color(phase::text()),
+                );
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("{latest}  -  {build}"))
+                    .font(FontId::monospace(10.0))
+                    .color(phase::text_secondary()),
+            );
+            if let Some(message) = message {
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(message)
+                            .font(FontId::proportional(10.2))
+                            .color(phase::text_muted()),
+                    )
+                    .wrap(true),
+                );
+            }
+        });
+    true
+}
+
+struct UserProxySummary {
+    enabled: bool,
+    server: String,
+    pac: String,
+}
+
+fn proxy_settings_summary(lines: &[String]) -> Option<UserProxySummary> {
+    let mut enabled = None;
+    let mut server = String::new();
+    let mut pac = String::new();
+
+    for line in lines {
+        if let Some(value) = line.strip_prefix("ProxyEnable=") {
+            enabled = Some(value.trim() == "1");
+        } else if let Some(value) = line.strip_prefix("ProxyServer=") {
+            server = value.trim().to_owned();
+        } else if let Some(value) = line.strip_prefix("AutoConfigURL=") {
+            pac = value.trim().to_owned();
+        }
+    }
+
+    enabled.map(|enabled| UserProxySummary {
+        enabled,
+        server,
+        pac,
+    })
+}
+
+fn proxy_settings_panel(ui: &mut Ui, proxy: &UserProxySummary, width: f32) {
+    let has_pac = !proxy.pac.trim().is_empty();
+    let has_proxy = proxy.enabled || !proxy.server.trim().is_empty() || has_pac;
+    let color = if has_proxy {
+        phase::warning()
+    } else {
+        phase::green()
+    };
+    let title = if has_proxy {
+        "Windows proxy configured"
+    } else {
+        "Windows proxy disabled"
+    };
+    let detail = if has_proxy {
+        "Windows user proxy/PAC settings may affect browsers and web requests."
+    } else {
+        "No user proxy server or PAC URL is enabled."
+    };
+
+    simple_command_summary(
+        ui,
+        if has_proxy {
+            Icon::Info
+        } else {
+            Icon::CheckCircle
+        },
+        title,
+        detail,
+        color,
+        width,
+    );
+    if has_proxy {
+        ui.add_space(5.0);
+        if !proxy.server.trim().is_empty() {
+            command_meta_row(ui, "Server", &proxy.server, false, width);
+        }
+        if has_pac {
+            ui.add_space(4.0);
+            command_meta_row(ui, "PAC", &proxy.pac, false, width);
+        }
+    }
+}
+
+struct WinHttpSummary {
+    direct: bool,
+    detail: String,
+}
+
+fn winhttp_proxy_summary(lines: &[String]) -> Option<WinHttpSummary> {
+    let joined = lines.join(" ");
+    let lower = joined.to_ascii_lowercase();
+    if !lower.contains("winhttp") && !lower.contains("proxy") {
+        return None;
+    }
+    let direct = lower.contains("direct access") || lower.contains("no proxy server");
+    Some(WinHttpSummary {
+        direct,
+        detail: joined.trim().to_owned(),
+    })
+}
+
+fn winhttp_proxy_panel(ui: &mut Ui, summary: &WinHttpSummary, width: f32) {
+    let color = if summary.direct {
+        phase::green()
+    } else {
+        phase::warning()
+    };
+    simple_command_summary(
+        ui,
+        if summary.direct {
+            Icon::CheckCircle
+        } else {
+            Icon::Info
+        },
+        if summary.direct {
+            "WinHTTP direct access"
+        } else {
+            "WinHTTP proxy configured"
+        },
+        if summary.direct {
+            "System web requests are not using a WinHTTP proxy."
+        } else {
+            summary.detail.as_str()
+        },
+        color,
+        width,
+    );
+}
+
+fn dns_flush_succeeded(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("successfully flushed"))
+}
+
+fn simple_command_summary(
+    ui: &mut Ui,
+    icon: Icon,
+    title: &str,
+    detail: &str,
+    color: Color32,
+    width: f32,
+) {
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.07))
+        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.22)))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 20.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                draw_icon(ui, icon, Vec2::splat(14.0), color);
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(title)
+                        .font(FontId::proportional(11.0))
+                        .strong()
+                        .color(phase::text()),
+                );
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(detail)
+                        .font(FontId::proportional(10.2))
+                        .color(phase::text_secondary()),
+                )
+                .wrap(true),
+            );
+        });
+}
+
+fn command_text_block(ui: &mut Ui, title: &str, lines: &[String], width: f32, color: Color32) {
+    if lines.is_empty() {
+        return;
+    }
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .font(FontId::proportional(9.3))
+            .strong()
+            .color(phase::text_muted()),
+    );
+    ui.add_space(3.0);
+    let preview = lines
+        .iter()
+        .take(5)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.05))
+        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.16)))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 16.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(preview)
+                        .font(FontId::monospace(9.7))
+                        .color(color),
+                )
+                .wrap(true),
+            );
+            if lines.len() > 5 {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("+{} more lines in copied log", lines.len() - 5))
+                        .font(FontId::proportional(9.6))
+                        .color(phase::text_muted()),
+                );
+            }
+        });
+}
+
+fn clean_content_type(value: &str) -> &str {
+    value.split(';').next().unwrap_or(value).trim()
+}
+
+#[derive(Clone)]
+struct DiagnosticSnapshot {
+    summary: String,
+    checked_at: Option<String>,
+    checks: Vec<DiagnosticSnapshotCheck>,
+}
+
+#[derive(Clone)]
+struct DiagnosticSnapshotCheck {
+    status: String,
+    title: String,
+    elapsed: Option<String>,
+    detail: String,
+    raw_error: Option<String>,
+    next_step: Option<String>,
+}
+
+fn parse_diagnostic_snapshot(output: &str) -> Option<DiagnosticSnapshot> {
+    let mut lines = output.lines();
+    let first = lines.next()?.trim();
+    let summary = first
+        .strip_prefix("Phase connection diagnostics:")?
+        .trim()
+        .to_owned();
+
+    let mut checked_at = None;
+    let mut checks = Vec::new();
+    let mut current: Option<DiagnosticSnapshotCheck> = None;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Checked at Unix time:") {
+            checked_at = Some(value.trim().to_owned());
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("- [") {
+            if let Some(check) = current.take() {
+                checks.push(check);
+            }
+            let Some((status, body)) = rest.split_once("] ") else {
+                continue;
+            };
+            let Some((title_part, detail)) = body.split_once(": ") else {
+                continue;
+            };
+            let (title, elapsed) = split_title_elapsed(title_part);
+            current = Some(DiagnosticSnapshotCheck {
+                status: status.trim().to_owned(),
+                title,
+                elapsed,
+                detail: detail.trim().to_owned(),
+                raw_error: None,
+                next_step: None,
+            });
+            continue;
+        }
+        if let Some(check) = current.as_mut() {
+            if let Some(value) = trimmed.strip_prefix("Raw error:") {
+                check.raw_error = Some(value.trim().to_owned());
+            } else if let Some(value) = trimmed.strip_prefix("Try:") {
+                check.next_step = Some(value.trim().to_owned());
+            }
+        }
+    }
+
+    if let Some(check) = current {
+        checks.push(check);
+    }
+
+    Some(DiagnosticSnapshot {
+        summary,
+        checked_at,
+        checks,
+    })
+}
+
+fn split_title_elapsed(value: &str) -> (String, Option<String>) {
+    let value = value.trim();
+    if let Some(open) = value.rfind(" (")
+        && value.ends_with(')')
+    {
+        return (
+            value[..open].trim().to_owned(),
+            Some(value[open + 2..value.len() - 1].trim().to_owned()),
+        );
+    }
+    (value.to_owned(), None)
+}
+
+fn diagnostics_snapshot_panel(ui: &mut Ui, snapshot: &DiagnosticSnapshot, width: f32) {
+    let status_color = snapshot_color(snapshot);
+    egui::Frame::none()
+        .fill(input_fill())
+        .stroke(Stroke::new(1.0, color_with_alpha(status_color, 0.42)))
+        .rounding(Rounding::same(6.0))
+        .inner_margin(Margin::symmetric(10.0, 9.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 20.0).max(220.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal(|ui| {
+                draw_icon(ui, Icon::Search, Vec2::splat(14.0), status_color);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.set_min_width((inner_width - 26.0).max(180.0));
+                    ui.set_max_width((inner_width - 26.0).max(180.0));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("Diagnostic snapshot")
+                                .font(FontId::proportional(10.8))
+                                .strong()
+                                .color(phase::text()),
+                        );
+                        if let Some(checked_at) = &snapshot.checked_at {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(format!("Unix {checked_at}"))
+                                    .font(FontId::monospace(9.3))
+                                    .color(phase::text_muted()),
+                            );
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&snapshot.summary)
+                                .font(FontId::proportional(10.5))
+                                .color(phase::text_secondary()),
+                        )
+                        .wrap(true),
+                    );
+                });
+            });
+
+            ui.add_space(8.0);
+            for check in &snapshot.checks {
+                diagnostics_snapshot_row(ui, check, inner_width);
+                ui.add_space(6.0);
+            }
+        });
+}
+
+fn diagnostics_snapshot_row(ui: &mut Ui, check: &DiagnosticSnapshotCheck, width: f32) {
+    let color = status_label_color(&check.status);
+    egui::Frame::none()
+        .fill(color_with_alpha(color, 0.055))
+        .stroke(Stroke::new(1.0, color_with_alpha(color, 0.22)))
+        .rounding(Rounding::same(5.0))
+        .inner_margin(Margin::symmetric(8.0, 7.0))
+        .show(ui, |ui| {
+            let inner_width = (width - 16.0).max(180.0);
+            ui.set_min_width(inner_width);
+            ui.set_max_width(inner_width);
+            ui.horizontal_wrapped(|ui| {
+                draw_icon(
+                    ui,
+                    if check.status == "Good" {
+                        Icon::CheckCircle
+                    } else {
+                        Icon::Info
+                    },
+                    Vec2::splat(13.0),
+                    color,
+                );
+                ui.add_space(5.0);
+                status_indicator(ui, &check.status, color);
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new(&check.title)
+                        .font(FontId::proportional(10.8))
+                        .strong()
+                        .color(phase::text()),
+                );
+                if let Some(elapsed) = &check.elapsed {
+                    ui.add_space(5.0);
+                    ui.label(
+                        RichText::new(elapsed)
+                            .font(FontId::monospace(9.2))
+                            .color(phase::text_muted()),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&check.detail)
+                        .font(FontId::proportional(10.4))
+                        .color(phase::text_secondary()),
+                )
+                .wrap(true),
+            );
+            if let Some(next_step) = &check.next_step {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Try: {next_step}"))
+                            .font(FontId::proportional(10.0))
+                            .color(color),
+                    )
+                    .wrap(true),
+                );
+            }
+            if let Some(raw_error) = &check.raw_error {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(raw_error)
+                            .font(FontId::monospace(9.4))
+                            .color(phase::warning()),
+                    )
+                    .wrap(true),
+                );
+            }
+        });
+}
+
+fn snapshot_color(snapshot: &DiagnosticSnapshot) -> Color32 {
+    if snapshot
+        .checks
+        .iter()
+        .any(|check| check.status == "Problem")
+    {
+        phase::red()
+    } else if snapshot
+        .checks
+        .iter()
+        .any(|check| check.status == "Check" || check.status == "Warning")
+    {
+        phase::warning()
+    } else {
+        phase::green()
+    }
+}
+
+fn status_label_color(label: &str) -> Color32 {
+    match label {
+        "Good" => phase::green(),
+        "Check" | "Warning" => phase::warning(),
+        "Problem" | "Error" => phase::red(),
+        _ => phase::text_muted(),
+    }
+}
+
+fn diagnostics_likely_cause_card(ui: &mut Ui, report: &diagnostics::RepairReport) {
+    if report.likely_cause.trim().is_empty() {
+        return;
+    }
+    let color = match report.overall_status() {
+        diagnostics::DiagnosticStatus::Good => phase::green(),
+        diagnostics::DiagnosticStatus::Warning => phase::warning(),
+        diagnostics::DiagnosticStatus::Problem => phase::red(),
+    };
+
+    ui.separator();
+    ui.add_space(GAP_S);
+    card_header(
+        ui,
+        Icon::Info,
+        color,
+        "Most likely cause",
+        &report.likely_cause,
+        None,
+    );
+}
+
+fn animated_diagnostics_bar(ui: &mut Ui, width: f32, pulse: f32) {
+    let width = width.max(96.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 5.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(999.0), input_fill());
+    let fill = Rect::from_min_max(
+        rect.left_top(),
+        Pos2::new(
+            rect.left() + rect.width() * (0.24 + 0.52 * pulse),
+            rect.bottom(),
+        ),
+    );
+    painter.rect_filled(
+        fill,
+        Rounding::same(999.0),
+        color_with_alpha(phase::accent(), 0.45 + 0.45 * pulse),
+    );
+}
+
+fn parse_f64_or(text: &str, fallback: f64) -> f64 {
+    text.trim().parse::<f64>().unwrap_or(fallback)
+}
+
+fn parse_i64_or(text: &str, fallback: i64) -> i64 {
+    text.trim().parse::<i64>().unwrap_or(fallback)
+}
+
+fn format_seconds(value: f64) -> String {
+    if value.fract().abs() < 0.0005 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.3}")
+    }
+}
+
+fn reference_summary(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let source = object
+        .get("Source")
+        .or_else(|| object.get("source"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let title = object
+        .get("Title")
+        .or_else(|| object.get("title"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("Video Reference");
+    if source.trim().is_empty() {
+        return Some("No video reference linked.".to_owned());
+    }
+    Some(format!("{title}: {source}"))
+}
+
+fn phase_text(phase: InstallPhase) -> &'static str {
+    let _ = phase;
+    match phase {
+        InstallPhase::Idle => "Ready",
+        InstallPhase::Checking => "Checking...",
+        InstallPhase::Ready => "Update ready",
+        InstallPhase::Downloading => "Downloading...",
+        InstallPhase::Installing => "Installing...",
+        InstallPhase::Complete => "Complete",
+        InstallPhase::Error => "Needs location",
+    }
+}
+
+fn progress_for(elapsed: Duration, total: Duration) -> f32 {
+    (elapsed.as_secs_f32() / total.as_secs_f32()).min(1.0)
+}
+
+fn install_id() -> String {
+    let fallback = || uuid::Uuid::new_v4().to_string();
+    let Some(mut dir) = dirs::config_dir() else {
+        return fallback();
+    };
+
+    dir.push("Phase");
+    dir.push("Phase Animator Installer");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return fallback();
+    }
+
+    // Stable local handle so reconnects and installs can be matched to this app.
+    let path = dir.join("install-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let id = existing.trim();
+        if uuid::Uuid::parse_str(id).is_ok() {
+            return id.to_owned();
+        }
+    }
+
+    let id = fallback();
+    let _ = std::fs::write(path, &id);
+    id
+}
+
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WindowState {
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
+}
+
+fn window_state_path() -> Option<PathBuf> {
+    account_cache_path().map(|path| path.with_file_name("window.json"))
+}
+
+fn load_window_state() -> Option<WindowState> {
+    serde_json::from_str(&std::fs::read_to_string(window_state_path()?).ok()?).ok()
+}
+
+fn save_window_state(state: &WindowState) {
+    if let (Some(path), Ok(text)) = (window_state_path(), serde_json::to_string(state)) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+fn account_cache_path() -> Option<PathBuf> {
+    let mut dir = dirs::config_dir()?;
+    dir.push("Phase");
+    dir.push("Phase Animator Installer");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    Some(dir.join("account-cache.json"))
+}
+
+fn load_account_cache() -> Option<AccountCache> {
+    let path = account_cache_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_account_cache(cache: &AccountCache) {
+    let Some(path) = account_cache_path() else {
+        return;
+    };
+    if cache.plugin_token.is_none()
+        && cache.linked_user.is_none()
+        && cache.roblox_user_id.trim().is_empty()
+        && cache.activation.is_none()
+        && cache.selected_theme.is_none()
+    {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Ok(text) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+#[derive(Default)]
+struct PluginSettingsResetSummary {
+    files_changed: usize,
+    removed_keys: usize,
+}
+
+#[derive(Default)]
+struct PluginSettingsInventory {
+    files_with_phase_keys: usize,
+    theme_keys: usize,
+    keybind_keys: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginSettingsCategory {
+    Themes,
+    Keybinds,
+}
+
+fn reset_phase_plugin_settings(
+    categories: &[PluginSettingsCategory],
+) -> Result<PluginSettingsResetSummary, String> {
+    let paths = discover_roblox_plugin_settings_files();
+    let mut summary = PluginSettingsResetSummary::default();
+
+    for path in paths {
+        let text = std::fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "Could not read Roblox plugin settings at {}: {error}",
+                compact_path(&path, 44)
+            )
+        })?;
+        let mut value = serde_json::from_str::<serde_json::Value>(&text).map_err(|error| {
+            format!(
+                "Could not parse Roblox plugin settings at {}: {error}",
+                compact_path(&path, 44)
+            )
+        })?;
+
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+
+        let keys = object
+            .keys()
+            .filter(|key| phase_setting_matches_any_category(key, categories))
+            .cloned()
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            continue;
+        }
+
+        let mut selected = serde_json::Map::new();
+        for key in &keys {
+            if let Some(value) = object.get(key) {
+                selected.insert(key.clone(), value.clone());
+            }
+        }
+
+        backup_roblox_settings_file(&path, &text, &selected)?;
+        let removed = keys.len();
+        for key in keys {
+            object.remove(&key);
+        }
+
+        let updated = serde_json::to_string_pretty(&value).map_err(|error| {
+            format!(
+                "Could not serialize Roblox plugin settings at {}: {error}",
+                compact_path(&path, 44)
+            )
+        })?;
+        std::fs::write(&path, updated).map_err(|error| {
+            format!(
+                "Could not update Roblox plugin settings at {}: {error}",
+                compact_path(&path, 44)
+            )
+        })?;
+        summary.files_changed += 1;
+        summary.removed_keys += removed;
+    }
+
+    Ok(summary)
+}
+
+fn phase_plugin_settings_inventory() -> PluginSettingsInventory {
+    let mut inventory = PluginSettingsInventory::default();
+
+    for path in discover_roblox_plugin_settings_files() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+
+        let mut file_has_phase_keys = false;
+        for key in object.keys() {
+            if !key.starts_with("PhaseAnimator") {
+                continue;
+            }
+            file_has_phase_keys = true;
+            if phase_setting_matches_category(key, PluginSettingsCategory::Themes) {
+                inventory.theme_keys += 1;
+            }
+            if phase_setting_matches_category(key, PluginSettingsCategory::Keybinds) {
+                inventory.keybind_keys += 1;
+            }
+        }
+        if file_has_phase_keys {
+            inventory.files_with_phase_keys += 1;
+        }
+    }
+
+    inventory
+}
+
+fn phase_setting_matches_any_category(key: &str, categories: &[PluginSettingsCategory]) -> bool {
+    categories
+        .iter()
+        .any(|category| phase_setting_matches_category(key, *category))
+}
+
+fn phase_setting_matches_category(key: &str, category: PluginSettingsCategory) -> bool {
+    match category {
+        PluginSettingsCategory::Themes => matches!(
+            key,
+            "PhaseAnimatorThemeV2"
+                | "PhaseAnimatorTheme"
+                | "PhaseAnimatorThemeName"
+                | "PhaseAnimatorThemePresets"
+                | "PhaseAnimatorFontProfile"
+                | "PhaseAnimatorGlassSettings"
+                | "PhaseAnimatorMotionSettings"
+                | "PhaseAnimatorTimelineSettings"
+                | "PhaseAnimator_ViewTransitionProfile_v1"
+        ),
+        PluginSettingsCategory::Keybinds => key == "PhaseAnimator_Keybinds_V1",
+    }
+}
+
+fn discover_roblox_plugin_settings_files() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            collect_roblox_plugin_settings_files(
+                &PathBuf::from(local_app_data).join("Roblox"),
+                &mut paths,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(data_dir) = dirs::data_dir() {
+            collect_roblox_plugin_settings_files(&data_dir.join("Roblox"), &mut paths);
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Some(data_dir) = dirs::data_dir() {
+            collect_roblox_plugin_settings_files(&data_dir.join("Roblox"), &mut paths);
+        }
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn collect_roblox_plugin_settings_files(root: &Path, paths: &mut Vec<PathBuf>) {
+    let Ok(users) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for user in users.flatten() {
+        let Ok(file_type) = user.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let user_path = user.path();
+        let user_name = user.file_name().to_string_lossy().to_string();
+        if !user_name.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+
+        let installed_plugins = user_path.join("InstalledPlugins");
+        let Ok(plugins) = std::fs::read_dir(installed_plugins) else {
+            continue;
+        };
+        for plugin_dir in plugins.flatten() {
+            let settings_path = plugin_dir.path().join("settings.json");
+            if settings_path.is_file() && settings_file_mentions_phase_animator(&settings_path) {
+                paths.push(settings_path);
+            }
+        }
+    }
+}
+
+fn settings_file_mentions_phase_animator(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| text.contains("\"PhaseAnimator"))
+        .unwrap_or(false)
+}
+
+fn backup_roblox_settings_file(
+    path: &Path,
+    contents: &str,
+    selected: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let timestamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let full_backup_path =
+        path.with_file_name(format!("settings.phase-full-backup-{timestamp}.json"));
+    std::fs::write(&full_backup_path, contents).map_err(|error| {
+        format!(
+            "Could not back up Roblox plugin settings to {}: {error}",
+            compact_path(&full_backup_path, 44)
+        )
+    })?;
+
+    let selected_backup_path =
+        path.with_file_name(format!("settings.phase-selected-backup-{timestamp}.json"));
+    let backup = json!({
+        "sourcePath": path.to_string_lossy(),
+        "backedUpAtUnix": timestamp,
+        "settings": selected,
+    });
+    let selected_text = serde_json::to_string_pretty(&backup)
+        .map_err(|error| format!("Could not prepare selected settings backup: {error}"))?;
+    std::fs::write(&selected_backup_path, selected_text).map_err(|error| {
+        format!(
+            "Could not back up selected Phase settings to {}: {error}",
+            compact_path(&selected_backup_path, 44)
+        )
+    })?;
+
+    Ok(())
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("Could not read installed plugin: {error}"))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)
+            .map_err(|error| format!("Could not read installed plugin: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn display_linked_user(user: &verification::LinkedUser) -> String {
+    user.display_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&user.username)
+        .to_owned()
+}
+
+fn normalize_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn compact_path(path: &std::path::Path, max_chars: usize) -> String {
+    let text = path.to_string_lossy().to_string();
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("...{tail}")
+}
+
+fn initials(text: &str) -> String {
+    let mut letters = text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.chars().next())
+        .take(2)
+        .collect::<String>();
+    if letters.is_empty() {
+        letters = "?".to_owned();
+    }
+    letters.to_uppercase()
+}
+
+fn human_size(bytes: u64) -> String {
+    let mb = bytes as f64 / 1024.0 / 1024.0;
+    if mb >= 1.0 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+fn parse_theme_background_image_id(theme_code: &str) -> Option<String> {
+    if let Some(image_id) = parse_theme_background_image_id_from_json(theme_code) {
+        return Some(image_id);
+    }
+
+    theme_code.split('|').find_map(normalize_roblox_image_id)
+}
+
+fn parse_theme_background_image_id_from_json(theme_code: &str) -> Option<String> {
+    let payload = theme_code.split('|').nth(2)?.trim();
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    value
+        .get("background")
+        .and_then(|background| background.get("imageId"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_roblox_image_id)
+}
+
+fn normalize_roblox_image_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value.strip_prefix('i').unwrap_or(value).trim();
+    let value = value.strip_prefix("rbxassetid://").unwrap_or(value).trim();
+    if value.chars().all(|ch| ch.is_ascii_digit()) && !value.is_empty() {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn display_theme_owner(owner: &verification::PhaseThemeOwner) -> String {
+    owner
+        .display_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            if owner.username.trim().is_empty() {
+                None
+            } else {
+                Some(owner.username.as_str())
+            }
+        })
+        .unwrap_or("Phase creator")
+        .to_owned()
+}
+
+fn theme_matches_search(asset: &verification::PhaseThemeAsset, search: &str) -> bool {
+    let search = search.trim().to_ascii_lowercase();
+    if search.is_empty() {
+        return true;
+    }
+
+    let owner = asset
+        .owner
+        .as_ref()
+        .map(display_theme_owner)
+        .unwrap_or_default();
+    let tags = asset.tags.join(" ");
+    let haystack =
+        format!("{} {} {} {}", asset.title, asset.description, owner, tags).to_ascii_lowercase();
+    haystack.contains(&search)
+}
+
+fn paint_theme_texture(
+    painter: &egui::Painter,
+    rect: Rect,
+    texture: &TextureHandle,
+    mode: ThemeBackgroundMode,
+    opacity: f32,
+) {
+    if opacity <= 0.001 {
+        return;
+    }
+    let (image_rect, uv_rect) = theme_background_layout(rect, texture.size_vec2(), mode);
+    painter.image(
+        texture.id(),
+        image_rect,
+        uv_rect,
+        Color32::from_white_alpha((255.0 * opacity.clamp(0.0, 1.0)).round() as u8),
+    );
+}
+
+fn theme_background_layout(
+    rect: Rect,
+    texture_size: Vec2,
+    mode: ThemeBackgroundMode,
+) -> (Rect, Rect) {
+    let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    let image_w = texture_size.x.max(1.0);
+    let image_h = texture_size.y.max(1.0);
+    let image_aspect = image_w / image_h;
+    let rect_aspect = rect.width().max(1.0) / rect.height().max(1.0);
+
+    match mode {
+        ThemeBackgroundMode::Stretch => (rect, full_uv),
+        ThemeBackgroundMode::Fit => {
+            let size = if image_aspect > rect_aspect {
+                Vec2::new(rect.width(), rect.width() / image_aspect)
+            } else {
+                Vec2::new(rect.height() * image_aspect, rect.height())
+            };
+            (Rect::from_center_size(rect.center(), size), full_uv)
+        }
+        ThemeBackgroundMode::Crop => {
+            let uv = if image_aspect > rect_aspect {
+                let visible_width = rect_aspect / image_aspect;
+                let inset = (1.0 - visible_width) * 0.5;
+                Rect::from_min_max(Pos2::new(inset, 0.0), Pos2::new(1.0 - inset, 1.0))
+            } else {
+                let visible_height = image_aspect / rect_aspect;
+                let inset = (1.0 - visible_height) * 0.5;
+                Rect::from_min_max(Pos2::new(0.0, inset), Pos2::new(1.0, 1.0 - inset))
+            };
+            (rect, uv)
+        }
+    }
+}
+
+/// Mean color of an image, sampled on a coarse grid.
+fn average_color(image: &ColorImage) -> Color32 {
+    let [width, height] = image.size;
+    let step = ((width * height) as f32 / 4096.0).sqrt().max(1.0) as usize;
+    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for y in (0..height).step_by(step) {
+        for x in (0..width).step_by(step) {
+            let pixel = image[(x, y)];
+            r += pixel.r() as u64;
+            g += pixel.g() as u64;
+            b += pixel.b() as u64;
+            n += 1;
+        }
+    }
+    let n = n.max(1);
+    Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+fn ease_out_back(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0) - 1.0;
+    1.0 + 2.70158 * t.powi(3) + 1.70158 * t.powi(2)
+}
+
+fn color_with_alpha(color: Color32, alpha: f32) -> Color32 {
+    let alpha = (color.a() as f32 * alpha.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |left: u8, right: u8| left as f32 + (right as f32 - left as f32) * t;
+    Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()).round() as u8,
+        mix(a.g(), b.g()).round() as u8,
+        mix(a.b(), b.b()).round() as u8,
+        mix(a.a(), b.a()).round() as u8,
+    )
+}
+
+fn icon_button_text(
+    icon: Icon,
+    text: &str,
+    icon_color: Option<Color32>,
+    text_size: f32,
+    icon_size: f32,
+    gap: f32,
+) -> WidgetText {
+    let mut job = egui::text::LayoutJob {
+        break_on_newline: false,
+        first_row_min_height: icon_size.max(text_size),
+        ..Default::default()
+    };
+    job.append(
+        icon.glyph(),
+        0.0,
+        TextFormat {
+            font_id: FontId::new(icon_size, FontFamily::Name(PHOSPHOR_FONT.into())),
+            color: icon_color.unwrap_or(Color32::PLACEHOLDER),
+            valign: Align::Center,
+            ..Default::default()
+        },
+    );
+    job.append(
+        text,
+        gap,
+        TextFormat {
+            font_id: type_display(text_size),
+            color: Color32::PLACEHOLDER,
+            valign: Align::Center,
+            ..Default::default()
+        },
+    );
+    WidgetText::from(job)
+}
+
+#[derive(Clone, Copy)]
+struct PhaseButtonVisuals {
+    fill: Color32,
+    hover_fill: Color32,
+    active_fill: Color32,
+    stroke: Stroke,
+    hover_stroke: Stroke,
+    active_stroke: Stroke,
+    text_color: Color32,
+}
+
+fn apply_button_visuals(ui: &mut Ui, visuals: PhaseButtonVisuals) {
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    widgets.noninteractive.weak_bg_fill = visuals.fill;
+    widgets.noninteractive.bg_stroke = visuals.stroke;
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0, visuals.text_color);
+
+    widgets.inactive.weak_bg_fill = visuals.fill;
+    widgets.inactive.bg_stroke = visuals.stroke;
+    widgets.inactive.fg_stroke = Stroke::new(1.0, visuals.text_color);
+
+    widgets.hovered.weak_bg_fill = visuals.hover_fill;
+    widgets.hovered.bg_stroke = visuals.hover_stroke;
+    widgets.hovered.fg_stroke = Stroke::new(1.0, visuals.text_color);
+
+    widgets.active.weak_bg_fill = visuals.active_fill;
+    widgets.active.bg_stroke = visuals.active_stroke;
+    widgets.active.fg_stroke = Stroke::new(1.0, visuals.text_color);
+}
+
+fn primary_button(ui: &mut Ui, icon: Icon, text: &str, size: Vec2) -> egui::Response {
+    let opacity = if ui.is_enabled() { 1.0 } else { 0.45 };
+    let text_color = color_with_alpha(phase::text_on_accent(), opacity);
+    let visuals = PhaseButtonVisuals {
+        fill: color_with_alpha(phase::accent(), opacity),
+        hover_fill: color_with_alpha(phase::accent_hover(), opacity),
+        active_fill: color_with_alpha(phase::accent_dim(), opacity),
+        stroke: Stroke::new(
+            1.0,
+            color_with_alpha(phase::text_on_accent(), 0.85 * opacity),
+        ),
+        hover_stroke: Stroke::new(1.0, color_with_alpha(phase::text_on_accent(), opacity)),
+        active_stroke: Stroke::new(
+            1.0,
+            color_with_alpha(phase::text_on_accent(), 0.75 * opacity),
+        ),
+        text_color,
+    };
+
+    let response = ui
+        .scope(|ui| {
+            apply_button_visuals(ui, visuals);
+            ui.add_sized(
+                size,
+                Button::new(icon_button_text(icon, text, None, 13.0, 18.0, 8.0))
+                    .frame(true)
+                    .min_size(size)
+                    .rounding(Rounding::same(CONTROL_ROUNDING))
+                    .wrap(false),
+            )
+        })
+        .inner;
+
+    if response.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn secondary_button(ui: &mut Ui, icon: Icon, text: &str, size: Vec2) -> egui::Response {
+    let opacity = if ui.is_enabled() { 1.0 } else { 0.45 };
+    let visuals = PhaseButtonVisuals {
+        fill: color_with_alpha(phase::input(), 0.38 * opacity),
+        hover_fill: color_with_alpha(phase::surface_hover(), 0.72 * opacity),
+        active_fill: color_with_alpha(phase::surface_active(), 0.78 * opacity),
+        stroke: Stroke::new(1.0, color_with_alpha(phase::line(), 0.58 * opacity)),
+        hover_stroke: Stroke::new(1.0, color_with_alpha(phase::line(), opacity)),
+        active_stroke: Stroke::new(1.0, color_with_alpha(phase::line(), opacity)),
+        text_color: color_with_alpha(phase::text_secondary(), opacity),
+    };
+
+    let response = ui
+        .scope(|ui| {
+            apply_button_visuals(ui, visuals);
+            ui.add_sized(
+                size,
+                Button::new(icon_button_text(icon, text, None, 14.0, 15.0, 8.0))
+                    .frame(true)
+                    .min_size(size)
+                    .rounding(Rounding::same(CONTROL_ROUNDING))
+                    .wrap(false),
+            )
+        })
+        .inner;
+    if response.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn danger_button(ui: &mut Ui, icon: Icon, text: &str, size: Vec2) -> egui::Response {
+    let opacity = if ui.is_enabled() { 1.0 } else { 0.45 };
+    let visuals = PhaseButtonVisuals {
+        fill: color_with_alpha(lerp_color(phase::input(), phase::red(), 0.08), opacity),
+        hover_fill: color_with_alpha(lerp_color(phase::input(), phase::red(), 0.15), opacity),
+        active_fill: color_with_alpha(lerp_color(phase::input(), phase::red(), 0.22), opacity),
+        stroke: Stroke::new(1.0, color_with_alpha(phase::red(), 0.42 * opacity)),
+        hover_stroke: Stroke::new(1.0, color_with_alpha(phase::red(), 0.82 * opacity)),
+        active_stroke: Stroke::new(1.0, color_with_alpha(phase::red(), opacity)),
+        text_color: color_with_alpha(phase::red(), opacity),
+    };
+    let response = ui
+        .scope(|ui| {
+            apply_button_visuals(ui, visuals);
+            ui.add_sized(
+                size,
+                Button::new(icon_button_text(icon, text, None, 14.0, 15.0, 8.0))
+                    .frame(true)
+                    .min_size(size)
+                    .rounding(Rounding::same(CONTROL_ROUNDING))
+                    .wrap(false),
+            )
+        })
+        .inner;
+    if response.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+mod phase {
+    use eframe::egui::Color32;
+    use std::sync::{OnceLock, RwLock};
+
+    #[derive(Clone, Copy)]
+    pub struct Palette {
+        background: Color32,
+        surface: Color32,
+        surface_hover: Color32,
+        surface_active: Color32,
+        input: Color32,
+        line: Color32,
+        accent: Color32,
+        accent_hover: Color32,
+        accent_dim: Color32,
+        blue: Color32,
+        green: Color32,
+        red: Color32,
+        warning: Color32,
+        text: Color32,
+        text_secondary: Color32,
+        text_muted: Color32,
+        text_on_accent: Color32,
+    }
+
+    static PALETTE: OnceLock<RwLock<Palette>> = OnceLock::new();
+
+    pub fn reset_palette() {
+        set_palette(default_palette());
+    }
+
+    pub fn set_palette(palette: Palette) {
+        let lock = PALETTE.get_or_init(|| RwLock::new(default_palette()));
+        if let Ok(mut current) = lock.write() {
+            *current = palette;
+        }
+    }
+
+    pub fn snapshot() -> Palette {
+        current()
+    }
+
+    pub fn blend(from: Palette, to: Palette, t: f32) -> Palette {
+        let mix = |a: Color32, b: Color32| {
+            let t = t.clamp(0.0, 1.0);
+            let channel = |left: u8, right: u8| {
+                (left as f32 + (right as f32 - left as f32) * t).round() as u8
+            };
+            Color32::from_rgba_unmultiplied(
+                channel(a.r(), b.r()),
+                channel(a.g(), b.g()),
+                channel(a.b(), b.b()),
+                channel(a.a(), b.a()),
+            )
+        };
+
+        Palette {
+            background: mix(from.background, to.background),
+            surface: mix(from.surface, to.surface),
+            surface_hover: mix(from.surface_hover, to.surface_hover),
+            surface_active: mix(from.surface_active, to.surface_active),
+            input: mix(from.input, to.input),
+            line: mix(from.line, to.line),
+            accent: mix(from.accent, to.accent),
+            accent_hover: mix(from.accent_hover, to.accent_hover),
+            accent_dim: mix(from.accent_dim, to.accent_dim),
+            blue: mix(from.blue, to.blue),
+            green: mix(from.green, to.green),
+            red: mix(from.red, to.red),
+            warning: mix(from.warning, to.warning),
+            text: mix(from.text, to.text),
+            text_secondary: mix(from.text_secondary, to.text_secondary),
+            text_muted: mix(from.text_muted, to.text_muted),
+            text_on_accent: mix(from.text_on_accent, to.text_on_accent),
+        }
+    }
+
+    pub fn palette_from_theme_code(code: &str) -> Option<Palette> {
+        if let Some(palette) = palette_from_theme_json(code) {
+            return Some(palette);
+        }
+
+        let colors = code
+            .split('|')
+            .nth(2)?
+            .split('.')
+            .filter_map(hex_color)
+            .collect::<Vec<_>>();
+        if colors.len() < 25 {
+            return None;
+        }
+
+        Some(Palette {
+            background: colors[0],
+            surface: colors[5],
+            surface_hover: colors[6],
+            surface_active: colors[7],
+            input: colors[23],
+            line: colors[20],
+            accent: colors[8],
+            accent_hover: colors[9],
+            accent_dim: colors[11],
+            blue: colors[12],
+            green: colors[13],
+            red: colors[14],
+            warning: colors[15],
+            text: colors[16],
+            text_secondary: colors[17],
+            text_muted: colors[18],
+            text_on_accent: colors[19],
+        })
+    }
+
+    fn palette_from_theme_json(code: &str) -> Option<Palette> {
+        let payload = code.split('|').nth(2)?.trim();
+        if !payload.starts_with('{') {
+            return None;
+        }
+
+        let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+        let palette = value.get("palette")?.as_object()?;
+
+        Some(Palette {
+            background: color_field(palette, "Background")?,
+            surface: color_field(palette, "PanelBackground")
+                .or_else(|| color_field(palette, "Surface"))?,
+            surface_hover: color_field(palette, "SurfaceHover")?,
+            surface_active: color_field(palette, "SurfaceActive")?,
+            input: color_field(palette, "Input")?,
+            line: color_field(palette, "Line")
+                .or_else(|| color_field(palette, "Separator"))
+                .or_else(|| color_field(palette, "PanelBorder"))?,
+            accent: color_field(palette, "Accent")?,
+            accent_hover: color_field(palette, "AccentHover")?,
+            accent_dim: color_field(palette, "AccentDim")
+                .or_else(|| color_field(palette, "AccentMuted"))?,
+            blue: color_field(palette, "Blue")?,
+            green: color_field(palette, "Green")?,
+            red: color_field(palette, "Red")?,
+            warning: color_field(palette, "Warning")?,
+            text: color_field(palette, "TextPrimary").or_else(|| color_field(palette, "Text"))?,
+            text_secondary: color_field(palette, "TextSecondary")?,
+            text_muted: color_field(palette, "TextMuted")
+                .or_else(|| color_field(palette, "TextDim"))?,
+            text_on_accent: color_field(palette, "TextOnAccent")?,
+        })
+    }
+
+    pub fn background() -> Color32 {
+        current().background
+    }
+    pub fn surface() -> Color32 {
+        current().surface
+    }
+    pub fn surface_hover() -> Color32 {
+        current().surface_hover
+    }
+    pub fn surface_active() -> Color32 {
+        current().surface_active
+    }
+    pub fn input() -> Color32 {
+        current().input
+    }
+    pub fn line() -> Color32 {
+        current().line
+    }
+    pub fn accent() -> Color32 {
+        current().accent
+    }
+    pub fn accent_hover() -> Color32 {
+        current().accent_hover
+    }
+    pub fn accent_dim() -> Color32 {
+        current().accent_dim
+    }
+    pub fn blue() -> Color32 {
+        current().blue
+    }
+    pub fn green() -> Color32 {
+        current().green
+    }
+    pub fn red() -> Color32 {
+        current().red
+    }
+    pub fn warning() -> Color32 {
+        current().warning
+    }
+    pub fn text() -> Color32 {
+        current().text
+    }
+    pub fn text_secondary() -> Color32 {
+        current().text_secondary
+    }
+    pub fn text_muted() -> Color32 {
+        current().text_muted
+    }
+    pub fn text_on_accent() -> Color32 {
+        current().text_on_accent
+    }
+
+    fn current() -> Palette {
+        let lock = PALETTE.get_or_init(|| RwLock::new(default_palette()));
+        lock.read()
+            .map(|palette| *palette)
+            .unwrap_or_else(|_| default_palette())
+    }
+
+    fn default_palette() -> Palette {
+        Palette {
+            background: Color32::from_rgb(18, 11, 22),
+            surface: Color32::from_rgb(43, 24, 50),
+            surface_hover: Color32::from_rgb(65, 34, 72),
+            surface_active: Color32::from_rgb(82, 39, 86),
+            input: Color32::from_rgb(32, 17, 38),
+            line: Color32::from_rgb(91, 57, 96),
+            accent: Color32::from_rgb(229, 72, 201),
+            accent_hover: Color32::from_rgb(244, 107, 216),
+            accent_dim: Color32::from_rgb(126, 47, 119),
+            blue: Color32::from_rgb(147, 197, 253),
+            green: Color32::from_rgb(99, 214, 154),
+            red: Color32::from_rgb(241, 111, 131),
+            warning: Color32::from_rgb(240, 184, 91),
+            text: Color32::from_rgb(255, 248, 254),
+            text_secondary: Color32::from_rgb(217, 199, 218),
+            text_muted: Color32::from_rgb(169, 142, 170),
+            text_on_accent: Color32::from_rgb(39, 16, 37),
+        }
+    }
+
+    fn color_field(
+        palette: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+    ) -> Option<Color32> {
+        palette.get(field)?.as_str().and_then(hex_color)
+    }
+
+    pub fn hex_color(value: &str) -> Option<Color32> {
+        let value = value.trim().trim_start_matches('#');
+        if value.len() != 6 {
+            return None;
+        }
+        let rgb = u32::from_str_radix(value, 16).ok()?;
+        Some(Color32::from_rgb(
+            ((rgb >> 16) & 0xff) as u8,
+            ((rgb >> 8) & 0xff) as u8,
+            (rgb & 0xff) as u8,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PA2_THEME_CODE: &str = r##"PA2|Violet Nebula|{"schemaVersion":2,"name":"Violet Nebula","palette":{"Background":"#080713","PanelBackground":"#21153D","SurfaceHover":"#3A345A","SurfaceActive":"#433B63","Input":"#0D0818","Line":"#5A348A","Accent":"#B985E8","AccentHover":"#E7C7FF","AccentDim":"#7442A8","Blue":"#85C7FF","Green":"#4BC67A","Red":"#E04E4E","Warning":"#E4A940","TextPrimary":"#F3EEFF","TextSecondary":"#D8B6F2","TextMuted":"#A36BD2","TextOnAccent":"#05040A"},"background":{"imageId":"rbxassetid://1161841954"}}"##;
+
+    #[test]
+    fn active_theme_drives_native_controls_and_text() {
+        let palette = phase::palette_from_theme_code(PA2_THEME_CODE).unwrap();
+        phase::set_palette(palette);
+        let ctx = Context::default();
+        configure_style(&ctx);
+        let style = ctx.style();
+        assert_eq!(style.visuals.panel_fill, phase::background());
+        assert_eq!(style.visuals.window_fill, phase::surface());
+        assert_eq!(style.visuals.override_text_color, Some(phase::text()));
+        assert_eq!(style.visuals.widgets.inactive.bg_fill, phase::input());
+        assert_eq!(style.visuals.widgets.inactive.weak_bg_fill, phase::input());
+        assert_eq!(
+            style.visuals.widgets.hovered.weak_bg_fill,
+            phase::surface_hover()
+        );
+        assert_eq!(
+            style.visuals.widgets.active.weak_bg_fill,
+            phase::surface_active()
+        );
+        assert_eq!(
+            style.visuals.widgets.open.weak_bg_fill,
+            phase::surface_active()
+        );
+        assert_eq!(style.visuals.window_stroke.color, phase::line());
+        phase::reset_palette();
+    }
+
+    #[test]
+    fn brand_mark_keeps_default_art_and_recolors_themes() {
+        let original = brand_base().clone();
+        assert_eq!(
+            brand_image(None),
+            original,
+            "default theme keeps the original mark"
+        );
+        let light = Color32::from_rgb(0x60, 0xA5, 0xFA);
+        let dark = Color32::from_rgb(0x1E, 0x2A, 0x78);
+        let themed = brand_image(Some((light, dark, Color32::WHITE)));
+        assert_eq!(themed.dimensions(), original.dimensions());
+        let mut recolored = 0;
+        for (before, after) in original.pixels().zip(themed.pixels()) {
+            assert_eq!(
+                before.0[3], after.0[3],
+                "alpha (the silhouette) is preserved"
+            );
+            let hsva = egui::ecolor::HsvaGamma::from(Color32::from_rgb(
+                before.0[0],
+                before.0[1],
+                before.0[2],
+            ));
+            if before.0[3] == 255 && hsva.s > 0.8 {
+                // Saturated violet/pink pixels land between the theme stops.
+                let [r, _, b, _] = after.0;
+                assert!(b > r, "blue theme recolors the gradient");
+                recolored += 1;
+            }
+        }
+        assert!(recolored > 1000);
+    }
+
+    #[test]
+    fn parses_pa2_theme_json_palette() {
+        assert!(phase::palette_from_theme_code(PA2_THEME_CODE).is_some());
+    }
+
+    #[test]
+    fn parses_pa2_theme_background_image_id() {
+        assert_eq!(
+            parse_theme_background_image_id(PA2_THEME_CODE).as_deref(),
+            Some("1161841954")
+        );
+    }
+
+    #[test]
+    fn parses_legacy_theme_background_image_id() {
+        assert_eq!(
+            parse_theme_background_image_id("PA1|Theme|000000.111111|i96046223266953").as_deref(),
+            Some("96046223266953")
+        );
+    }
+
+    #[test]
+    fn full_body_avatar_decode_preserves_dimensions_and_alpha() {
+        use image::ImageEncoder;
+        use image::codecs::png::PngEncoder;
+
+        let pixels = [
+            255, 0, 0, 255, 0, 255, 0, 96, 0, 0, 255, 32, 255, 255, 255, 0,
+        ];
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&pixels, 2, 2, image::ColorType::Rgba8)
+            .expect("encode test PNG");
+
+        let decoded = decode_full_body_avatar_image(png).expect("decode full-body avatar");
+        assert_eq!(decoded.size, [2, 2]);
+        assert_eq!(decoded.pixels[0].a(), 255);
+        assert_eq!(decoded.pixels[1].a(), 96);
+        assert_eq!(decoded.pixels[2].a(), 32);
+        assert_eq!(decoded.pixels[3].a(), 0);
+    }
+}
