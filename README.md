@@ -102,6 +102,8 @@ must approve Phase Companion once in Privacy & Security.
 
 ## latest update
 
+`0.21.1` lets Early Access testers switch between the stable and Early Access plugin from Home with a single Stable / Early Access control.
+
 `0.21.0` redesigns the companion: a sidebar with Home, Reference, Account and Settings pages; spring-based motion; a cleaner pop-out video player with icon controls; an inspector-style timing panel; Windows 11 Mica; theme-tinted app, taskbar and tray icons; readable status colors on any theme; and remembered window size and position.
 
 `0.20.14` fixes macOS title-bar spacing and theme integration, packages the app

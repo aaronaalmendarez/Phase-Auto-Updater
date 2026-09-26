@@ -89,6 +89,28 @@ impl PhaseInstallerApp {
         {
             state.reference_timing = true;
         }
+        // Harness: `PHASE_UI_EARLY_ACCESS=ready|pending` simulates a tester.
+        if self.screenshot_path.is_some()
+            && let Ok(mode) = std::env::var("PHASE_UI_EARLY_ACCESS")
+        {
+            self.plugin_token
+                .get_or_insert_with(|| "preview".to_owned());
+            let release = (mode == "ready")
+                .then(|| self.release.clone())
+                .flatten()
+                .map(|mut release| {
+                    release.ok = true;
+                    release.blocked = false;
+                    release.download_available = true;
+                    release.access_channel = "early-access".to_owned();
+                    release
+                });
+            self.build_access = Some(verification::CompanionBuildAccess {
+                early_access: true,
+                status: "verified".to_owned(),
+                early_access_release: release,
+            });
+        }
 
         let modal_open = self.shell.install_confirmation.is_some() || self.shell.install_location;
         if !modal_open {
@@ -329,7 +351,7 @@ impl PhaseInstallerApp {
 
         if self.has_early_access() {
             ui.add_space(18.0);
-            self.early_access_card(ui, account_busy);
+            self.channel_card(ui, account_busy);
         }
 
         if !self.activity.is_empty() {
@@ -643,58 +665,60 @@ impl PhaseInstallerApp {
         }
     }
 
-    fn early_access_card(&mut self, ui: &mut Ui, account_busy: bool) {
-        let available = self
+    /// Early Access testers switch between the stable and their personal
+    /// build here. Picking the other side asks for confirmation, then installs.
+    fn channel_card(&mut self, ui: &mut Ui, account_busy: bool) {
+        let installed = self.installed_release.as_ref().map(|r| r.channel);
+        let current = installed.unwrap_or(ReleaseChannel::Stable);
+        let early_ready = self
             .build_access
             .as_ref()
             .and_then(|a| a.downloadable_release())
             .is_some();
-        let mut download = false;
+        let stable_ready = self
+            .release
+            .as_ref()
+            .is_some_and(|r| !r.blocked && r.download_available);
+        let other_ready = match current {
+            ReleaseChannel::Stable => early_ready,
+            ReleaseChannel::EarlyAccess => stable_ready,
+        };
+        let detail = match installed {
+            Some(ReleaseChannel::EarlyAccess) => "You're on your personal Early Access build.",
+            Some(ReleaseChannel::Stable) if early_ready => {
+                "You're on stable. Your Early Access build is ready."
+            }
+            _ if !early_ready => "Your Early Access build isn't ready yet.",
+            _ => "Choose which build to install.",
+        };
+        let can_switch =
+            other_ready && self.selected_folder.is_some() && !self.is_busy() && !account_busy;
+
+        // While confirming, show the choice so cancelling visibly slides back.
+        let mut shown = self.shell.install_confirmation.unwrap_or(current);
+        let mut picked = None;
         kit::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                kit::icon_chip(ui, Icon::Sparkle, phase::blue(), 42.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.horizontal(|ui| {
-                        kit::title(ui, "Early Access", 16.0);
-                    });
-                    kit::note(
+            kit::setting_line(ui, "Plugin channel", detail, 190.0, |ui| {
+                ui.add_enabled_ui(can_switch, |ui| {
+                    if !can_switch {
+                        ui.set_opacity(0.45);
+                    }
+                    if kit::segmented(
                         ui,
-                        if available {
-                            "Your personal tester build is ready. It replaces the stable plugin, and a backup is kept."
-                        } else {
-                            "Access verified. Your build will appear here when Early Access opens."
-                        },
-                    );
+                        "plugin-channel",
+                        &[
+                            (ReleaseChannel::Stable, "Stable"),
+                            (ReleaseChannel::EarlyAccess, "Early Access"),
+                        ],
+                        &mut shown,
+                    ) {
+                        picked = Some(shown);
+                    }
                 });
             });
-            ui.add_space(12.0);
-            kit::divider(ui);
-            ui.add_space(4.0);
-            if kit::toggle(
-                ui,
-                &mut self.stable_updates_paused,
-                "Pause stable update notifications",
-                "Stay on your tester build without reminders.",
-                true,
-            ) {
-                self.save_account_cache();
-            }
-            ui.add_enabled_ui(
-                !self.is_busy() && !account_busy && available && self.selected_folder.is_some(),
-                |ui| {
-                    download = kit::secondary_button(
-                        ui,
-                        Some(Icon::DownloadSimple),
-                        "Download Early Access build",
-                    )
-                    .clicked();
-                },
-            );
         });
-        if download {
-            self.shell.install_confirmation = Some(ReleaseChannel::EarlyAccess);
+        if let Some(channel) = picked.filter(|c| *c != current) {
+            self.shell.install_confirmation = Some(channel);
         }
     }
 

@@ -5236,7 +5236,6 @@ enum Icon {
     Pause,
     Trash,
     Palette,
-    Sparkle,
     Broadcast,
     FilmStrip,
     House,
@@ -5284,7 +5283,6 @@ impl Icon {
             Icon::Pause => "\u{E39E}",          // pause
             Icon::Trash => "\u{E4A6}",          // trash
             Icon::Palette => "\u{E6C8}",        // palette
-            Icon::Sparkle => "\u{E6A2}",        // sparkle
             Icon::Broadcast => "\u{E0F2}",      // broadcast
             Icon::FilmStrip => "\u{E792}",      // film-strip
             Icon::House => "\u{E2C2}",          // house
