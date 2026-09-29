@@ -1153,8 +1153,11 @@ impl PhaseInstallerApp {
             Ok((catalog, thumbnails)) => {
                 self.wallpaper_catalog = catalog;
                 for (id, image) in thumbnails {
-                    let texture =
-                        ctx.load_texture(format!("wallpaper-thumb-{id}"), image, TextureOptions::LINEAR);
+                    let texture = ctx.load_texture(
+                        format!("wallpaper-thumb-{id}"),
+                        image,
+                        TextureOptions::LINEAR,
+                    );
                     self.wallpaper_thumbnails.insert(id, texture);
                 }
                 // A saved theme the cached list didn't have yet (first run).
@@ -1187,7 +1190,12 @@ impl PhaseInstallerApp {
             self.save_account_cache();
             return;
         };
-        let Some(entry) = self.wallpaper_catalog.iter().find(|entry| entry.id == id).cloned() else {
+        let Some(entry) = self
+            .wallpaper_catalog
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+        else {
             // Not in the list yet; poll_wallpaper_catalog retries once it arrives.
             return;
         };
@@ -1223,7 +1231,9 @@ impl PhaseInstallerApp {
                 done.store(bytes, std::sync::atomic::Ordering::Relaxed);
                 repaint.request_repaint();
             };
-            let result = library.sheets(&entry, &progress).map(|images| (entry, images));
+            let result = library
+                .sheets(&entry, &progress)
+                .map(|images| (entry, images));
             let _ = tx.send(result);
             repaint.request_repaint();
         });
@@ -1240,7 +1250,10 @@ impl PhaseInstallerApp {
         self.wallpaper_download = None;
         match result {
             Ok((entry, images)) => {
-                self.log(phase::green(), format!("Animated theme applied: {}", entry.title));
+                self.log(
+                    phase::green(),
+                    format!("Animated theme applied: {}", entry.title),
+                );
                 self.wallpaper = Some(wallpaper::AnimatedWallpaper::new(ctx, entry, images));
             }
             Err(error) => {
@@ -4479,8 +4492,11 @@ impl PhaseInstallerApp {
 
         if let Some(wallpaper) = &self.wallpaper {
             if let Some((texture, sheet_uv)) = wallpaper.frame(wallpaper.current_frame()) {
-                let (image_rect, uv) =
-                    theme_background_layout(rect, wallpaper.frame_size(), self.theme_background_mode);
+                let (image_rect, uv) = theme_background_layout(
+                    rect,
+                    wallpaper.frame_size(),
+                    self.theme_background_mode,
+                );
                 // Map the crop/fit UVs (0..1 of the frame) into the frame's cell on the sheet.
                 let size = sheet_uv.size();
                 let cell = Rect::from_min_max(
@@ -4491,7 +4507,11 @@ impl PhaseInstallerApp {
             }
             // Theme-colored scrim, at least as strong as the wallpaper needs.
             let scrim = wallpaper.entry.color.recommended_scrim.max(0.38);
-            painter.rect_filled(rect, Rounding::ZERO, color_with_alpha(phase::background(), scrim));
+            painter.rect_filled(
+                rect,
+                Rounding::ZERO,
+                color_with_alpha(phase::background(), scrim),
+            );
             if wallpaper.frozen_frame.is_none() {
                 ui.ctx().request_repaint_after(wallpaper.frame_interval());
             }
@@ -7608,7 +7628,9 @@ mod phase {
             let c = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
             Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
         };
-        let luma = |c: Color32| (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0;
+        let luma = |c: Color32| {
+            (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0
+        };
         let white = Color32::from_rgb(245, 245, 247);
         let ink = Color32::from_rgb(20, 18, 24);
         let text = if luma(background) > 0.55 { ink } else { white };

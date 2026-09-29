@@ -112,7 +112,10 @@ impl Library {
             Self::Remote { cache } => cache.join("registry.json"),
             Self::Folder(root) => root.join("registry.json"),
         };
-        std::fs::read(path).ok().map(|bytes| parse_catalog(&bytes)).unwrap_or_default()
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| parse_catalog(&bytes))
+            .unwrap_or_default()
     }
 
     /// The latest catalog from the server, cached for next time. Falls back
@@ -156,7 +159,8 @@ impl Library {
             Self::Folder(_) => {
                 // A working folder has no thumbnail file; use the first frame.
                 let sheet = self.sheet(entry, entry.sheets.first()?).ok()?;
-                let frame = image::imageops::crop_imm(&sheet, 0, 0, entry.frame_width, entry.frame_height);
+                let frame =
+                    image::imageops::crop_imm(&sheet, 0, 0, entry.frame_width, entry.frame_height);
                 image::DynamicImage::ImageRgba8(frame.to_image())
             }
         };
@@ -191,8 +195,15 @@ impl Library {
                 let path = cached_sheet(cache, entry, sheet);
                 if !path.is_file() {
                     let bytes = download(&sheet_url(entry, sheet))?;
-                    if sheet.hash.as_deref().is_some_and(|hash| hash != content_hash(&bytes)) {
-                        return Err(format!("{} did not download correctly. Try again.", entry.title));
+                    if sheet
+                        .hash
+                        .as_deref()
+                        .is_some_and(|hash| hash != content_hash(&bytes))
+                    {
+                        return Err(format!(
+                            "{} did not download correctly. Try again.",
+                            entry.title
+                        ));
                     }
                     done += bytes.len() as u64;
                     progress(done);
@@ -207,7 +218,11 @@ impl Library {
         Ok(images)
     }
 
-    fn sheet(&self, entry: &WallpaperEntry, sheet: &SheetEntry) -> Result<image::RgbaImage, String> {
+    fn sheet(
+        &self,
+        entry: &WallpaperEntry,
+        sheet: &SheetEntry,
+    ) -> Result<image::RgbaImage, String> {
         let path = match self {
             Self::Remote { cache } => cached_sheet(cache, entry, sheet),
             Self::Folder(root) => root.join("wallpapers").join(&entry.id).join(&sheet.file),
@@ -244,7 +259,11 @@ fn cached_sheet(cache: &Path, entry: &WallpaperEntry, sheet: &SheetEntry) -> Pat
 
 /// Deletes cached sheets a re-published wallpaper no longer uses.
 fn remove_stale_sheets(cache: &Path, entry: &WallpaperEntry) {
-    let keep: Vec<PathBuf> = entry.sheets.iter().map(|sheet| cached_sheet(cache, entry, sheet)).collect();
+    let keep: Vec<PathBuf> = entry
+        .sheets
+        .iter()
+        .map(|sheet| cached_sheet(cache, entry, sheet))
+        .collect();
     let Ok(files) = std::fs::read_dir(cache.join(&entry.id)) else {
         return;
     };
@@ -258,7 +277,11 @@ fn remove_stale_sheets(cache: &Path, entry: &WallpaperEntry) {
 
 fn content_hash(bytes: &[u8]) -> String {
     use sha2::Digest;
-    sha2::Sha256::digest(bytes).iter().take(8).map(|byte| format!("{byte:02x}")).collect()
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn download(url: &str) -> Result<Vec<u8>, String> {
@@ -316,7 +339,9 @@ impl AnimatedWallpaper {
         let sheets = images
             .into_iter()
             .enumerate()
-            .map(|(n, image)| ctx.load_texture(format!("wallpaper-{}-{n}", entry.id), image, filter))
+            .map(|(n, image)| {
+                ctx.load_texture(format!("wallpaper-{}-{n}", entry.id), image, filter)
+            })
             .collect();
         Self {
             entry,
@@ -328,7 +353,11 @@ impl AnimatedWallpaper {
 
     pub fn current_frame(&self) -> u32 {
         let sequence = &self.entry.sequence;
-        let length = if sequence.is_empty() { self.entry.frame_count } else { sequence.len() as u32 };
+        let length = if sequence.is_empty() {
+            self.entry.frame_count
+        } else {
+            sequence.len() as u32
+        };
         let step = self.frozen_frame.unwrap_or_else(|| {
             (self.started.elapsed().as_secs_f32() * self.entry.fps) as u32 % length.max(1)
         });
@@ -355,7 +384,10 @@ impl AnimatedWallpaper {
 
     /// Frame size, for crop/fit layout.
     pub fn frame_size(&self) -> egui::Vec2 {
-        egui::vec2(self.entry.frame_width as f32, self.entry.frame_height as f32)
+        egui::vec2(
+            self.entry.frame_width as f32,
+            self.entry.frame_height as f32,
+        )
     }
 
     /// Seconds until the next frame should be shown.

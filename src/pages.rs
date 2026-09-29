@@ -1996,7 +1996,10 @@ impl PhaseInstallerApp {
                 .map(|w| w.entry.title.clone())
                 .unwrap_or_else(|| "None".to_owned()),
         };
-        let thumbnail = current.as_ref().and_then(|id| self.wallpaper_thumbnails.get(id)).cloned();
+        let thumbnail = current
+            .as_ref()
+            .and_then(|id| self.wallpaper_thumbnails.get(id))
+            .cloned();
         // Screenshot harness: PHASE_UI_PICKER=animated shows the list open.
         if self.screenshot_path.is_some()
             && std::env::var("PHASE_UI_PICKER").as_deref() == Ok("animated")

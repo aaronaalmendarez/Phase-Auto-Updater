@@ -1801,9 +1801,17 @@ pub(super) fn picker<R>(
     let below = screen.bottom() - trigger.rect.bottom() - 6.0;
     let above = trigger.rect.top() - screen.top() - 6.0;
     let (anchor, pivot, room) = if below >= 240.0 || below >= above {
-        (trigger.rect.left_bottom() + Vec2::new(0.0, 6.0), egui::Align2::LEFT_TOP, below)
+        (
+            trigger.rect.left_bottom() + Vec2::new(0.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            below,
+        )
     } else {
-        (trigger.rect.left_top() - Vec2::new(0.0, 6.0), egui::Align2::LEFT_BOTTOM, above)
+        (
+            trigger.rect.left_top() - Vec2::new(0.0, 6.0),
+            egui::Align2::LEFT_BOTTOM,
+            above,
+        )
     };
     let popup = egui::Area::new(id)
         .order(egui::Order::Foreground)

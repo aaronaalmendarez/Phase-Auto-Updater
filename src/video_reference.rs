@@ -2458,7 +2458,9 @@ fn poll_clients(
                                     Err(error) => {
                                         let _ = event_tx.send(BridgeEvent::SendFailed {
                                             op: "reference.set".to_owned(),
-                                            message: format!("Could not replay the current clip: {error}"),
+                                            message: format!(
+                                                "Could not replay the current clip: {error}"
+                                            ),
                                         });
                                     }
                                 }
@@ -3079,9 +3081,10 @@ mod tests {
         popup
             .send(Message::Text(reference))
             .expect("send popup reference");
-        wait_for_event(&bridge, |event| {
-            matches!(event, BridgeEvent::PacketReceived(packet) if packet.op == "reference.set")
-        });
+        wait_for_event(
+            &bridge,
+            |event| matches!(event, BridgeEvent::PacketReceived(packet) if packet.op == "reference.set"),
+        );
 
         // Studio connects afterwards: hello.ok, then the replayed clip.
         let (mut studio, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}{DEFAULT_PATH}"))
@@ -3091,9 +3094,12 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("set studio read timeout");
         }
-        let hello = serde_json::to_string(&make_packet("hello", json!({ "side": "studio" }), "", None))
-            .expect("encode hello");
-        studio.send(Message::Text(hello)).expect("send studio hello");
+        let hello =
+            serde_json::to_string(&make_packet("hello", json!({ "side": "studio" }), "", None))
+                .expect("encode hello");
+        studio
+            .send(Message::Text(hello))
+            .expect("send studio hello");
         let mut ops = Vec::new();
         for _ in 0..2 {
             let text = studio
