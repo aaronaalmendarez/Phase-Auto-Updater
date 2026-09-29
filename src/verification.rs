@@ -175,12 +175,22 @@ impl PhaseRequestError {
     }
 }
 
+/// Server errors carry a JSON `message` meant for people; show that rather
+/// than the URL and status code.
 fn phase_http_error(context: &str, error: ureq::Error) -> PhaseRequestError {
-    let message = format!("{context}: {error}");
-    if matches!(error, ureq::Error::Transport(_)) {
-        PhaseRequestError::Transport(message)
-    } else {
-        PhaseRequestError::Other(message)
+    match error {
+        ureq::Error::Status(code, response) => {
+            let message = response
+                .into_json::<serde_json::Value>()
+                .ok()
+                .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
+                .filter(|message| !message.trim().is_empty());
+            PhaseRequestError::Other(match message {
+                Some(message) => format!("{context}: {message}"),
+                None => format!("{context}: the server returned status {code}."),
+            })
+        }
+        error => PhaseRequestError::Transport(format!("{context}: {error}")),
     }
 }
 
@@ -1075,6 +1085,37 @@ mod tests {
         assert_eq!(
             legacy_fallback_plan(&plan).unwrap().base_url,
             LEGACY_BASE_URL
+        );
+    }
+
+    #[test]
+    fn server_errors_show_the_server_message() {
+        let response = ureq::Response::new(
+            404,
+            "Not Found",
+            r#"{"ok":false,"message":"Roblox purchase could not be verified for download."}"#,
+        )
+        .unwrap();
+        let PhaseRequestError::Other(message) = phase_http_error(
+            "Install authorization failed",
+            ureq::Error::Status(404, response),
+        ) else {
+            panic!("status errors are not transport errors");
+        };
+        assert_eq!(
+            message,
+            "Install authorization failed: Roblox purchase could not be verified for download."
+        );
+
+        let empty = ureq::Response::new(502, "Bad Gateway", "<html></html>").unwrap();
+        let PhaseRequestError::Other(message) =
+            phase_http_error("Version check failed", ureq::Error::Status(502, empty))
+        else {
+            panic!("status errors are not transport errors");
+        };
+        assert_eq!(
+            message,
+            "Version check failed: the server returned status 502."
         );
     }
 

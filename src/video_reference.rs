@@ -2329,6 +2329,9 @@ fn run_server(
     let url = config.url();
     let _ = event_tx.send(BridgeEvent::Listening { url });
     let mut clients = Vec::<tungstenite::WebSocket<TcpStream>>::new();
+    // The most recent clip (encoded reference.set), replayed to Studio when it
+    // says hello so a player opened before Studio connected still links.
+    let mut last_reference: Option<String> = None;
 
     loop {
         let mut stopping = false;
@@ -2354,6 +2357,7 @@ fn run_server(
                         });
                         continue;
                     };
+                    remember_reference(&mut last_reference, &op, &encoded);
                     send_to_clients(&mut clients, &event_tx, op, encoded);
                 }
                 BridgeCommand::Stop => stopping = true,
@@ -2387,7 +2391,7 @@ fn run_server(
             }
         }
 
-        poll_clients(&mut clients, &event_tx);
+        poll_clients(&mut clients, &event_tx, &mut last_reference);
         thread::sleep(Duration::from_millis(16));
     }
 
@@ -2433,6 +2437,7 @@ fn accept_client(
 fn poll_clients(
     clients: &mut Vec<tungstenite::WebSocket<TcpStream>>,
     event_tx: &Sender<BridgeEvent>,
+    last_reference: &mut Option<String>,
 ) {
     let mut index = 0;
     while index < clients.len() {
@@ -2442,6 +2447,24 @@ fn poll_clients(
                 Ok(Message::Text(text)) => match serde_json::from_str::<VideoPacket>(&text) {
                     Ok(packet) if packet.v == VERSION => {
                         send_auto_reply(&mut clients[index], &packet);
+                        if packet.op == "hello" && !is_player_hello(&packet) {
+                            if let Some(reference) = last_reference.as_deref() {
+                                match send_text_with_retry(&mut clients[index], reference) {
+                                    Ok(_) => {
+                                        let _ = event_tx.send(BridgeEvent::PacketSent {
+                                            op: "reference.set".to_owned(),
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = event_tx.send(BridgeEvent::SendFailed {
+                                            op: "reference.set".to_owned(),
+                                            message: format!("Could not replay the current clip: {error}"),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        remember_reference(last_reference, &packet.op, &text);
                         if should_relay_client_packet(&packet.op) {
                             relay_client_packet_to_peers(
                                 clients, index, event_tx, &packet.op, &text,
@@ -2494,6 +2517,24 @@ fn poll_clients(
             index += 1;
         }
     }
+}
+
+/// Tracks the clip to replay: a new reference.set replaces it, a clear drops it.
+fn remember_reference(last_reference: &mut Option<String>, op: &str, encoded: &str) {
+    match op {
+        "reference.set" => *last_reference = Some(encoded.to_owned()),
+        "reference.clear" => *last_reference = None,
+        _ => {}
+    }
+}
+
+/// The companion's own player window says hello too; only Studio gets the replay.
+fn is_player_hello(packet: &VideoPacket) -> bool {
+    packet_payload(packet)
+        .get("side")
+        .and_then(|side| side.as_str())
+        .map(|side| side == "phase-video-popup")
+        .unwrap_or(false)
 }
 
 fn should_relay_client_packet(op: &str) -> bool {
@@ -3008,6 +3049,77 @@ mod tests {
         assert_eq!(relayed.payload["playing"], false);
 
         bridge.stop();
+    }
+
+    #[test]
+    fn server_replays_current_clip_when_studio_connects_later() {
+        let port = free_local_port();
+        let bridge = VideoReferenceBridge::start(BridgeConfig {
+            port,
+            path: DEFAULT_PATH.to_owned(),
+            token: String::new(),
+        });
+        wait_for_event(&bridge, |event| {
+            matches!(event, BridgeEvent::Listening { .. })
+        });
+
+        // The player opens first and announces its clip while Studio is away.
+        let (mut popup, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}{DEFAULT_PATH}"))
+            .expect("connect popup client");
+        wait_for_event(&bridge, |event| {
+            matches!(event, BridgeEvent::ClientConnected)
+        });
+        let reference = serde_json::to_string(&make_packet(
+            "reference.set",
+            json!({ "source": "C:/clips/run.mp4", "title": "Run" }),
+            "",
+            None,
+        ))
+        .expect("encode reference packet");
+        popup
+            .send(Message::Text(reference))
+            .expect("send popup reference");
+        wait_for_event(&bridge, |event| {
+            matches!(event, BridgeEvent::PacketReceived(packet) if packet.op == "reference.set")
+        });
+
+        // Studio connects afterwards: hello.ok, then the replayed clip.
+        let (mut studio, _) = tungstenite::connect(format!("ws://127.0.0.1:{port}{DEFAULT_PATH}"))
+            .expect("connect studio client");
+        if let tungstenite::stream::MaybeTlsStream::Plain(stream) = studio.get_mut() {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set studio read timeout");
+        }
+        let hello = serde_json::to_string(&make_packet("hello", json!({ "side": "studio" }), "", None))
+            .expect("encode hello");
+        studio.send(Message::Text(hello)).expect("send studio hello");
+        let mut ops = Vec::new();
+        for _ in 0..2 {
+            let text = studio
+                .read()
+                .expect("read studio packet")
+                .into_text()
+                .expect("text studio packet");
+            let packet: VideoPacket = serde_json::from_str(&text).expect("decode studio packet");
+            ops.push((packet.op.clone(), packet.payload["title"].clone()));
+        }
+        assert_eq!(ops[0].0, "hello.ok");
+        assert_eq!(ops[1].0, "reference.set");
+        assert_eq!(ops[1].1, "Run");
+
+        bridge.stop();
+    }
+
+    #[test]
+    fn remembered_clip_follows_set_and_clear() {
+        let mut last = None;
+        remember_reference(&mut last, "reference.set", "{a}");
+        assert_eq!(last.as_deref(), Some("{a}"));
+        remember_reference(&mut last, "sync.timeline", "{b}");
+        assert_eq!(last.as_deref(), Some("{a}"));
+        remember_reference(&mut last, "reference.clear", "{c}");
+        assert_eq!(last, None);
     }
 
     fn wait_for_event(

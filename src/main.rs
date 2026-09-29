@@ -9,6 +9,7 @@ mod release_channel;
 mod studio_patch;
 mod verification;
 mod video_reference;
+mod wallpaper;
 
 use release_channel::{InstalledRelease, ReleaseChannel};
 use serde_json::json;
@@ -311,6 +312,8 @@ struct AccountCache {
     stable_updates_paused: bool,
     #[serde(default)]
     installed_release: Option<InstalledRelease>,
+    #[serde(default)]
+    animated_theme: Option<String>,
 }
 
 struct PhaseInstallerApp {
@@ -458,8 +461,38 @@ struct PhaseInstallerApp {
     logo_key: Option<Option<u64>>,
     brand_icon: Option<image::RgbaImage>,
     brand_icon_focused: bool,
+    wallpaper: Option<wallpaper::AnimatedWallpaper>,
+    wallpaper_library: wallpaper::Library,
+    wallpaper_catalog: Vec<wallpaper::WallpaperEntry>,
+    wallpaper_catalog_rx: Option<Receiver<Result<WallpaperCatalog, String>>>,
+    wallpaper_thumbnails: HashMap<String, TextureHandle>,
+    wallpaper_download: Option<WallpaperDownload>,
+    animated_theme: Option<String>,
     window_state_saved: Option<WindowState>,
     window_state_checked: Option<Instant>,
+}
+
+/// The animated theme list with each theme's thumbnail.
+type WallpaperCatalog = (Vec<wallpaper::WallpaperEntry>, Vec<(String, ColorImage)>);
+
+/// An animated theme's sheets being downloaded (or read from the cache) and
+/// decoded in the background.
+struct WallpaperDownload {
+    id: String,
+    /// Bytes still to download when it started; 0 when everything is cached.
+    total: u64,
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    rx: Receiver<Result<(wallpaper::WallpaperEntry, Vec<ColorImage>), String>>,
+}
+
+impl WallpaperDownload {
+    fn status(&self) -> String {
+        if self.total == 0 {
+            return "Loading...".to_owned();
+        }
+        let done = self.done.load(std::sync::atomic::Ordering::Relaxed);
+        format!("Downloading {}%", (done * 100 / self.total).min(99))
+    }
 }
 
 impl PhaseInstallerApp {
@@ -624,11 +657,20 @@ impl PhaseInstallerApp {
             logo_key: None,
             brand_icon: None,
             brand_icon_focused: false,
+            wallpaper: None,
+            wallpaper_library: wallpaper::Library::open(),
+            wallpaper_catalog: Vec::new(),
+            wallpaper_catalog_rx: None,
+            wallpaper_thumbnails: HashMap::new(),
+            wallpaper_download: None,
+            animated_theme: None,
             window_state_saved: None,
             window_state_checked: None,
         };
 
         app.load_cached_accounts(&cc.egui_ctx);
+        app.load_wallpaper_catalog(&cc.egui_ctx);
+        app.apply_preview_overrides(&cc.egui_ctx);
 
         app.log(
             phase::blue(),
@@ -726,6 +768,8 @@ impl PhaseInstallerApp {
         self.poll_studio_patch(ctx);
         self.poll_theme_fetch(ctx);
         self.poll_theme_apply(ctx);
+        self.poll_wallpaper_catalog(ctx);
+        self.poll_wallpaper_download(ctx);
         self.poll_connection_diagnostics(ctx);
         self.poll_connection_fix(ctx);
         self.poll_avatar_fetches(ctx);
@@ -1038,7 +1082,8 @@ impl PhaseInstallerApp {
         if self.theme_transition.is_some() {
             return;
         }
-        let key = self.selected_theme.as_ref().map(|_| {
+        let themed = self.selected_theme.is_some() || self.wallpaper.is_some();
+        let key = themed.then(|| {
             let (light, dark, stripe) = brand_stops();
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(
@@ -1068,6 +1113,209 @@ impl PhaseInstallerApp {
             }
         }
         self.brand_icon = Some(image);
+    }
+
+    /// Shows the cached animated theme list at once, then refreshes it and
+    /// its thumbnails from the server in the background. Restores the saved
+    /// animated theme.
+    fn load_wallpaper_catalog(&mut self, ctx: &Context) {
+        self.wallpaper_catalog = self.wallpaper_library.cached_catalog();
+        if let Some(id) = self.animated_theme.clone() {
+            self.apply_animated_theme(ctx, Some(&id));
+        }
+        let library = self.wallpaper_library.clone();
+        let (tx, rx) = mpsc::channel();
+        self.wallpaper_catalog_rx = Some(rx);
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = library.fetch_catalog().map(|catalog| {
+                let thumbnails = catalog
+                    .iter()
+                    .filter_map(|entry| Some((entry.id.clone(), library.thumbnail(entry)?)))
+                    .collect();
+                (catalog, thumbnails)
+            });
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_wallpaper_catalog(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .wallpaper_catalog_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+        self.wallpaper_catalog_rx = None;
+        match result {
+            Ok((catalog, thumbnails)) => {
+                self.wallpaper_catalog = catalog;
+                for (id, image) in thumbnails {
+                    let texture =
+                        ctx.load_texture(format!("wallpaper-thumb-{id}"), image, TextureOptions::LINEAR);
+                    self.wallpaper_thumbnails.insert(id, texture);
+                }
+                // A saved theme the cached list didn't have yet (first run).
+                let idle = self.wallpaper.is_none() && self.wallpaper_download.is_none();
+                if let Some(id) = self.animated_theme.clone().filter(|_| idle) {
+                    self.apply_animated_theme(ctx, Some(&id));
+                }
+            }
+            Err(error) => self.log(phase::warning(), error),
+        }
+    }
+
+    /// Switch to an animated theme, or back to the normal theme with `None`.
+    /// The palette changes at once; the wallpaper appears when its sheets are
+    /// downloaded (only the first time) and decoded.
+    fn apply_animated_theme(&mut self, ctx: &Context, id: Option<&str>) {
+        let Some(id) = id else {
+            self.wallpaper = None;
+            self.wallpaper_download = None;
+            self.animated_theme = None;
+            match self
+                .selected_theme
+                .as_ref()
+                .and_then(|selection| phase::palette_from_theme_code(&selection.theme_code))
+            {
+                Some(palette) => phase::set_palette(palette),
+                None => phase::reset_palette(),
+            }
+            configure_style(ctx);
+            self.save_account_cache();
+            return;
+        };
+        let Some(entry) = self.wallpaper_catalog.iter().find(|entry| entry.id == id).cloned() else {
+            // Not in the list yet; poll_wallpaper_catalog retries once it arrives.
+            return;
+        };
+        if let Some(palette) = entry
+            .theme_code()
+            .and_then(|code| phase::palette_from_theme_code(&code))
+        {
+            phase::set_palette(palette);
+            configure_style(ctx);
+        }
+        self.animated_theme = Some(id.to_owned());
+        self.save_account_cache();
+        if self.wallpaper.as_ref().is_some_and(|w| w.entry.id == id) {
+            return;
+        }
+        self.wallpaper = None;
+        self.start_wallpaper_download(ctx, entry);
+    }
+
+    fn start_wallpaper_download(&mut self, ctx: &Context, entry: wallpaper::WallpaperEntry) {
+        let library = self.wallpaper_library.clone();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel();
+        self.wallpaper_download = Some(WallpaperDownload {
+            id: entry.id.clone(),
+            total: library.missing_bytes(&entry),
+            done: done.clone(),
+            rx,
+        });
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let progress = |bytes| {
+                done.store(bytes, std::sync::atomic::Ordering::Relaxed);
+                repaint.request_repaint();
+            };
+            let result = library.sheets(&entry, &progress).map(|images| (entry, images));
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_wallpaper_download(&mut self, ctx: &Context) {
+        let Some(result) = self
+            .wallpaper_download
+            .as_ref()
+            .and_then(|job| job.rx.try_recv().ok())
+        else {
+            return;
+        };
+        self.wallpaper_download = None;
+        match result {
+            Ok((entry, images)) => {
+                self.log(phase::green(), format!("Animated theme applied: {}", entry.title));
+                self.wallpaper = Some(wallpaper::AnimatedWallpaper::new(ctx, entry, images));
+            }
+            Err(error) => {
+                self.log(phase::red(), error.clone());
+                self.apply_animated_theme(ctx, None);
+                self.theme_error = Some(error);
+            }
+        }
+    }
+
+    /// The animated theme being fetched and its progress text, for the picker.
+    pub(crate) fn wallpaper_download_status(&self) -> Option<(&str, String)> {
+        self.wallpaper_download
+            .as_ref()
+            .map(|job| (job.id.as_str(), job.status()))
+    }
+
+    /// Development previews: `PHASE_UI_WALLPAPER=<id>` plays an animated
+    /// wallpaper (from the server, or `PHASE_WALLPAPER_DIR` when set).
+    /// `PHASE_UI_THEME_CODE` (a PA2 code) or
+    /// `PHASE_UI_PREVIEW_PALETTE=bg,panel,accent` applies colors without
+    /// touching the saved theme.
+    fn apply_preview_overrides(&mut self, ctx: &Context) {
+        // A full PA2 theme code, e.g. an animated wallpaper's own palette.
+        if let Some(palette) = std::env::var("PHASE_UI_THEME_CODE")
+            .ok()
+            .and_then(|code| phase::palette_from_theme_code(&code))
+        {
+            phase::set_palette(palette);
+            configure_style(ctx);
+            self.selected_theme = None;
+            self.theme_background = None;
+            self.theme_background_key = None;
+        }
+        if let Ok(spec) = std::env::var("PHASE_UI_PREVIEW_PALETTE") {
+            let colors: Vec<_> = spec.split(',').filter_map(phase::hex_color).collect();
+            if let [background, panel, accent] = colors[..] {
+                phase::set_palette(phase::palette_from_preview(background, panel, accent));
+                configure_style(ctx);
+                self.selected_theme = None;
+                self.theme_background = None;
+                self.theme_background_key = None;
+            }
+        }
+        if let Ok(id) = std::env::var("PHASE_UI_WALLPAPER") {
+            let library = self.wallpaper_library.clone();
+            let loaded = library
+                .fetch_catalog()
+                .and_then(|catalog| {
+                    catalog
+                        .into_iter()
+                        .find(|entry| entry.id == id)
+                        .ok_or_else(|| format!("No animated theme named {id}."))
+                })
+                .and_then(|entry| {
+                    let images = library.sheets(&entry, &|_| {})?;
+                    Ok(wallpaper::AnimatedWallpaper::new(ctx, entry, images))
+                });
+            // The preview replaces whatever the saved theme was loading.
+            self.wallpaper_download = None;
+            match loaded {
+                Ok(mut loaded) => {
+                    if self.screenshot_path.is_some() {
+                        loaded.frozen_frame = Some(
+                            std::env::var("PHASE_UI_WALLPAPER_FRAME")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(loaded.entry.frame_count / 2),
+                        );
+                    }
+                    self.wallpaper = Some(loaded);
+                }
+                Err(error) => eprintln!("{error}"),
+            }
+        }
     }
 
     fn persist_window_state(&mut self, ctx: &Context) {
@@ -1911,6 +2159,13 @@ impl PhaseInstallerApp {
                 self.roblox_user_id = user_id_text;
                 self.roblox_username = status.roblox_username.clone();
                 self.activation_error = None;
+                if self
+                    .release_error
+                    .as_deref()
+                    .is_some_and(pages::needs_roblox_reverify)
+                {
+                    self.release_error = None;
+                }
                 self.activation = Some(verification::ActivationResponse {
                     ok: true,
                     active: true,
@@ -2358,6 +2613,9 @@ impl PhaseInstallerApp {
         if self.theme_apply_rx.is_some() {
             return;
         }
+        self.wallpaper = None;
+        self.animated_theme = None;
+        self.wallpaper_download = None;
 
         let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
         let (tx, rx) = mpsc::channel();
@@ -2456,6 +2714,9 @@ impl PhaseInstallerApp {
     }
 
     fn reset_theme(&mut self, ctx: &Context) {
+        self.wallpaper = None;
+        self.animated_theme = None;
+        self.wallpaper_download = None;
         phase::reset_palette();
         configure_style(ctx);
         self.selected_theme = None;
@@ -2554,6 +2815,7 @@ impl PhaseInstallerApp {
         self.theme_background_mode = cache.theme_background_mode;
         self.stable_updates_paused = cache.stable_updates_paused;
         self.installed_release = cache.installed_release;
+        self.animated_theme = cache.animated_theme;
         if let Some(selection) = &self.selected_theme
             && let Some(palette) = phase::palette_from_theme_code(&selection.theme_code)
         {
@@ -2580,6 +2842,7 @@ impl PhaseInstallerApp {
             theme_background_mode: self.theme_background_mode,
             stable_updates_paused: self.stable_updates_paused,
             installed_release: self.installed_release.clone(),
+            animated_theme: self.animated_theme.clone(),
         };
         save_account_cache(&cache);
     }
@@ -4201,7 +4464,9 @@ impl PhaseInstallerApp {
         let painter = ui.painter();
 
         // Under Mica the canvas is translucent so the system material shows.
-        let has_art = self.theme_background.is_some() || self.theme_outgoing_background.is_some();
+        let has_art = self.theme_background.is_some()
+            || self.theme_outgoing_background.is_some()
+            || self.wallpaper.is_some();
         painter.rect_filled(
             rect,
             Rounding::ZERO,
@@ -4211,6 +4476,27 @@ impl PhaseInstallerApp {
                 phase::background()
             },
         );
+
+        if let Some(wallpaper) = &self.wallpaper {
+            if let Some((texture, sheet_uv)) = wallpaper.frame(wallpaper.current_frame()) {
+                let (image_rect, uv) =
+                    theme_background_layout(rect, wallpaper.frame_size(), self.theme_background_mode);
+                // Map the crop/fit UVs (0..1 of the frame) into the frame's cell on the sheet.
+                let size = sheet_uv.size();
+                let cell = Rect::from_min_max(
+                    sheet_uv.min + Vec2::new(uv.min.x * size.x, uv.min.y * size.y),
+                    sheet_uv.min + Vec2::new(uv.max.x * size.x, uv.max.y * size.y),
+                );
+                painter.image(texture.id(), image_rect, cell, Color32::WHITE);
+            }
+            // Theme-colored scrim, at least as strong as the wallpaper needs.
+            let scrim = wallpaper.entry.color.recommended_scrim.max(0.38);
+            painter.rect_filled(rect, Rounding::ZERO, color_with_alpha(phase::background(), scrim));
+            if wallpaper.frozen_frame.is_none() {
+                ui.ctx().request_repaint_after(wallpaper.frame_interval());
+            }
+            return;
+        }
 
         // Keep the outgoing image alive until the incoming texture is loaded,
         // then crossfade them rather than flashing through an empty canvas.
@@ -4248,7 +4534,9 @@ impl PhaseInstallerApp {
     }
 
     fn has_theme_background_art(&self) -> bool {
-        self.theme_background.is_some() || self.theme_outgoing_background.is_some()
+        self.theme_background.is_some()
+            || self.theme_outgoing_background.is_some()
+            || self.wallpaper.is_some()
     }
 
     fn check_milestones(&mut self) {
@@ -6629,6 +6917,7 @@ fn save_account_cache(cache: &AccountCache) {
         && cache.roblox_user_id.trim().is_empty()
         && cache.activation.is_none()
         && cache.selected_theme.is_none()
+        && cache.animated_theme.is_none()
     {
         let _ = std::fs::remove_file(path);
         return;
@@ -7311,6 +7600,38 @@ mod phase {
     }
 
     static PALETTE: OnceLock<RwLock<Palette>> = OnceLock::new();
+
+    /// Marketplace listings only expose background, panel and accent. Derive
+    /// the rest so a theme can be previewed without installing it.
+    pub fn palette_from_preview(background: Color32, panel: Color32, accent: Color32) -> Palette {
+        let mix = |a: Color32, b: Color32, t: f32| {
+            let c = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+            Color32::from_rgb(c(a.r(), b.r()), c(a.g(), b.g()), c(a.b(), b.b()))
+        };
+        let luma = |c: Color32| (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0;
+        let white = Color32::from_rgb(245, 245, 247);
+        let ink = Color32::from_rgb(20, 18, 24);
+        let text = if luma(background) > 0.55 { ink } else { white };
+        Palette {
+            background,
+            surface: panel,
+            surface_hover: mix(panel, white, 0.08),
+            surface_active: mix(panel, accent, 0.25),
+            input: mix(background, panel, 0.5),
+            line: mix(panel, white, 0.18),
+            accent,
+            accent_hover: mix(accent, white, 0.2),
+            accent_dim: mix(accent, background, 0.5),
+            blue: Color32::from_rgb(147, 197, 253),
+            green: Color32::from_rgb(99, 214, 154),
+            red: Color32::from_rgb(241, 111, 131),
+            warning: Color32::from_rgb(240, 184, 91),
+            text,
+            text_secondary: mix(text, background, 0.25),
+            text_muted: mix(text, background, 0.45),
+            text_on_accent: if luma(accent) > 0.55 { ink } else { white },
+        }
+    }
 
     pub fn reset_palette() {
         set_palette(default_palette());

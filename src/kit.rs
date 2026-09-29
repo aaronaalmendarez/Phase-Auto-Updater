@@ -1795,11 +1795,22 @@ pub(super) fn picker<R>(
     if !ui.memory(|m| m.is_popup_open(id)) {
         return None;
     }
+    // Open on whichever side of the trigger has more room, and scroll when the
+    // list is taller than that.
+    let screen = ui.ctx().screen_rect().shrink(8.0);
+    let below = screen.bottom() - trigger.rect.bottom() - 6.0;
+    let above = trigger.rect.top() - screen.top() - 6.0;
+    let (anchor, pivot, room) = if below >= 240.0 || below >= above {
+        (trigger.rect.left_bottom() + Vec2::new(0.0, 6.0), egui::Align2::LEFT_TOP, below)
+    } else {
+        (trigger.rect.left_top() - Vec2::new(0.0, 6.0), egui::Align2::LEFT_BOTTOM, above)
+    };
     let popup = egui::Area::new(id)
         .order(egui::Order::Foreground)
-        .fixed_pos(trigger.rect.left_bottom() + Vec2::new(0.0, 6.0))
+        .pivot(pivot)
+        .fixed_pos(anchor)
         .constrain(true)
-        .constrain_to(ui.ctx().screen_rect().shrink(8.0))
+        .constrain_to(screen)
         .show(ui.ctx(), |ui| {
             let frame = egui::Frame::popup(ui.style())
                 .fill(lerp_color(phase::background(), phase::surface(), 0.9))
@@ -1812,13 +1823,20 @@ pub(super) fn picker<R>(
                     color: Color32::from_black_alpha(110),
                 });
             let width = (trigger.rect.width() - frame.total_margin().sum().x).max(1.0);
+            let max_height = (room - frame.total_margin().sum().y).max(80.0);
             frame
                 .show(ui, |ui| {
-                    ui.with_layout(egui::Layout::top_down(Align::LEFT), |ui| {
-                        compact_menu_width(ui, width);
-                        contents(ui)
-                    })
-                    .inner
+                    egui::ScrollArea::vertical()
+                        .id_source(id.with("scroll"))
+                        .max_height(max_height)
+                        .show(ui, |ui| {
+                            ui.with_layout(egui::Layout::top_down(Align::LEFT), |ui| {
+                                compact_menu_width(ui, width);
+                                contents(ui)
+                            })
+                            .inner
+                        })
+                        .inner
                 })
                 .inner
         });

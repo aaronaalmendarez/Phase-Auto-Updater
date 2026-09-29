@@ -69,7 +69,12 @@ impl PhaseInstallerApp {
             self.open_page(Page::Reference);
         }
         kit::track_input_mode(ui.ctx());
-        kit::set_surface_tint(self.theme_background.as_ref().and(self.theme_art_tint));
+        kit::set_surface_tint(
+            self.wallpaper
+                .as_ref()
+                .and_then(|w| w.tint())
+                .or(self.theme_background.as_ref().and(self.theme_art_tint)),
+        );
 
         // Remember the moment an install finishes for the success animation.
         let state = &mut self.shell;
@@ -88,6 +93,14 @@ impl PhaseInstallerApp {
             && std::env::var("PHASE_UI_DIALOG").ok().as_deref() == Some("timing")
         {
             state.reference_timing = true;
+        }
+        if self.screenshot_path.is_some()
+            && std::env::var("PHASE_UI_DIALOG").ok().as_deref() == Some("reverify")
+        {
+            self.release_error = Some(
+                "Install authorization failed: Roblox purchase could not be verified for download."
+                    .to_owned(),
+            );
         }
         // Harness: `PHASE_UI_EARLY_ACCESS=ready|pending` simulates a tester.
         if self.screenshot_path.is_some()
@@ -343,7 +356,11 @@ impl PhaseInstallerApp {
             .clone()
             .or_else(|| self.activation_error.clone())
         {
-            kit::banner(ui, Tone::Danger, Icon::Warning, &error);
+            if needs_roblox_reverify(&error) {
+                self.reverify_notice(ui);
+            } else {
+                kit::banner(ui, Tone::Danger, Icon::Warning, &error);
+            }
             ui.add_space(14.0);
         }
 
@@ -799,6 +816,45 @@ impl PhaseInstallerApp {
 
         ui.add_space(18.0);
         self.timing_card(ui);
+    }
+
+    /// Shown when the server no longer recognises this PC's install. Signing
+    /// in with Roblox again registers it, after which installs work.
+    fn reverify_notice(&mut self, ui: &mut Ui) {
+        let busy = self.roblox_oauth_rx.is_some() || self.roblox_oauth_status_rx.is_some();
+        let mut verify = false;
+        kit::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                kit::icon_chip(ui, Icon::ShieldCheck, phase::warning(), 38.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    kit::title(ui, "Verify this PC to install", 16.0);
+                    kit::note(
+                        ui,
+                        if busy {
+                            "Finish signing in with Roblox in your browser."
+                        } else {
+                            "Phase no longer recognises this PC. Sign in with Roblox once, then retry the install."
+                        },
+                    );
+                });
+            });
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    verify =
+                        kit::secondary_button(ui, Some(Icon::ShieldCheck), "Verify with Roblox")
+                            .clicked();
+                });
+                if busy {
+                    kit::spinner(ui, 22.0, phase::text_secondary());
+                }
+            });
+        });
+        if verify {
+            self.start_roblox_oauth(ui.ctx());
+        }
     }
 
     /// A chosen local file: lands with a short rise, then offers Open.
@@ -1457,11 +1513,23 @@ impl PhaseInstallerApp {
                         kit::title(ui, &name, 16.0);
                         kit::caption(ui, "Verified Roblox account");
                     });
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        if kit::quiet_button(ui, Some(Icon::SignOut), "Disconnect").clicked() {
-                            action = Some("disconnect");
+                });
+                ui.add_space(14.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_enabled_ui(!oauth_busy, |ui| {
+                        if kit::secondary_button(ui, Some(Icon::ShieldCheck), "Verify again")
+                            .on_hover_text("Re-verify this PC with Roblox")
+                            .clicked()
+                        {
+                            action = Some("verify");
                         }
                     });
+                    if kit::quiet_button(ui, Some(Icon::SignOut), "Disconnect").clicked() {
+                        action = Some("disconnect");
+                    }
+                    if oauth_busy {
+                        kit::spinner(ui, 22.0, phase::blue());
+                    }
                 });
                 ui.add_space(16.0);
                 kit::divider(ui);
@@ -1529,6 +1597,17 @@ impl PhaseInstallerApp {
                 trailing,
                 |ui| {
                     self.theme_picker(ui, trailing);
+                },
+            );
+            kit::divider(ui);
+            kit::row(
+                ui,
+                Icon::MonitorPlay,
+                "Animated",
+                "Live wallpaper themes, each with its own colors.",
+                trailing,
+                |ui| {
+                    self.animated_picker(ui, trailing);
                 },
             );
             kit::divider(ui);
@@ -1900,6 +1979,85 @@ impl PhaseInstallerApp {
         });
     }
 
+    fn animated_picker(&mut self, ui: &mut Ui, width: f32) {
+        let picker_id = ui.make_persistent_id("animated-theme-picker");
+        let downloading = self
+            .wallpaper_download_status()
+            .map(|(id, status)| (id.to_owned(), status));
+        let current = match &downloading {
+            Some((id, _)) => Some(id.clone()),
+            None => self.wallpaper.as_ref().map(|w| w.entry.id.clone()),
+        };
+        let title = match &downloading {
+            Some((_, status)) => status.clone(),
+            None => self
+                .wallpaper
+                .as_ref()
+                .map(|w| w.entry.title.clone())
+                .unwrap_or_else(|| "None".to_owned()),
+        };
+        let thumbnail = current.as_ref().and_then(|id| self.wallpaper_thumbnails.get(id)).cloned();
+        // Screenshot harness: PHASE_UI_PICKER=animated shows the list open.
+        if self.screenshot_path.is_some()
+            && std::env::var("PHASE_UI_PICKER").as_deref() == Ok("animated")
+        {
+            ui.memory_mut(|m| m.open_popup(picker_id));
+        }
+        let open = ui.memory(|m| m.is_popup_open(picker_id));
+        let available = !self.wallpaper_catalog.is_empty();
+        let response = ui
+            .add_enabled_ui(available, |ui| {
+                kit::select_button(
+                    ui,
+                    thumbnail.as_ref(),
+                    None,
+                    if available {
+                        &title
+                    } else if self.wallpaper_catalog_rx.is_some() {
+                        "Loading..."
+                    } else {
+                        "Unavailable offline"
+                    },
+                    width,
+                    open,
+                )
+            })
+            .inner;
+        if response.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(picker_id));
+        }
+        let mut choice: Option<Option<String>> = None;
+        kit::picker(ui, &response, picker_id, |ui| {
+            if kit::theme_choice(ui, "None", None, current.is_none(), phase::surface()).clicked() {
+                choice = Some(None);
+            }
+            for entry in self.wallpaper_catalog.clone() {
+                let swatch = entry
+                    .theme
+                    .as_ref()
+                    .and_then(|t| t.palette.get("Background"))
+                    .and_then(|v| v.as_str())
+                    .and_then(phase::hex_color)
+                    .unwrap_or_else(phase::surface);
+                if kit::theme_choice(
+                    ui,
+                    &entry.title,
+                    self.wallpaper_thumbnails.get(&entry.id),
+                    current.as_deref() == Some(entry.id.as_str()),
+                    swatch,
+                )
+                .clicked()
+                {
+                    choice = Some(Some(entry.id.clone()));
+                }
+            }
+        });
+        if let Some(choice) = choice {
+            ui.memory_mut(|m| m.close_popup());
+            self.apply_animated_theme(ui.ctx(), choice.as_deref());
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Dialogs
 
@@ -2097,6 +2255,12 @@ fn is_local_video(source: &str) -> bool {
         && [".mp4", ".mov", ".m4v", ".webm"]
             .iter()
             .any(|ext| source.ends_with(ext))
+}
+
+/// The license server answers this when a PC's install token is no longer
+/// registered (for example after the account's install slots rotated).
+pub(super) fn needs_roblox_reverify(error: &str) -> bool {
+    error.contains("could not be verified for download")
 }
 
 /// "Roblox › Plugins" rather than a raw path or environment-variable label.
