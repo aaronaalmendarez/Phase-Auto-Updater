@@ -1475,7 +1475,7 @@ impl PhaseInstallerApp {
                         kit::title(ui, "Verify with Roblox", 16.0);
                         kit::note(
                             ui,
-                            "An alternative to a Phase account. Needed for license keys.",
+                            "Use this for Roblox Creator Store purchases. License keys work below without sign-in.",
                         );
                     });
                 });
@@ -1531,41 +1531,40 @@ impl PhaseInstallerApp {
                         kit::spinner(ui, 22.0, phase::blue());
                     }
                 });
-                ui.add_space(16.0);
-                kit::divider(ui);
-                ui.add_space(12.0);
-                ui.label(
-                    RichText::new("License key")
-                        .font(kit::semibold(kit::TEXT_SIZE))
-                        .color(phase::text()),
-                );
-                kit::caption(
-                    ui,
-                    "Have a key instead of a subscription? Activate it here.",
-                );
+            }
+            ui.add_space(16.0);
+            kit::divider(ui);
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new("License key")
+                    .font(kit::semibold(kit::TEXT_SIZE))
+                    .color(phase::text()),
+            );
+            kit::caption(
+                ui,
+                "Enter your Phase license key to activate without Roblox sign-in.",
+            );
+            ui.add_space(8.0);
+            let activating = self.activation_rx.is_some();
+            let (response, submit) = kit::field_with_icon(
+                ui,
+                Icon::Key,
+                &mut self.license_key,
+                "Enter your license key",
+                |ui| {
+                    ui.add_enabled_ui(!activating, |ui| {
+                        kit::icon_button(ui, Icon::ArrowRight, "Activate", 34.0, true).clicked()
+                    })
+                    .inner
+                },
+            );
+            let entered = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (submit || entered) && !activating && !self.license_key.trim().is_empty() {
+                action = Some("activate");
+            }
+            if let Some(error) = self.activation_error.clone() {
                 ui.add_space(8.0);
-                let activating = self.activation_rx.is_some();
-                let (response, submit) = kit::field_with_icon(
-                    ui,
-                    Icon::Key,
-                    &mut self.license_key,
-                    "Enter your license key",
-                    |ui| {
-                        ui.add_enabled_ui(!activating, |ui| {
-                            kit::icon_button(ui, Icon::ArrowRight, "Activate", 34.0, true).clicked()
-                        })
-                        .inner
-                    },
-                );
-                let entered =
-                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (submit || entered) && !activating && !self.license_key.trim().is_empty() {
-                    action = Some("activate");
-                }
-                if let Some(error) = self.activation_error.clone() {
-                    ui.add_space(8.0);
-                    kit::banner(ui, Tone::Danger, Icon::Warning, &error);
-                }
+                kit::banner(ui, Tone::Danger, Icon::Warning, &error);
             }
         });
         match action {

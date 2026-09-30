@@ -16,7 +16,7 @@ The companion connects to Phase, checks for the latest release, installs the plu
 - lets you pick a folder manually when Roblox uses a different local path
 - connects a Phase account
 - supports Roblox OAuth verification
-- supports license key activation
+- supports license key activation without Roblox OAuth
 - can apply public Phase marketplace themes to the installer UI
 - opens a Video Reference tab for syncing Phase Animator to YouTube or local video files
 - runs a local `ws://127.0.0.1:27731/phase-video-reference` bridge for Studio timeline/playback sync
@@ -101,6 +101,8 @@ use a Developer ID identity through `MACOS_SIGN_IDENTITY`; without one, users
 must approve Phase Companion once in Privacy & Security.
 
 ## latest update
+
+`0.21.3` lets license holders activate directly with a key, without Roblox OAuth. Existing keys keep their Roblox binding and cloud settings identity.
 
 `0.21.2` adds animated themes: live wallpaper themes, each with its own palette, picked from Settings and downloaded the first time they are used. Roblox verification problems now show a Verify again card with the server's reason, and long pickers scroll on small windows.
 

@@ -1767,6 +1767,13 @@ impl PhaseInstallerApp {
         if let Some(user) = self.linked_user.as_ref().map(display_linked_user) {
             return user;
         }
+        if let Some(activation) = self
+            .activation
+            .as_ref()
+            .filter(|a| a.ok && a.active && a.activation_mode == "licenseKey")
+        {
+            return activation.licensee.clone();
+        }
         if let Some(name) = self
             .roblox_username
             .as_deref()
@@ -2233,11 +2240,9 @@ impl PhaseInstallerApp {
             return;
         }
 
-        let Ok(user_id) = self.roblox_user_id.trim().parse::<u64>() else {
-            self.activation_error = Some("Verify Roblox in browser first.".to_owned());
-            self.log(phase::red(), "Verify Roblox in browser first.");
-            return;
-        };
+        // The license server resolves an existing Roblox binding from the key.
+        // A new key stays unbound and can activate without Roblox OAuth.
+        let user_id = 0;
 
         let license_key = self.license_key.trim().to_owned();
         if license_key.is_empty() {
@@ -2259,10 +2264,7 @@ impl PhaseInstallerApp {
         self.activation_rx = Some(rx);
         self.activation = None;
         self.activation_error = None;
-        self.log(
-            phase::blue(),
-            "Activating license key for verified Roblox account.",
-        );
+        self.log(phase::blue(), "Activating license key.");
 
         let repaint = ctx.clone();
         std::thread::spawn(move || {
