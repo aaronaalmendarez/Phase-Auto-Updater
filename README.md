@@ -16,7 +16,7 @@ The companion connects to Phase, checks for the latest release, installs the plu
 - lets you pick a folder manually when Roblox uses a different local path
 - connects a Phase account
 - supports Roblox OAuth verification
-- supports license key activation
+- supports license key activation without Roblox OAuth
 - can apply public Phase marketplace themes to the installer UI
 - opens a Video Reference tab for syncing Phase Animator to YouTube or local video files
 - runs a local `ws://127.0.0.1:27731/phase-video-reference` bridge for Studio timeline/playback sync
