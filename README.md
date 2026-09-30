@@ -102,6 +102,8 @@ must approve Phase Companion once in Privacy & Security.
 
 ## latest update
 
+`0.21.3` lets license holders activate directly with a key, without Roblox OAuth. Existing keys keep their Roblox binding and cloud settings identity.
+
 `0.21.2` adds animated themes: live wallpaper themes, each with its own palette, picked from Settings and downloaded the first time they are used. Roblox verification problems now show a Verify again card with the server's reason, and long pickers scroll on small windows.
 
 `0.21.1` lets Early Access testers switch between the stable and Early Access plugin from Home with a single Stable / Early Access control.
