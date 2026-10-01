@@ -108,6 +108,20 @@ impl PhaseInstallerApp {
         {
             self.plugin_token
                 .get_or_insert_with(|| "preview".to_owned());
+            self.activation
+                .get_or_insert_with(|| verification::ActivationResponse {
+                    ok: true,
+                    active: true,
+                    activation_mode: "phaseAccount".to_owned(),
+                    product: "Phase Animator".to_owned(),
+                    user_id: 0,
+                    install_id: "preview".to_owned(),
+                    asset_id: None,
+                    token: "preview".to_owned(),
+                    expires_at: 0,
+                    licensee: "Preview tester".to_owned(),
+                    message: String::new(),
+                });
             let release = (mode == "ready")
                 .then(|| self.release.clone())
                 .flatten()
@@ -312,7 +326,7 @@ impl PhaseInstallerApp {
     }
 
     fn has_early_access(&self) -> bool {
-        self.plugin_token.is_some()
+        self.activation.as_ref().is_some_and(|a| a.ok && a.active)
             && self
                 .build_access
                 .as_ref()
@@ -323,6 +337,7 @@ impl PhaseInstallerApp {
         self.link_rx.is_some()
             || self.link_status_rx.is_some()
             || self.account_refresh_rx.is_some()
+            || self.build_access_rx.is_some()
             || self.roblox_oauth_rx.is_some()
             || self.roblox_oauth_status_rx.is_some()
     }
@@ -366,7 +381,10 @@ impl PhaseInstallerApp {
 
         self.overview_tiles(ui);
 
-        if self.has_early_access() {
+        if self.has_early_access()
+            || self.build_access_rx.is_some()
+            || self.build_access_error.is_some()
+        {
             ui.add_space(18.0);
             self.channel_card(ui, account_busy);
         }
@@ -685,6 +703,7 @@ impl PhaseInstallerApp {
     /// Early Access testers switch between the stable and their personal
     /// build here. Picking the other side asks for confirmation, then installs.
     fn channel_card(&mut self, ui: &mut Ui, account_busy: bool) {
+        let refreshing = self.build_access_rx.is_some();
         let installed = self.installed_release.as_ref().map(|r| r.channel);
         let current = installed.unwrap_or(ReleaseChannel::Stable);
         let early_ready = self
@@ -700,13 +719,19 @@ impl PhaseInstallerApp {
             ReleaseChannel::Stable => early_ready,
             ReleaseChannel::EarlyAccess => stable_ready,
         };
-        let detail = match installed {
-            Some(ReleaseChannel::EarlyAccess) => "You're on your personal Early Access build.",
-            Some(ReleaseChannel::Stable) if early_ready => {
-                "You're on stable. Your Early Access build is ready."
+        let detail = if refreshing {
+            "Checking Early Access and the latest build…"
+        } else if self.build_access_error.is_some() {
+            "Could not refresh Early Access. Try again."
+        } else {
+            match installed {
+                Some(ReleaseChannel::EarlyAccess) => "You're on your personal Early Access build.",
+                Some(ReleaseChannel::Stable) if early_ready => {
+                    "You're on stable. Your Early Access build is ready."
+                }
+                _ if !early_ready => "Your Early Access build isn't ready yet.",
+                _ => "Choose which build to install.",
             }
-            _ if !early_ready => "Your Early Access build isn't ready yet.",
-            _ => "Choose which build to install.",
         };
         let can_switch =
             other_ready && self.selected_folder.is_some() && !self.is_busy() && !account_busy;
@@ -714,6 +739,7 @@ impl PhaseInstallerApp {
         // While confirming, show the choice so cancelling visibly slides back.
         let mut shown = self.shell.install_confirmation.unwrap_or(current);
         let mut picked = None;
+        let mut refresh_clicked = false;
         kit::card(ui, |ui| {
             kit::setting_line(ui, "Plugin channel", detail, 190.0, |ui| {
                 ui.add_enabled_ui(can_switch, |ui| {
@@ -733,7 +759,33 @@ impl PhaseInstallerApp {
                     }
                 });
             });
+            ui.add_space(ui.spacing().item_spacing.y);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!self.is_busy() && !account_busy, |ui| {
+                    refresh_clicked = kit::quiet_button(
+                        ui,
+                        Some(Icon::Refresh),
+                        if refreshing {
+                            "Refreshing…"
+                        } else {
+                            "Refresh Early Access"
+                        },
+                    )
+                    .clicked();
+                });
+                if refreshing {
+                    kit::spinner(
+                        ui,
+                        ui.text_style_height(&egui::TextStyle::Body),
+                        phase::accent_hover(),
+                    );
+                }
+            });
         });
+        if refresh_clicked {
+            self.log(phase::blue(), "Refreshing Early Access…");
+            self.begin_build_access_refresh(Some(ui.ctx().clone()));
+        }
         if let Some(channel) = picked.filter(|c| *c != current) {
             self.shell.install_confirmation = Some(channel);
         }

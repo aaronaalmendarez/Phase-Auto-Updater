@@ -319,6 +319,13 @@ struct AccountCache {
 struct PhaseInstallerApp {
     shell: pages::ShellState,
     build_access: Option<verification::CompanionBuildAccess>,
+    build_access_error: Option<String>,
+    build_access_rx: Option<
+        Receiver<(
+            verification::ActivationResponse,
+            Result<verification::CompanionBuildAccess, String>,
+        )>,
+    >,
     stable_updates_paused: bool,
     installed_release: Option<InstalledRelease>,
     logo: Option<TextureHandle>,
@@ -518,6 +525,8 @@ impl PhaseInstallerApp {
             shell: pages::ShellState::default(),
             logo: load_logo(&cc.egui_ctx),
             build_access: None,
+            build_access_error: None,
+            build_access_rx: None,
             stable_updates_paused: false,
             installed_release: None,
             phase_avatar: None,
@@ -668,7 +677,11 @@ impl PhaseInstallerApp {
             window_state_checked: None,
         };
 
-        app.load_cached_accounts(&cc.egui_ctx);
+        if !(app.screenshot_path.is_some()
+            && std::env::var("PHASE_UI_EMPTY_ACCOUNT").ok().as_deref() == Some("1"))
+        {
+            app.load_cached_accounts(&cc.egui_ctx);
+        }
         app.load_wallpaper_catalog(&cc.egui_ctx);
         app.apply_preview_overrides(&cc.egui_ctx);
 
@@ -697,6 +710,7 @@ impl PhaseInstallerApp {
         app.begin_version_check(Some(cc.egui_ctx.clone()));
         app.begin_update_stream(&cc.egui_ctx);
         app.begin_phase_account_refresh(&cc.egui_ctx);
+        app.begin_build_access_refresh(Some(cc.egui_ctx.clone()));
         app.begin_app_update_check(&cc.egui_ctx);
         app.begin_theme_fetch(&cc.egui_ctx);
         app.begin_studio_patch_action(studio_patch::PatchAction::Inspect, &cc.egui_ctx);
@@ -762,6 +776,7 @@ impl PhaseInstallerApp {
         self.poll_activation(ctx);
         self.poll_install(ctx);
         self.poll_phase_account_refresh(ctx);
+        self.poll_build_access_refresh(ctx);
         self.poll_phase_disconnect(ctx);
         self.poll_app_update_check(ctx);
         self.poll_app_update_install(ctx);
@@ -1412,6 +1427,7 @@ impl PhaseInstallerApp {
         self.milestone = 0;
         self.activity.clear();
         self.log(phase::blue(), "Checking for updates...");
+        self.begin_build_access_refresh(None);
         self.begin_version_check(None);
     }
 
@@ -1952,6 +1968,66 @@ impl PhaseInstallerApp {
         ctx.request_repaint();
     }
 
+    fn begin_build_access_refresh(&mut self, repaint: Option<Context>) {
+        self.build_access_rx = None;
+        self.build_access = None;
+        self.build_access_error = None;
+        let Some(activation) = self
+            .activation
+            .clone()
+            .filter(|a| a.ok && a.active && !a.token.is_empty())
+        else {
+            return;
+        };
+        let plan = verification::VerificationPlan::new(CURRENT_BUILD_ID);
+        let (tx, rx) = mpsc::channel();
+        self.build_access_rx = Some(rx);
+        let license_key = self.license_key.trim().to_owned();
+        std::thread::spawn(move || {
+            let result =
+                verification::fetch_companion_build_access(&plan, &activation, &license_key);
+            let _ = tx.send((activation, result));
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn poll_build_access_refresh(&mut self, ctx: &Context) {
+        let Some((checked, result)) = self
+            .build_access_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
+            return;
+        };
+        self.build_access_rx = None;
+        if !self
+            .activation
+            .as_ref()
+            .is_some_and(|a| a.same_active_install(&checked))
+        {
+            return;
+        }
+        match result {
+            Ok(access) => {
+                if access.downloadable_release().is_some() {
+                    self.log(
+                        phase::green(),
+                        "Your Early Access build is ready. Choose Early Access below.",
+                    );
+                }
+                self.build_access = Some(access);
+            }
+            Err(error) => {
+                self.build_access = None;
+                self.build_access_error = Some(error.clone());
+                self.log(phase::warning(), error);
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn begin_phase_account_refresh(&mut self, ctx: &Context) {
         if self.account_refresh_rx.is_some() {
             return;
@@ -1999,6 +2075,16 @@ impl PhaseInstallerApp {
                         .activation_token
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
+                        .filter(|_| {
+                            session
+                                .roblox_user_id
+                                .as_deref()
+                                .is_some_and(|id| !id.is_empty())
+                                || !self
+                                    .activation
+                                    .as_ref()
+                                    .is_some_and(|a| a.ok && a.active && a.user_id > 0)
+                        })
                     {
                         let activation_mode = session
                             .activation_mode
@@ -2038,6 +2124,7 @@ impl PhaseInstallerApp {
                     self.log(phase::green(), "Phase account restored.");
                 }
                 self.save_account_cache();
+                self.begin_build_access_refresh(Some(ctx.clone()));
             }
             Ok(_) => {
                 self.clear_phase_account(true);
@@ -2208,6 +2295,7 @@ impl PhaseInstallerApp {
                     .unwrap_or(&self.roblox_user_id);
                 self.log(phase::green(), format!("Roblox verified: {name}."));
                 self.save_account_cache();
+                self.begin_build_access_refresh(Some(ctx.clone()));
             }
             Ok(status) if status.status == "denied" => {
                 let message = status
@@ -2288,6 +2376,7 @@ impl PhaseInstallerApp {
                 self.activation_error = None;
                 self.activation = Some(activation);
                 self.save_account_cache();
+                self.begin_build_access_refresh(Some(ctx.clone()));
             }
             Err(error) => {
                 self.activation = None;
@@ -2798,6 +2887,9 @@ impl PhaseInstallerApp {
         self.activation = None;
         self.activation_error = None;
         self.save_account_cache();
+        self.build_access = None;
+        self.build_access_rx = None;
+        self.build_access_error = None;
         self.log(phase::green(), "Roblox account disconnected locally.");
     }
 

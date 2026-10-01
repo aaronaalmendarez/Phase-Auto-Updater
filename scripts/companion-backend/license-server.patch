@@ -1,0 +1,23 @@
+--- server.js
++++ server.js
+@@ -1,3 +1,4 @@
++import { createCompanionEntitlementResolver, installCompanionSessionAccess } from './companion-session-access.mjs';
+ import { recoverPersonalStudioInstall } from "./personal-studio-recovery.mjs";
+ import { installCompatibilityIpGuard, normalizeIp, requestClientIp } from "./compatibility-ip.mjs";
+ import { createRobloxInstallRequestStore, maskRobloxInstallId, ROBLOX_INSTALL_ID_PATTERN, ROBLOX_INSTALL_REQUEST_TTL_SECONDS } from "./roblox-install-requests.mjs";
+@@ -2744,7 +2745,14 @@
+     const result = personalBuilds.metadata(userId);
+     return result && !isPhaseBuildBlocked(result.latestBuildId) ? result : null;
+   } });
+-installPersonalizedDownloads({ app, store:personalBuilds, verifyDownloadEntitlement,
++const resolveCompanionEntitlement = createCompanionEntitlementResolver({ db, verifyDownloadEntitlement });
++installCompanionSessionAccess({ app, resolveEntitlement: resolveCompanionEntitlement,
++  hasEarlyAccess: hasPersonalEarlyAccess, isAccessBlocked,
++  personalRelease: userId => {
++    const result = personalBuilds.metadata(userId);
++    return result && !isPhaseBuildBlocked(result.latestBuildId) ? result : null;
++  } });
++installPersonalizedDownloads({ app, store:personalBuilds, verifyDownloadEntitlement: resolveCompanionEntitlement,
+   hasEarlyAccess:hasPersonalEarlyAccess, isAccessBlocked, checkDownloadRateLimit, publicOrigin,
+   registerIdentity:record => compatibilityHoneypot.register(record),
+   isBuildBlocked:buildId => isPhaseBuildBlocked(buildId) });

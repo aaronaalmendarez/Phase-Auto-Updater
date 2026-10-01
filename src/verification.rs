@@ -350,6 +350,34 @@ pub fn activate_install(
     })
 }
 
+pub fn fetch_companion_build_access(
+    plan: &VerificationPlan,
+    activation: &ActivationResponse,
+    license_key: &str,
+) -> Result<CompanionBuildAccess, String> {
+    phase_request_with_fallback(plan, |active_plan| {
+        http_agent()
+            .post(&format!(
+                "{}/plugin/build-access",
+                active_plan.base_url.trim_end_matches('/')
+            ))
+            .timeout(std::time::Duration::from_secs(20))
+            .send_json(ureq::json!({
+                "activationMode": activation.activation_mode,
+                "userId": activation.user_id,
+                "installId": activation.install_id,
+                "assetId": activation.asset_id,
+                "token": activation.token,
+                "licenseKey": (!license_key.is_empty()).then_some(license_key),
+            }))
+            .map_err(|error| phase_http_error("Could not refresh build access", error))?
+            .into_json::<CompanionBuildAccess>()
+            .map_err(|error| {
+                PhaseRequestError::Other(format!("Invalid build access response: {error}"))
+            })
+    })
+}
+
 pub fn create_download_session(
     plan: &VerificationPlan,
     request: &DownloadSessionRequest,
@@ -773,6 +801,82 @@ mod companion_access_tests {
         .unwrap();
         assert!(me.build_access.is_none());
     }
+    fn activation() -> ActivationResponse {
+        serde_json::from_value(
+            json!({"ok":true,"active":true,"activationMode":"phaseAccount",
+            "product":"Phase Animator","userId":4945613323u64,"installId":"install",
+            "assetId":null,"token":"test-token","expiresAt":0,"licensee":"tester","message":""}),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn pending_access_response_cannot_cross_account_or_install_changes() {
+        let checked = activation();
+        assert!(checked.same_active_install(&checked));
+        for change in 0..6 {
+            let mut current = checked.clone();
+            match change {
+                0 => current.user_id += 1,
+                1 => current.install_id = "different".into(),
+                2 => current.token = "different".into(),
+                3 => current.activation_mode = "earlyAccess".into(),
+                4 => current.active = false,
+                _ => current.ok = false,
+            }
+            assert!(!current.same_active_install(&checked));
+        }
+    }
+    #[test]
+    fn build_access_refresh_sends_install_credentials_and_parses_personal_release() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            assert!(headers.starts_with("POST /plugin/build-access HTTP/1.1"));
+            let size: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; size];
+            stream.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["userId"], 4945613323u64);
+            assert_eq!(body["token"], "test-token");
+            assert_eq!(body["installId"], "install");
+            assert_eq!(body["activationMode"], "phaseAccount");
+            let response = serde_json::to_string(&json!({"earlyAccess":true,"status":"verified",
+                "earlyAccessRelease":{"ok":true,"product":"Phase Animator","latestVersion":"v3.2.1",
+                "latestBuildId":"ea11","minimumBuildId":"","updateRequired":false,"required":false,
+                "blocked":false,"downloadAvailable":true,"message":"","notes":"","accessChannel":"early-access",
+                "release":{"buildId":"ea11","version":"v3.2.1","size":0,"sha256":"","createdAt":0,"personalized":true}}})).unwrap();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).unwrap();
+        });
+        let plan = VerificationPlan {
+            base_url: format!("http://{address}"),
+            current_build_id: "stable".into(),
+        };
+        let result = fetch_companion_build_access(&plan, &activation(), "").unwrap();
+        assert_eq!(
+            result.downloadable_release().unwrap().latest_build_id,
+            "ea11"
+        );
+        server.join().unwrap();
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -853,6 +957,18 @@ pub struct ActivationResponse {
     pub expires_at: u64,
     pub licensee: String,
     pub message: String,
+}
+
+impl ActivationResponse {
+    pub fn same_active_install(&self, other: &Self) -> bool {
+        self.ok
+            && self.active
+            && !self.token.is_empty()
+            && self.token == other.token
+            && self.install_id == other.install_id
+            && self.user_id == other.user_id
+            && self.activation_mode == other.activation_mode
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
