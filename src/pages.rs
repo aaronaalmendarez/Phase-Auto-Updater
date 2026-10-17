@@ -1400,7 +1400,9 @@ impl PhaseInstallerApp {
         let busy = self.link_rx.is_some()
             || self.link_status_rx.is_some()
             || self.account_refresh_rx.is_some();
-        let waiting_link = self.link_rx.is_some() || self.link_status_rx.is_some();
+        // Waiting lasts until the link completes or the code expires, not just
+        // while a status check is in flight (those run every 2 seconds).
+        let waiting_link = self.link_rx.is_some() || self.link_code.is_some();
         let mut action = None;
         kit::section_label(ui, "Phase account");
         kit::card(ui, |ui| {
@@ -1471,14 +1473,18 @@ impl PhaseInstallerApp {
                     ui.add_space(4.0);
                     link_code(ui, &code);
                 }
-                if self.link_url.is_some() {
-                    ui.add_space(16.0);
-                    if kit::secondary_button(ui, Some(Icon::External), "Open browser again")
-                        .clicked()
+                ui.add_space(16.0);
+                ui.horizontal_wrapped(|ui| {
+                    if self.link_url.is_some()
+                        && kit::secondary_button(ui, Some(Icon::External), "Open browser again")
+                            .clicked()
                     {
                         action = Some("browser");
                     }
-                }
+                    if kit::quiet_button(ui, None, "Cancel").clicked() {
+                        action = Some("cancel");
+                    }
+                });
             } else {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 14.0;
@@ -1509,6 +1515,7 @@ impl PhaseInstallerApp {
                     let _ = open::that(url);
                 }
             }
+            Some("cancel") => self.cancel_phase_account_link(),
             _ => {}
         }
     }

@@ -1837,6 +1837,15 @@ impl PhaseInstallerApp {
         });
     }
 
+    /// Stops waiting for the browser; a late result is ignored.
+    pub(crate) fn cancel_phase_account_link(&mut self) {
+        self.link_rx = None;
+        self.link_status_rx = None;
+        self.link_code = None;
+        self.link_url = None;
+        self.link_expires_at = None;
+    }
+
     fn begin_link_status_check(&mut self, ctx: &Context) {
         if self.link_status_rx.is_some() || self.plugin_token.is_some() {
             return;
@@ -1959,6 +1968,15 @@ impl PhaseInstallerApp {
                 }
                 self.save_account_cache();
                 self.begin_phase_account_refresh(ctx);
+            }
+            Ok(status) if status.status == "expired" => {
+                self.link_code = None;
+                self.link_url = None;
+                self.link_expires_at = None;
+                self.log(
+                    phase::warning(),
+                    "Link code expired. Connect your Phase account again.",
+                );
             }
             Ok(status) => {
                 self.link_expires_at = status.expires_at;

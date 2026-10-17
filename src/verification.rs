@@ -293,10 +293,15 @@ pub fn fetch_plugin_link_status(
     code: &str,
 ) -> Result<PluginLinkStatusResponse, String> {
     phase_request_with_fallback(plan, |active_plan| {
-        http_agent()
+        let response = http_agent()
             .get(&active_plan.plugin_link_status_url(code))
             .timeout(std::time::Duration::from_secs(10))
-            .call()
+            .call();
+        // The server answers 404 for an expired code and 410 for a used one.
+        if let Err(ureq::Error::Status(404 | 410, _)) = response {
+            return Ok(PluginLinkStatusResponse::expired());
+        }
+        response
             .map_err(|error| phase_http_error("Could not check Phase account link", error))?
             .into_json::<PluginLinkStatusResponse>()
             .map_err(|error| PhaseRequestError::Other(format!("Invalid link status: {error}")))
@@ -908,7 +913,7 @@ pub struct PluginLinkStartResponse {
     pub verify_url: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginLinkStatusResponse {
     pub status: String,
@@ -922,6 +927,15 @@ pub struct PluginLinkStatusResponse {
     pub licensee: Option<String>,
     pub message: Option<String>,
     pub expires_at: Option<String>,
+}
+
+impl PluginLinkStatusResponse {
+    fn expired() -> Self {
+        Self {
+            status: "expired".to_owned(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
